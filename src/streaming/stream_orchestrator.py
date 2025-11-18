@@ -78,18 +78,35 @@ class StreamOrchestrator:
             """Called by MediaMTX when a stream becomes ready"""
             data = request.get_json()
             stream_name = data.get('stream', '')
-            device_id = data.get('device_id', stream_name)  # Default to stream_name if not provided
-            password = data.get('password', '')
 
             if stream_name:
-                # Store device information for this stream
-                self.device_info[stream_name] = {
-                    'device_id': device_id,
-                    'password': password,
-                    'timestamp': time.time()
-                }
+                # Check if this stream is already being processed (avoid duplicate calls)
+                if stream_name in self.processors and self.processors[stream_name].is_alive():
+                    # Stream already has a processor running, ignore
+                    return jsonify({'status': 'ok', 'message': 'Already processing'}), 200
 
-                self.logger.info(f"Received stream ready notification: {stream_name} (device_id: {device_id})")
+                # Get device info from pre-registration, or use defaults
+                if stream_name in self.device_info:
+                    device_id = self.device_info[stream_name].get('device_id', stream_name)
+                    password = self.device_info[stream_name].get('password', '')
+                else:
+                    # No pre-registration, use stream name as device_id
+                    device_id = stream_name
+                    password = ''
+                    self.device_info[stream_name] = {
+                        'device_id': device_id,
+                        'password': password,
+                        'timestamp': time.time()
+                    }
+
+                # Detailed logging for testing
+                self.logger.info("=" * 60)
+                self.logger.info(f"🔗 NEW DEVICE CONNECTED")
+                self.logger.info(f"   Stream Name: {stream_name}")
+                self.logger.info(f"   Device ID:   {device_id}")
+                self.logger.info(f"   Password:    {password if password else '(none)'}")
+                self.logger.info("=" * 60)
+
                 self.start_processor(stream_name)
                 return jsonify({'status': 'ok'}), 200
 
@@ -243,7 +260,8 @@ class StreamOrchestrator:
             self.logger.error(f"Error stopping processor for {stream_name}: {e}")
 
         finally:
-            del self.processors[stream_name]
+            # Clean up processor entry (use pop to avoid KeyError)
+            self.processors.pop(stream_name, None)
             # Clean up device info
             if stream_name in self.device_info:
                 del self.device_info[stream_name]
