@@ -52,6 +52,9 @@ class StreamOrchestrator:
         # Track active processors
         self.processors: Dict[str, multiprocessing.Process] = {}
 
+        # Track device information for each stream (device_id, password, etc.)
+        self.device_info: Dict[str, dict] = {}
+
         self.running = False
         self.monitor_thread = None
 
@@ -75,9 +78,18 @@ class StreamOrchestrator:
             """Called by MediaMTX when a stream becomes ready"""
             data = request.get_json()
             stream_name = data.get('stream', '')
+            device_id = data.get('device_id', stream_name)  # Default to stream_name if not provided
+            password = data.get('password', '')
 
             if stream_name:
-                self.logger.info(f"Received stream ready notification: {stream_name}")
+                # Store device information for this stream
+                self.device_info[stream_name] = {
+                    'device_id': device_id,
+                    'password': password,
+                    'timestamp': time.time()
+                }
+
+                self.logger.info(f"Received stream ready notification: {stream_name} (device_id: {device_id})")
                 self.start_processor(stream_name)
                 return jsonify({'status': 'ok'}), 200
 
@@ -92,6 +104,11 @@ class StreamOrchestrator:
             if stream_name:
                 self.logger.info(f"Received stream stopped notification: {stream_name}")
                 self.stop_processor(stream_name)
+
+                # Clean up device info for this stream
+                if stream_name in self.device_info:
+                    del self.device_info[stream_name]
+
                 return jsonify({'status': 'ok'}), 200
 
             return jsonify({'status': 'error', 'message': 'No stream name provided'}), 400
@@ -104,7 +121,14 @@ class StreamOrchestrator:
                 'mediamtx_healthy': self.mediamtx.is_healthy(),
                 'active_streams': list(self.processors.keys()),
                 'processor_count': len(self.processors),
-                'max_processors': MAX_PROCESSORS
+                'max_processors': MAX_PROCESSORS,
+                'device_info': {
+                    stream: {
+                        'device_id': info['device_id'],
+                        'has_password': bool(info.get('password'))
+                    }
+                    for stream, info in self.device_info.items()
+                }
             }), 200
 
         @self.app.route('/processors', methods=['GET'])
@@ -117,6 +141,30 @@ class StreamOrchestrator:
                     'pid': proc.pid
                 }
             return jsonify(processor_info), 200
+
+        @self.app.route('/device/register', methods=['POST'])
+        def register_device():
+            """
+            Register device information for a stream.
+            Useful for pre-registering device info before the stream connects.
+            """
+            data = request.get_json()
+            stream_name = data.get('stream_name', '')
+            device_id = data.get('device_id', stream_name)
+            password = data.get('password', '')
+
+            if not stream_name:
+                return jsonify({'status': 'error', 'message': 'stream_name is required'}), 400
+
+            # Store device info
+            self.device_info[stream_name] = {
+                'device_id': device_id,
+                'password': password,
+                'timestamp': time.time()
+            }
+
+            self.logger.info(f"Registered device info for stream: {stream_name} (device_id: {device_id})")
+            return jsonify({'status': 'ok', 'stream_name': stream_name, 'device_id': device_id}), 200
 
     def start_processor(self, stream_name: str):
         """
@@ -143,11 +191,14 @@ class StreamOrchestrator:
         # Create RTSP URL
         rtsp_url = f"rtsp://{RTSP_HOST}:{RTSP_PORT}/{stream_name}"
 
+        # Get device info if available
+        device_info = self.device_info.get(stream_name, {})
+
         self.logger.info(f"Starting processor for stream: {stream_name}")
 
         try:
-            # Create processor instance
-            processor = self.processor_class(stream_name, rtsp_url)
+            # Create processor instance with device info
+            processor = self.processor_class(stream_name, rtsp_url, device_info=device_info)
 
             # Start in separate process for isolation
             proc = multiprocessing.Process(target=processor.run, name=f"Processor-{stream_name}")
@@ -193,6 +244,9 @@ class StreamOrchestrator:
 
         finally:
             del self.processors[stream_name]
+            # Clean up device info
+            if stream_name in self.device_info:
+                del self.device_info[stream_name]
 
     def monitor_streams(self):
         """

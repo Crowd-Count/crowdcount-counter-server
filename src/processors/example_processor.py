@@ -14,16 +14,19 @@ class ExampleProcessor(BaseStreamProcessor):
     Replace this with your actual computer vision logic.
     """
 
-    def __init__(self, stream_name: str, rtsp_url: str):
-        super().__init__(stream_name, rtsp_url)
+    def __init__(self, stream_name: str, rtsp_url: str, device_info: dict = None):
+        super().__init__(stream_name, rtsp_url, device_info)
         self.detection_count = 0
 
     def on_start(self):
         """Initialize any resources needed for processing"""
         self.logger.info("Example processor starting")
+        self.logger.info(f"Device ID: {self.device_id}")
+        self.logger.info(f"Has password: {bool(self.password)}")
         self.logger.info("This is where you'd load ML models, initialize detectors, etc.")
         # Example: Load a face detector, person detector, etc.
         # self.detector = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+        # Note: You can use self.device_id and self.password for authentication or device-specific processing
 
     def process_frame(self, frame: np.ndarray, frame_number: int, timestamp: float) -> np.ndarray:
         """
@@ -53,7 +56,7 @@ class ExampleProcessor(BaseStreamProcessor):
             self.detection_count += 1
 
         # Add overlay with stats
-        cv2.putText(display_frame, f"Stream: {self.stream_name}",
+        cv2.putText(display_frame, f"Device: {self.device_id}",
                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         cv2.putText(display_frame, f"Frame: {frame_number}",
                    (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)

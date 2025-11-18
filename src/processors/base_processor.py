@@ -17,16 +17,20 @@ class BaseStreamProcessor(ABC):
     Each processor handles one video stream and runs its own processing logic.
     """
 
-    def __init__(self, stream_name: str, rtsp_url: str):
+    def __init__(self, stream_name: str, rtsp_url: str, device_info: Optional[dict] = None):
         """
         Initialize the stream processor
 
         Args:
             stream_name: Unique identifier for this stream (e.g., 'camera1')
             rtsp_url: Full RTSP URL to pull frames from (e.g., 'rtsp://127.0.0.1:8554/camera1')
+            device_info: Optional dictionary containing device information (device_id, password, etc.)
         """
         self.stream_name = stream_name
         self.rtsp_url = rtsp_url
+        self.device_info = device_info or {}
+        self.device_id = self.device_info.get('device_id', stream_name)
+        self.password = self.device_info.get('password', '')
         self.running = False
         self.cap: Optional[cv2.VideoCapture] = None
 
@@ -209,10 +213,12 @@ class BaseStreamProcessor(ABC):
 
         return {
             'stream_name': self.stream_name,
+            'device_id': self.device_id,
             'rtsp_url': self.rtsp_url,
             'running': self.running,
             'frames_processed': self.frames_processed,
             'elapsed_time': elapsed,
             'fps': fps,
-            'last_frame_time': self.last_frame_time
+            'last_frame_time': self.last_frame_time,
+            'has_password': bool(self.password)
         }
