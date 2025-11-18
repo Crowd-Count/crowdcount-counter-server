@@ -50,8 +50,8 @@ recordPath: ./data/recordings/%path/%Y-%m-%d_%H-%M-%S-%f
 
 # Path configurations (streams)
 paths:
-  # Default path - accepts all streams
-  all:
+  # Catch-all regex pattern to match any stream name
+  ~^.*$:
     source: publisher
     # Allow any Raspberry Pi to publish
     publishUser:
