@@ -13,8 +13,19 @@ from collections import deque, defaultdict
 from dataclasses import dataclass
 from typing import Optional, Tuple, List, Dict
 from enum import Enum
+import os
 
 from .base_processor import BaseStreamProcessor
+
+# Import API client
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from api.crowdcount_api_client import CrowdCountAPIClient
+
+# Get project root directory (crowdcount-counter-server/)
+PROJECT_ROOT = Path(__file__).parent.parent.parent
+MODELS_DIR = PROJECT_ROOT / "models"
 
 # Try to import YOLO, provide helpful error if not available
 try:
@@ -161,12 +172,12 @@ class PeopleCounterProcessor(BaseStreamProcessor):
     Tracks people crossing a virtual line and maintains counts
     """
 
-    def __init__(self, stream_name: str, rtsp_url: str, device_info: Optional[dict] = None):
-        super().__init__(stream_name, rtsp_url, device_info)
+    def __init__(self, stream_name: str, rtsp_url: str, device_info: Optional[dict] = None, frame_queue=None):
+        super().__init__(stream_name, rtsp_url, device_info, frame_queue)
 
         # YOLO model setup
         self.model = None
-        self.model_path = "yolo11n.pt"  # Default model, can be overridden
+        self.model_path = str(MODELS_DIR / "yolo11s.pt")  # Using YOLOv11 Small model for better accuracy
         self.class_names = {0: 'person'}  # Default
 
         # Doorway configuration
@@ -193,33 +204,59 @@ class PeopleCounterProcessor(BaseStreamProcessor):
         }
         self.crossing_log = []
 
-        # API Configuration (optional)
-        self.api_config = {
-            'enabled': False,  # Disabled by default
-            'base_url': 'https://api.crowdcount.tech',
-            'user_id': 'Demo',
-            'password': 'password',
-            'timeout': 5
-        }
+        # Initialize API client with device credentials
+        # API is enabled only if device has credentials
+        device_id = self.device_info.get('device_id', self.stream_name)
+        password = self.device_info.get('password', '')
+        self.api_client = CrowdCountAPIClient(
+            device_id=device_id,
+            password=password,
+            base_url='https://api.crowdcount.tech',
+            timeout=5
+        )
 
     def on_start(self):
         """Initialize YOLO model when processor starts"""
         if not YOLO_AVAILABLE:
+            print(f"ERROR: YOLO not available - cannot start people counter", flush=True)
             self.logger.error("YOLO not available - cannot start people counter")
             raise ImportError("ultralytics package required. Install with: pip install ultralytics")
 
         try:
+            import torch
+
+            # Check CUDA availability
+            cuda_available = torch.cuda.is_available()
+            device = 'cuda' if cuda_available else 'cpu'
+
+            print(f"Loading YOLO model: {self.model_path}", flush=True)
+            print(f"Using device: {device}", flush=True)
+            if cuda_available:
+                print(f"GPU: {torch.cuda.get_device_name(0)}", flush=True)
+
             self.logger.info(f"Loading YOLO model: {self.model_path}")
+            self.logger.info(f"Using device: {device}")
+
+            # Load model with explicit CUDA device
             self.model = YOLO(self.model_path)
+            self.model.to(device)
+
+            # Verify device
+            model_device = next(self.model.model.parameters()).device
+            print(f"Model loaded on device: {model_device}", flush=True)
+            self.logger.info(f"Model loaded on device: {model_device}")
 
             # Get class names from model
             if hasattr(self.model, 'names'):
                 self.class_names = self.model.names
+                print(f"Model classes: {', '.join([f'{k}:{v}' for k, v in list(self.class_names.items())[:5]])}...", flush=True)
                 self.logger.info(f"Model classes: {', '.join([f'{k}:{v}' for k, v in self.class_names.items()])}")
 
+            print("✓ YOLO model loaded successfully with CUDA acceleration!" if cuda_available else "✓ YOLO model loaded (CPU mode)", flush=True)
             self.logger.info("YOLO model loaded successfully")
 
         except Exception as e:
+            print(f"ERROR: Failed to load YOLO model: {e}", flush=True)
             self.logger.error(f"Failed to load YOLO model: {e}")
             raise
 
@@ -245,11 +282,12 @@ class PeopleCounterProcessor(BaseStreamProcessor):
         detections = []
 
         try:
-            # Run YOLO inference
+            # Run YOLO inference - only detect people (class 0)
             results = self.model(
                 frame,
                 conf=self.doorway_config['yolo_conf_threshold'],
                 iou=self.doorway_config['yolo_iou_threshold'],
+                classes=[0],  # Only detect person class
                 verbose=False
             )
 
@@ -259,6 +297,15 @@ class PeopleCounterProcessor(BaseStreamProcessor):
                 if result.boxes is not None and len(result.boxes) > 0:
                     # Process each detection
                     for box in result.boxes:
+                        # Get confidence and class
+                        confidence = float(box.conf[0])
+                        class_id = int(box.cls[0])
+                        class_name = self.class_names.get(class_id, 'unknown')
+
+                        # ONLY process person detections (class_id == 0)
+                        if class_id != 0:
+                            continue
+
                         # Get box coordinates
                         x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
 
@@ -267,11 +314,6 @@ class PeopleCounterProcessor(BaseStreamProcessor):
                         center_y = int((y1 + y2) / 2)
                         width = int(x2 - x1)
                         height = int(y2 - y1)
-
-                        # Get confidence and class
-                        confidence = float(box.conf[0])
-                        class_id = int(box.cls[0])
-                        class_name = self.class_names.get(class_id, 'unknown')
 
                         # Create detection
                         detection = Detection(
@@ -360,20 +402,19 @@ class PeopleCounterProcessor(BaseStreamProcessor):
                     # A crossing occurred!
                     self.crossings[crossing_dir] += 1
 
-                    # Make API call if enabled
-                    if self.api_config['enabled']:
-                        if crossing_dir == CrossingDirection.LEFT_TO_RIGHT:
-                            threading.Thread(
-                                target=self.api_add_to_count,
-                                args=(1,),
-                                daemon=True
-                            ).start()
-                        elif crossing_dir == CrossingDirection.RIGHT_TO_LEFT:
-                            threading.Thread(
-                                target=self.api_sub_from_count,
-                                args=(1,),
-                                daemon=True
-                            ).start()
+                    # Make API call with device credentials
+                    if crossing_dir == CrossingDirection.LEFT_TO_RIGHT:
+                        threading.Thread(
+                            target=self.api_client.add_to_count,
+                            args=(1,),
+                            daemon=True
+                        ).start()
+                    elif crossing_dir == CrossingDirection.RIGHT_TO_LEFT:
+                        threading.Thread(
+                            target=self.api_client.subtract_from_count,
+                            args=(1,),
+                            daemon=True
+                        ).start()
 
                     # Log the crossing
                     crossing_info = {
@@ -561,54 +602,3 @@ class PeopleCounterProcessor(BaseStreamProcessor):
 
         return vis_frame
 
-    def api_add_to_count(self, count: int = 1) -> bool:
-        """Make API call to add to count (LEFT_TO_RIGHT crossing)"""
-        if not self.api_config['enabled']:
-            return True
-
-        try:
-            url = f"{self.api_config['base_url']}/add_to_count"
-            data = {
-                'user_id': self.api_config['user_id'],
-                'password': self.api_config['password'],
-                'count_to_add': str(count)
-            }
-
-            response = requests.post(url, data=data, timeout=self.api_config['timeout'])
-
-            if response.status_code == 200:
-                self.logger.info(f"API: Added {count} to remote count")
-                return True
-            else:
-                self.logger.warning(f"API Error: {response.status_code}")
-                return False
-
-        except Exception as e:
-            self.logger.warning(f"API Error: {e}")
-            return False
-
-    def api_sub_from_count(self, count: int = 1) -> bool:
-        """Make API call to subtract from count (RIGHT_TO_LEFT crossing)"""
-        if not self.api_config['enabled']:
-            return True
-
-        try:
-            url = f"{self.api_config['base_url']}/sub_from_count"
-            data = {
-                'user_id': self.api_config['user_id'],
-                'password': self.api_config['password'],
-                'count_to_sub': str(count)
-            }
-
-            response = requests.post(url, data=data, timeout=self.api_config['timeout'])
-
-            if response.status_code == 200:
-                self.logger.info(f"API: Subtracted {count} from remote count")
-                return True
-            else:
-                self.logger.warning(f"API Error: {response.status_code}")
-                return False
-
-        except Exception as e:
-            self.logger.warning(f"API Error: {e}")
-            return False

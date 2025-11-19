@@ -17,7 +17,7 @@ class BaseStreamProcessor(ABC):
     Each processor handles one video stream and runs its own processing logic.
     """
 
-    def __init__(self, stream_name: str, rtsp_url: str, device_info: Optional[dict] = None):
+    def __init__(self, stream_name: str, rtsp_url: str, device_info: Optional[dict] = None, frame_queue=None):
         """
         Initialize the stream processor
 
@@ -25,6 +25,7 @@ class BaseStreamProcessor(ABC):
             stream_name: Unique identifier for this stream (e.g., 'camera1')
             rtsp_url: Full RTSP URL to pull frames from (e.g., 'rtsp://127.0.0.1:8554/camera1')
             device_info: Optional dictionary containing device information (device_id, password, etc.)
+            frame_queue: Optional multiprocessing.Queue for sending processed frames for live viewing
         """
         self.stream_name = stream_name
         self.rtsp_url = rtsp_url
@@ -33,6 +34,7 @@ class BaseStreamProcessor(ABC):
         self.password = self.device_info.get('password', '')
         self.running = False
         self.cap: Optional[cv2.VideoCapture] = None
+        self.frame_queue = frame_queue  # Queue for live viewing
 
         # Setup logging
         self.logger = logging.getLogger(f"Processor-{stream_name}")
@@ -174,22 +176,28 @@ class BaseStreamProcessor(ABC):
         Main processing loop.
         Continuously reads frames from the stream and processes them.
         """
+        print(f"[{self.stream_name}] Starting processor", flush=True)
         self.logger.info("Starting processor")
         self.running = True
         self.start_time = time.time()
 
         # Connect to stream
+        print(f"[{self.stream_name}] Connecting to RTSP stream...", flush=True)
         if not self.connect_stream():
+            print(f"[{self.stream_name}] ERROR: Failed to connect to stream", flush=True)
             self.logger.error("Failed to connect to stream, exiting")
             self.running = False
             return
 
+        print(f"[{self.stream_name}] Stream connected! Initializing processor...", flush=True)
         # Call custom start logic
         try:
             self.on_start()
         except Exception as e:
+            print(f"[{self.stream_name}] ERROR in on_start: {e}", flush=True)
             self.logger.error(f"Error in on_start: {e}")
 
+        print(f"[{self.stream_name}] Processor ready! Starting frame processing loop...", flush=True)
         # Main processing loop
         frame_number = 0
         consecutive_failures = 0
@@ -220,6 +228,16 @@ class BaseStreamProcessor(ABC):
                 # Process the frame (custom logic)
                 try:
                     processed_frame = self.process_frame(frame, frame_number, timestamp)
+
+                    # Send processed frame to queue for live viewing (non-blocking)
+                    if self.frame_queue is not None and processed_frame is not None:
+                        try:
+                            # Use put_nowait to avoid blocking if queue is full
+                            self.frame_queue.put_nowait(processed_frame)
+                        except:
+                            # Queue full, skip this frame
+                            pass
+
                 except Exception as e:
                     self.logger.error(f"Error processing frame {frame_number}: {e}")
                     continue

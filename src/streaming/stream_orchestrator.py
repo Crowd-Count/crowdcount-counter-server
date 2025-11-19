@@ -11,12 +11,15 @@ import threading
 import signal
 from pathlib import Path
 from typing import Dict, Type
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response, render_template_string
 import multiprocessing
+import cv2
+import queue
 
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from api.crowdcount_api_client import CrowdCountAPIClient
 from config.server_config import (
     ORCHESTRATOR_HOST,
     ORCHESTRATOR_PORT,
@@ -51,6 +54,12 @@ class StreamOrchestrator:
 
         # Track active processors
         self.processors: Dict[str, multiprocessing.Process] = {}
+
+        # Track frame queues for live viewing
+        self.frame_queues: Dict[str, multiprocessing.Queue] = {}
+
+        # Track API clients for device status updates
+        self.api_clients: Dict[str, CrowdCountAPIClient] = {}
 
         # Track device information for each stream (device_id, password, etc.)
         self.device_info: Dict[str, dict] = {}
@@ -183,6 +192,93 @@ class StreamOrchestrator:
             self.logger.info(f"Registered device info for stream: {stream_name} (device_id: {device_id})")
             return jsonify({'status': 'ok', 'stream_name': stream_name, 'device_id': device_id}), 200
 
+        @self.app.route('/view/<stream_name>')
+        def view_stream(stream_name):
+            """Serve HTML viewer for a stream"""
+            html = """
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>CrowdCount - Stream {{ stream_name }}</title>
+                <style>
+                    body {
+                        margin: 0;
+                        padding: 20px;
+                        background: #1a1a1a;
+                        font-family: Arial, sans-serif;
+                        color: #fff;
+                    }
+                    .container {
+                        max-width: 1400px;
+                        margin: 0 auto;
+                    }
+                    h1 {
+                        text-align: center;
+                        color: #00ff00;
+                    }
+                    .video-container {
+                        text-align: center;
+                        margin: 20px 0;
+                    }
+                    img {
+                        max-width: 100%;
+                        border: 2px solid #00ff00;
+                        border-radius: 8px;
+                    }
+                    .info {
+                        text-align: center;
+                        margin: 10px 0;
+                        color: #aaa;
+                    }
+                </style>
+            </head>
+            <body>
+                <div class="container">
+                    <h1>🎥 CrowdCount Stream Viewer</h1>
+                    <div class="info">Stream: {{ stream_name }}</div>
+                    <div class="video-container">
+                        <img src="/video_feed/{{ stream_name }}" alt="Live Stream">
+                    </div>
+                    <div class="info">Live YOLO Detection Feed</div>
+                </div>
+            </body>
+            </html>
+            """
+            return render_template_string(html, stream_name=stream_name)
+
+        @self.app.route('/video_feed/<stream_name>')
+        def video_feed(stream_name):
+            """Serve MJPEG video feed for a stream"""
+            def generate():
+                if stream_name not in self.frame_queues:
+                    return
+
+                frame_queue = self.frame_queues[stream_name]
+
+                while True:
+                    try:
+                        # Get frame from queue with timeout
+                        frame = frame_queue.get(timeout=1.0)
+
+                        # Encode frame as JPEG
+                        ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                        if not ret:
+                            continue
+
+                        # Yield frame in MJPEG format
+                        yield (b'--frame\r\n'
+                               b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
+
+                    except queue.Empty:
+                        # No frame available, continue waiting
+                        continue
+                    except Exception as e:
+                        self.logger.error(f"Error in video feed for {stream_name}: {e}")
+                        break
+
+            return Response(generate(),
+                          mimetype='multipart/x-mixed-replace; boundary=frame')
+
     def start_processor(self, stream_name: str):
         """
         Start a processor for a stream
@@ -214,8 +310,26 @@ class StreamOrchestrator:
         self.logger.info(f"Starting processor for stream: {stream_name}")
 
         try:
-            # Create processor instance with device info
-            processor = self.processor_class(stream_name, rtsp_url, device_info=device_info)
+            # Create API client for status updates
+            device_id = device_info.get('device_id', stream_name)
+            password = device_info.get('password', '')
+            api_client = CrowdCountAPIClient(
+                device_id=device_id,
+                password=password,
+                base_url='https://api.crowdcount.tech',
+                timeout=5
+            )
+            self.api_clients[stream_name] = api_client
+
+            # Update device status to online
+            threading.Thread(target=api_client.update_status, args=('online',), daemon=True).start()
+
+            # Create frame queue for live viewing
+            frame_queue = multiprocessing.Queue(maxsize=2)  # Small queue to avoid memory issues
+            self.frame_queues[stream_name] = frame_queue
+
+            # Create processor instance with device info and frame queue
+            processor = self.processor_class(stream_name, rtsp_url, device_info=device_info, frame_queue=frame_queue)
 
             # Start in separate process for isolation
             proc = multiprocessing.Process(target=processor.run, name=f"Processor-{stream_name}")
@@ -260,8 +374,17 @@ class StreamOrchestrator:
             self.logger.error(f"Error stopping processor for {stream_name}: {e}")
 
         finally:
+            # Update device status to offline
+            if stream_name in self.api_clients:
+                api_client = self.api_clients[stream_name]
+                threading.Thread(target=api_client.update_status, args=('offline',), daemon=True).start()
+                del self.api_clients[stream_name]
+
             # Clean up processor entry (use pop to avoid KeyError)
             self.processors.pop(stream_name, None)
+            # Clean up frame queue
+            if stream_name in self.frame_queues:
+                del self.frame_queues[stream_name]
             # Clean up device info
             if stream_name in self.device_info:
                 del self.device_info[stream_name]
@@ -361,9 +484,20 @@ class StreamOrchestrator:
         self.logger.info("Stopping orchestrator...")
         self.running = False
 
+        # Set all devices offline (in parallel for speed)
+        threads = []
+        for stream_name, api_client in list(self.api_clients.items()):
+            thread = threading.Thread(target=api_client.update_status, args=('offline',), daemon=False)
+            thread.start()
+            threads.append(thread)
+
         # Stop all processors
         for stream_name in list(self.processors.keys()):
             self.stop_processor(stream_name)
+
+        # Wait for all status updates to complete (max 2 seconds)
+        for thread in threads:
+            thread.join(timeout=2)
 
         # Stop MediaMTX
         self.mediamtx.stop()
