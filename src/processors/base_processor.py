@@ -48,6 +48,8 @@ class BaseStreamProcessor(ABC):
         self.frames_processed = 0
         self.start_time = None
         self.last_frame_time = time.time()
+        self.last_log_time = None
+        self.frames_since_log = 0
 
     def connect_stream(self, max_retries: int = 10, initial_delay: float = 0.5) -> bool:
         """
@@ -72,8 +74,12 @@ class BaseStreamProcessor(ABC):
                 # Create VideoCapture with RTSP options for low latency
                 self.cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_FFMPEG)
 
-                # Set buffer size to 1 for minimal latency
-                self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                # Set buffer size to 3 for balance between latency and stability
+                # Size of 1 is too aggressive and drops frames if processing is slow
+                self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 3)
+
+                # Request specific FPS (helps OpenCV's frame timing)
+                self.cap.set(cv2.CAP_PROP_FPS, 30)
 
                 if not self.cap.isOpened():
                     self.logger.warning(f"Failed to open stream (attempt {attempt}/{max_retries})")
@@ -100,8 +106,12 @@ class BaseStreamProcessor(ABC):
                         delay *= 1.5  # Exponential backoff
                     continue
 
-                # Success!
-                self.logger.info(f"Successfully connected to stream (resolution: {frame.shape[1]}x{frame.shape[0]})")
+                # Success! Get stream properties
+                actual_fps = self.cap.get(cv2.CAP_PROP_FPS)
+                self.logger.info(f"Successfully connected to stream")
+                self.logger.info(f"  Resolution: {frame.shape[1]}x{frame.shape[0]}")
+                self.logger.info(f"  Reported FPS: {actual_fps:.1f}")
+                self.logger.info(f"  Buffer size: {self.cap.get(cv2.CAP_PROP_BUFFERSIZE)}")
                 return True
 
             except Exception as e:
@@ -214,11 +224,25 @@ class BaseStreamProcessor(ABC):
                     self.logger.error(f"Error processing frame {frame_number}: {e}")
                     continue
 
-                # Log stats periodically (every 300 frames = ~10 seconds at 30fps)
-                if frame_number % 300 == 0:
+                # Initialize log timing on first frame
+                if self.last_log_time is None:
+                    self.last_log_time = timestamp
+
+                self.frames_since_log += 1
+
+                # Log stats periodically (every 5 seconds)
+                if timestamp - self.last_log_time >= 5.0:
                     elapsed = timestamp - self.start_time
-                    fps = self.frames_processed / elapsed if elapsed > 0 else 0
-                    self.logger.info(f"Processed {self.frames_processed} frames ({fps:.1f} fps)")
+                    overall_fps = self.frames_processed / elapsed if elapsed > 0 else 0
+                    interval_time = timestamp - self.last_log_time
+                    interval_fps = self.frames_since_log / interval_time if interval_time > 0 else 0
+
+                    self.logger.info(f"Processed {self.frames_processed} frames | "
+                                   f"Overall: {overall_fps:.1f} fps | "
+                                   f"Last 5s: {interval_fps:.1f} fps")
+
+                    self.last_log_time = timestamp
+                    self.frames_since_log = 0
 
         except KeyboardInterrupt:
             self.logger.info("Received interrupt signal")
