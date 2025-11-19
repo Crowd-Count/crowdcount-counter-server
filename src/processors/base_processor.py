@@ -49,36 +49,77 @@ class BaseStreamProcessor(ABC):
         self.start_time = None
         self.last_frame_time = time.time()
 
-    def connect_stream(self) -> bool:
+    def connect_stream(self, max_retries: int = 10, initial_delay: float = 0.5) -> bool:
         """
-        Connect to the RTSP stream
+        Connect to the RTSP stream with retry logic
+
+        MediaMTX may take a moment to fully establish the stream after the webhook fires,
+        so we retry with exponential backoff.
+
+        Args:
+            max_retries: Maximum number of connection attempts
+            initial_delay: Initial delay between retries in seconds
 
         Returns:
             True if connection successful, False otherwise
         """
-        try:
-            self.logger.info(f"Connecting to stream: {self.rtsp_url}")
-            self.cap = cv2.VideoCapture(self.rtsp_url)
+        delay = initial_delay
 
-            # Set buffer size to minimize latency
-            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        for attempt in range(1, max_retries + 1):
+            try:
+                self.logger.info(f"Connecting to stream (attempt {attempt}/{max_retries}): {self.rtsp_url}")
 
-            if not self.cap.isOpened():
-                self.logger.error("Failed to open stream")
-                return False
+                # Create VideoCapture with RTSP options for low latency
+                self.cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_FFMPEG)
 
-            # Test read a frame
-            ret, frame = self.cap.read()
-            if not ret or frame is None:
-                self.logger.error("Failed to read initial frame")
-                return False
+                # Set buffer size to 1 for minimal latency
+                self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
-            self.logger.info(f"Successfully connected to stream (resolution: {frame.shape[1]}x{frame.shape[0]})")
-            return True
+                if not self.cap.isOpened():
+                    self.logger.warning(f"Failed to open stream (attempt {attempt}/{max_retries})")
+                    if self.cap:
+                        self.cap.release()
+                        self.cap = None
 
-        except Exception as e:
-            self.logger.error(f"Error connecting to stream: {e}")
-            return False
+                    if attempt < max_retries:
+                        self.logger.info(f"Retrying in {delay:.1f}s...")
+                        time.sleep(delay)
+                        delay *= 1.5  # Exponential backoff
+                    continue
+
+                # Test read a frame
+                ret, frame = self.cap.read()
+                if not ret or frame is None:
+                    self.logger.warning(f"Failed to read initial frame (attempt {attempt}/{max_retries})")
+                    self.cap.release()
+                    self.cap = None
+
+                    if attempt < max_retries:
+                        self.logger.info(f"Retrying in {delay:.1f}s...")
+                        time.sleep(delay)
+                        delay *= 1.5  # Exponential backoff
+                    continue
+
+                # Success!
+                self.logger.info(f"Successfully connected to stream (resolution: {frame.shape[1]}x{frame.shape[0]})")
+                return True
+
+            except Exception as e:
+                self.logger.warning(f"Error connecting to stream (attempt {attempt}/{max_retries}): {e}")
+                if self.cap:
+                    try:
+                        self.cap.release()
+                    except:
+                        pass
+                    self.cap = None
+
+                if attempt < max_retries:
+                    self.logger.info(f"Retrying in {delay:.1f}s...")
+                    time.sleep(delay)
+                    delay *= 1.5  # Exponential backoff
+
+        self.logger.error(f"Failed to connect to stream after {max_retries} attempts")
+        return False
 
     def disconnect_stream(self):
         """Disconnect from the RTSP stream"""
