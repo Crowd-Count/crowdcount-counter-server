@@ -18,9 +18,7 @@ metricsAddress: 127.0.0.1:9998
 readTimeout: 10s
 writeTimeout: 10s
 readBufferCount: 2048  # Increased from 512 for better buffering at 30fps
-writeBufferCount: 2048
 udpMaxPayloadSize: 1472
-rtpMaxPayloadSize: 1460
 
 # RTSP Server Configuration
 rtspDisable: false
@@ -30,10 +28,6 @@ rtspAddress: :8554
 rtspsAddress: :8555
 rtpAddress: :8000
 rtcpAddress: :8001
-
-# RTSP-specific optimizations for 30fps
-rtspReadBufferSize: 8192
-rtspWriteBufferSize: 8192
 
 # RTMP Server Configuration (for camera publishing)
 rtmpDisable: false
