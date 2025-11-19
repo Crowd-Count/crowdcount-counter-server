@@ -29,6 +29,11 @@ rtspsAddress: :8555
 rtpAddress: :8000
 rtcpAddress: :8001
 
+# RTMP Server Configuration (for camera publishing)
+rtmpDisable: false
+rtmpAddress: :1935
+rtmpEncryption: "no"
+
 # HLS (for browser viewing)
 hlsDisable: false
 hlsAddress: :8888
