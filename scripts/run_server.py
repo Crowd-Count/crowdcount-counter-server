@@ -16,7 +16,8 @@ from processors import (
     ExampleProcessor,
     PassthroughProcessor,
     DisplayProcessor,
-    MultiStreamDisplayProcessor
+    MultiStreamDisplayProcessor,
+    PeopleCounterProcessor
 )
 import multiprocessing
 
@@ -26,7 +27,8 @@ PROCESSORS = {
     'example': ExampleProcessor,
     'passthrough': PassthroughProcessor,
     'display': DisplayProcessor,
-    'multi': MultiStreamDisplayProcessor
+    'multi': MultiStreamDisplayProcessor,
+    'counter': PeopleCounterProcessor
 }
 
 
@@ -41,12 +43,16 @@ Available Processors:
   passthrough  - Minimal processor that just logs frames
   display      - Shows stream in a window with info overlay
   multi        - Lightweight display for monitoring multiple streams
+  counter      - People counter with YOLO detection and tracking
 
 Examples:
+  # Run with people counter (YOLO-based person counting)
+  python3 scripts/run_server.py --processor counter
+
   # Run with display processor (shows video in window)
   python3 scripts/run_server.py --processor display
 
-  # Run with example processor (default)
+  # Run with example processor
   python3 scripts/run_server.py --processor example
 
   # Run with multi-stream display
@@ -87,8 +93,6 @@ Examples:
 
     print("Starting orchestrator...")
     print("Press Ctrl+C to stop")
-    if args.processor in ['display', 'multi']:
-        print("Press 'q' in the video window to stop that stream's processor")
     print()
 
     # Run (this blocks until stopped)

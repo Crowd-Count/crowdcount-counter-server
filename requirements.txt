@@ -2,6 +2,7 @@
 
 # Computer Vision
 opencv-python>=4.8.0
+ultralytics>=8.0.0  # YOLO for people counter processor
 
 # Web Framework
 Flask>=2.3.0
