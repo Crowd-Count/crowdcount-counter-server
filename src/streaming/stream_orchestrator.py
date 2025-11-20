@@ -10,9 +10,14 @@ import logging
 import threading
 import signal
 from pathlib import Path
-from typing import Dict, Type
-from flask import Flask, request, jsonify
+from typing import Dict, Type, Optional
+from flask import Flask, request, jsonify, send_from_directory
+from flask_cors import CORS
 import multiprocessing
+import sqlite3
+import paramiko
+import subprocess
+from datetime import datetime, timedelta
 
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -24,10 +29,91 @@ from config.server_config import (
     STREAM_HEALTH_CHECK_INTERVAL,
     RTSP_HOST,
     RTSP_PORT,
-    LOG_LEVEL
+    LOG_LEVEL,
+    DB_PATH,
+    SSH_KEY_PATH,
+    SSH_USER,
+    STATIC_DIR
 )
 from streaming.mediamtx_manager import MediaMTXManager
 from processors import BaseStreamProcessor, ExampleProcessor
+
+
+# Database helper functions
+def init_db():
+    """Create database tables if they don't exist"""
+    conn = sqlite3.connect(str(DB_PATH))
+    c = conn.cursor()
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS devices (
+            device_id TEXT PRIMARY KEY,
+            stream_name TEXT NOT NULL,
+            tailscale_ip TEXT,
+            last_seen TIMESTAMP,
+            status TEXT DEFAULT 'offline',
+            width INTEGER DEFAULT 640,
+            height INTEGER DEFAULT 480,
+            fps INTEGER DEFAULT 30,
+            registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+
+def get_db():
+    """Get database connection"""
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def ssh_exec(ip: str, command: str) -> tuple:
+    """Execute command via SSH on remote device"""
+    try:
+        ssh = paramiko.SSHClient()
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+        # Try to connect with SSH key
+        ssh.connect(
+            ip,
+            username=SSH_USER,
+            key_filename=SSH_KEY_PATH,
+            timeout=10,
+            allow_agent=True,
+            look_for_keys=True
+        )
+
+        stdin, stdout, stderr = ssh.exec_command(command)
+        output = stdout.read().decode('utf-8')
+        error = stderr.read().decode('utf-8')
+        exit_code = stdout.channel.recv_exit_status()
+
+        ssh.close()
+
+        success = exit_code == 0
+        result = output if success else error
+        return success, result
+
+    except Exception as e:
+        return False, str(e)
+
+
+def update_device_status():
+    """Update status of all devices based on last_seen"""
+    conn = get_db()
+    c = conn.cursor()
+
+    # Mark devices as offline if not seen in 60 seconds
+    threshold = datetime.now() - timedelta(seconds=60)
+    c.execute('''
+        UPDATE devices
+        SET status = 'offline'
+        WHERE last_seen < ? AND status != 'offline'
+    ''', (threshold,))
+
+    conn.commit()
+    conn.close()
 
 
 class StreamOrchestrator:
@@ -66,8 +152,12 @@ class StreamOrchestrator:
         self.logger.addHandler(handler)
         self.logger.setLevel(getattr(logging, LOG_LEVEL))
 
-        # Flask app for receiving MediaMTX webhooks
-        self.app = Flask(__name__)
+        # Initialize database
+        init_db()
+
+        # Flask app for receiving MediaMTX webhooks and device management
+        self.app = Flask(__name__, static_folder=str(STATIC_DIR))
+        CORS(self.app)
         self.setup_routes()
 
     def setup_routes(self):
@@ -163,7 +253,7 @@ class StreamOrchestrator:
         def register_device():
             """
             Register device information for a stream.
-            Useful for pre-registering device info before the stream connects.
+            Called by Raspberry Pis when they start streaming.
             """
             data = request.get_json()
             stream_name = data.get('stream_name', '')
@@ -173,15 +263,309 @@ class StreamOrchestrator:
             if not stream_name:
                 return jsonify({'status': 'error', 'message': 'stream_name is required'}), 400
 
-            # Store device info
+            # Get client IP (Tailscale IP)
+            client_ip = request.remote_addr
+
+            # Store device info in memory
             self.device_info[stream_name] = {
                 'device_id': device_id,
                 'password': password,
                 'timestamp': time.time()
             }
 
-            self.logger.info(f"Registered device info for stream: {stream_name} (device_id: {device_id})")
-            return jsonify({'status': 'ok', 'stream_name': stream_name, 'device_id': device_id}), 200
+            # Store device info in database
+            try:
+                conn = get_db()
+                c = conn.cursor()
+
+                # Check if device exists
+                c.execute('SELECT * FROM devices WHERE device_id = ?', (device_id,))
+                existing = c.fetchone()
+
+                if existing:
+                    # Update existing device
+                    c.execute('''
+                        UPDATE devices
+                        SET stream_name = ?, tailscale_ip = ?, last_seen = ?, status = 'online'
+                        WHERE device_id = ?
+                    ''', (stream_name, client_ip, datetime.now(), device_id))
+                else:
+                    # Insert new device
+                    c.execute('''
+                        INSERT INTO devices (device_id, stream_name, tailscale_ip, last_seen, status)
+                        VALUES (?, ?, ?, ?, 'online')
+                    ''', (device_id, stream_name, client_ip, datetime.now()))
+
+                conn.commit()
+                conn.close()
+
+                self.logger.info(f"Registered device: {device_id} (stream: {stream_name}, IP: {client_ip})")
+                return jsonify({'status': 'ok', 'stream_name': stream_name, 'device_id': device_id}), 200
+
+            except Exception as e:
+                self.logger.error(f"Error registering device in database: {e}")
+                # Still return success for backward compatibility
+                return jsonify({'status': 'ok', 'stream_name': stream_name, 'device_id': device_id}), 200
+
+        # Web Dashboard Route
+        @self.app.route('/')
+        def index():
+            """Serve the web dashboard"""
+            return send_from_directory(str(STATIC_DIR), 'index.html')
+
+        # Device Management API Routes
+        @self.app.route('/api/devices', methods=['GET'])
+        def list_devices():
+            """List all registered devices"""
+            try:
+                update_device_status()
+
+                conn = get_db()
+                c = conn.cursor()
+                c.execute('SELECT * FROM devices ORDER BY device_id')
+                devices = [dict(row) for row in c.fetchall()]
+                conn.close()
+
+                return jsonify(devices)
+
+            except Exception as e:
+                self.logger.error(f"Error listing devices: {e}")
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/device/<device_id>', methods=['GET'])
+        def get_device_info(device_id):
+            """Get details of a specific device"""
+            try:
+                conn = get_db()
+                c = conn.cursor()
+                c.execute('SELECT * FROM devices WHERE device_id = ?', (device_id,))
+                device = c.fetchone()
+                conn.close()
+
+                if not device:
+                    return jsonify({'error': 'Device not found'}), 404
+
+                return jsonify(dict(device))
+
+            except Exception as e:
+                self.logger.error(f"Error getting device: {e}")
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/device/<device_id>/restart', methods=['POST'])
+        def restart_device(device_id):
+            """Restart a device's camera stream service"""
+            try:
+                conn = get_db()
+                c = conn.cursor()
+                c.execute('SELECT tailscale_ip FROM devices WHERE device_id = ?', (device_id,))
+                result = c.fetchone()
+                conn.close()
+
+                if not result or not result['tailscale_ip']:
+                    return jsonify({'error': 'Device not found or no IP'}), 404
+
+                ip = result['tailscale_ip']
+
+                # Restart the systemd service
+                success, output = ssh_exec(ip, 'sudo systemctl restart camera-stream.service')
+
+                if success:
+                    self.logger.info(f"Restarted device {device_id}")
+                    return jsonify({'status': 'ok', 'message': 'Device restarted successfully'})
+                else:
+                    self.logger.error(f"Failed to restart {device_id}: {output}")
+                    return jsonify({'error': output}), 500
+
+            except Exception as e:
+                self.logger.error(f"Error restarting device: {e}")
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/device/<device_id>/stop', methods=['POST'])
+        def stop_device(device_id):
+            """Stop a device's camera stream service"""
+            try:
+                conn = get_db()
+                c = conn.cursor()
+                c.execute('SELECT tailscale_ip FROM devices WHERE device_id = ?', (device_id,))
+                result = c.fetchone()
+                conn.close()
+
+                if not result or not result['tailscale_ip']:
+                    return jsonify({'error': 'Device not found or no IP'}), 404
+
+                ip = result['tailscale_ip']
+                success, output = ssh_exec(ip, 'sudo systemctl stop camera-stream.service')
+
+                if success:
+                    self.logger.info(f"Stopped device {device_id}")
+                    return jsonify({'status': 'ok', 'message': 'Device stopped successfully'})
+                else:
+                    return jsonify({'error': output}), 500
+
+            except Exception as e:
+                self.logger.error(f"Error stopping device: {e}")
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/device/<device_id>/start', methods=['POST'])
+        def start_device(device_id):
+            """Start a device's camera stream service"""
+            try:
+                conn = get_db()
+                c = conn.cursor()
+                c.execute('SELECT tailscale_ip FROM devices WHERE device_id = ?', (device_id,))
+                result = c.fetchone()
+                conn.close()
+
+                if not result or not result['tailscale_ip']:
+                    return jsonify({'error': 'Device not found or no IP'}), 404
+
+                ip = result['tailscale_ip']
+                success, output = ssh_exec(ip, 'sudo systemctl start camera-stream.service')
+
+                if success:
+                    self.logger.info(f"Started device {device_id}")
+                    return jsonify({'status': 'ok', 'message': 'Device started successfully'})
+                else:
+                    return jsonify({'error': output}), 500
+
+            except Exception as e:
+                self.logger.error(f"Error starting device: {e}")
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/device/<device_id>/logs', methods=['GET'])
+        def get_device_logs(device_id):
+            """Get service logs from a device"""
+            try:
+                conn = get_db()
+                c = conn.cursor()
+                c.execute('SELECT tailscale_ip FROM devices WHERE device_id = ?', (device_id,))
+                result = c.fetchone()
+                conn.close()
+
+                if not result or not result['tailscale_ip']:
+                    return jsonify({'error': 'Device not found or no IP'}), 404
+
+                ip = result['tailscale_ip']
+                lines = request.args.get('lines', '50')
+
+                success, output = ssh_exec(ip, f'sudo journalctl -u camera-stream.service -n {lines} --no-pager')
+
+                if success:
+                    return jsonify({'logs': output})
+                else:
+                    return jsonify({'error': output}), 500
+
+            except Exception as e:
+                self.logger.error(f"Error getting logs: {e}")
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/device/<device_id>/config', methods=['PUT'])
+        def update_device_config(device_id):
+            """Update device configuration"""
+            try:
+                data = request.get_json()
+
+                conn = get_db()
+                c = conn.cursor()
+                c.execute('SELECT tailscale_ip FROM devices WHERE device_id = ?', (device_id,))
+                result = c.fetchone()
+
+                if not result or not result['tailscale_ip']:
+                    conn.close()
+                    return jsonify({'error': 'Device not found or no IP'}), 404
+
+                ip = result['tailscale_ip']
+
+                # Update database
+                updates = []
+                values = []
+                if 'width' in data:
+                    updates.append('width = ?')
+                    values.append(data['width'])
+                if 'height' in data:
+                    updates.append('height = ?')
+                    values.append(data['height'])
+                if 'fps' in data:
+                    updates.append('fps = ?')
+                    values.append(data['fps'])
+
+                if updates:
+                    values.append(device_id)
+                    c.execute(f'UPDATE devices SET {", ".join(updates)} WHERE device_id = ?', values)
+                    conn.commit()
+
+                conn.close()
+
+                # Update config file on device
+                commands = []
+                if 'width' in data:
+                    commands.append(f"sed -i 's/^WIDTH=.*/WIDTH={data['width']}/' ~/counter-stream/device-info.conf")
+                if 'height' in data:
+                    commands.append(f"sed -i 's/^HEIGHT=.*/HEIGHT={data['height']}/' ~/counter-stream/device-info.conf")
+                if 'fps' in data:
+                    commands.append(f"sed -i 's/^FPS=.*/FPS={data['fps']}/' ~/counter-stream/device-info.conf")
+
+                if commands:
+                    command = ' && '.join(commands)
+                    success, output = ssh_exec(ip, command)
+
+                    if not success:
+                        return jsonify({'error': f'Failed to update config file: {output}'}), 500
+
+                    # Restart service to apply changes
+                    success, output = ssh_exec(ip, 'sudo systemctl restart camera-stream.service')
+                    if not success:
+                        return jsonify({'error': f'Config updated but restart failed: {output}'}), 500
+
+                self.logger.info(f"Updated config for {device_id}")
+                return jsonify({'status': 'ok', 'message': 'Configuration updated successfully'})
+
+            except Exception as e:
+                self.logger.error(f"Error updating config: {e}")
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/device/<device_id>/status', methods=['GET'])
+        def get_device_service_status(device_id):
+            """Get current service status from device"""
+            try:
+                conn = get_db()
+                c = conn.cursor()
+                c.execute('SELECT tailscale_ip FROM devices WHERE device_id = ?', (device_id,))
+                result = c.fetchone()
+                conn.close()
+
+                if not result or not result['tailscale_ip']:
+                    return jsonify({'error': 'Device not found or no IP'}), 404
+
+                ip = result['tailscale_ip']
+                success, output = ssh_exec(ip, 'sudo systemctl is-active camera-stream.service')
+
+                if success:
+                    status = output.strip()
+                    return jsonify({'service_status': status, 'is_running': status == 'active'})
+                else:
+                    return jsonify({'service_status': 'unknown', 'is_running': False})
+
+            except Exception as e:
+                self.logger.error(f"Error getting status: {e}")
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/server/info', methods=['GET'])
+        def server_info():
+            """Get server information"""
+            try:
+                # Get Tailscale IP
+                result = subprocess.run(['tailscale', 'ip', '-4'], capture_output=True, text=True, timeout=5)
+                tailscale_ip = result.stdout.strip() if result.returncode == 0 else 'Unknown'
+
+                return jsonify({
+                    'tailscale_ip': tailscale_ip,
+                    'rtsp_port': RTSP_PORT,
+                    'orchestrator_port': ORCHESTRATOR_PORT
+                })
+            except Exception as e:
+                self.logger.error(f"Error getting server info: {e}")
+                return jsonify({'error': str(e)}), 500
 
     def start_processor(self, stream_name: str):
         """

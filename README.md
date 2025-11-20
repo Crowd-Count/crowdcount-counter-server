@@ -48,6 +48,15 @@ Server-side application for receiving and processing video streams from Raspberr
 - Runs computer vision algorithms
 - Base class provided for easy extension
 
+### 4. Web Dashboard & Device Management
+- Beautiful web UI for managing all Raspberry Pi devices
+- Remote control via SSH (start, stop, restart cameras)
+- Live device status monitoring
+- Configuration management (resolution, FPS)
+- Device logs viewer
+- Persistent device database (SQLite)
+- Auto-refresh device status
+
 ## Directory Structure
 
 ```
@@ -57,7 +66,10 @@ crowdcount-counter-server/
 ├── data/                       # Runtime data
 │   ├── streams/               # Stream metadata
 │   ├── recordings/            # Video recordings (if enabled)
+│   ├── devices.db             # Device database (auto-created)
 │   └── server.log            # Server logs
+├── static/                     # Web dashboard
+│   └── index.html             # Dashboard UI
 ├── src/
 │   ├── config/
 │   │   ├── mediamtx.yml      # MediaMTX configuration
@@ -71,6 +83,7 @@ crowdcount-counter-server/
 ├── scripts/
 │   ├── setup.sh              # Setup script (downloads MediaMTX)
 │   └── run_server.py         # Main entry point
+├── setup_ssh.sh               # SSH setup helper
 └── README.md
 ```
 
@@ -87,13 +100,41 @@ cd crowdcount-counter-server
 
 ### 2. Install Python Dependencies
 
-If any are missing:
-
 ```bash
-pip3 install opencv-python flask requests numpy
+pip3 install -r requirements.txt
 ```
 
-### 3. Verify Tailscale
+This will install:
+- OpenCV for video processing
+- Flask for web server
+- Paramiko for SSH device control
+- YOLO (ultralytics) for people counting
+- And other dependencies
+
+### 3. Set Up SSH Access (for Remote Device Control)
+
+To enable remote control of Raspberry Pi devices, set up SSH keys:
+
+```bash
+# Run the automated setup script
+bash setup_ssh.sh
+```
+
+This will:
+1. Generate an SSH key if you don't have one
+2. Guide you through copying it to each Raspberry Pi
+3. Verify SSH connections
+
+**Manual SSH setup (alternative):**
+```bash
+# Generate SSH key
+ssh-keygen -t rsa -b 4096
+
+# Copy to each Pi
+ssh-copy-id pi@<TAILSCALE_IP>
+```
+
+### 4. Verify Tailscale
 
 Make sure Tailscale is running:
 
@@ -134,6 +175,39 @@ Example:
 ```bash
 python3 stream_to_mediamtx.py 100.64.1.2 camera1
 ```
+
+### Using the Web Dashboard
+
+Once the server is running, open your web browser to:
+
+```
+http://localhost:5000
+```
+
+Or from another device on your Tailscale network:
+
+```
+http://<YOUR_TAILSCALE_IP>:5000
+```
+
+**Dashboard Features:**
+
+- **Device Overview**: See all registered devices with online/offline status
+- **Remote Control**:
+  - **Start**: Start camera stream on a device
+  - **Stop**: Stop camera stream on a device
+  - **Restart**: Restart camera stream service
+- **Configuration**: Update resolution, FPS remotely
+- **Logs**: View systemd logs from any device
+- **Stream URLs**: Quick access to RTSP URLs
+- **Auto-refresh**: Dashboard updates every 10 seconds
+
+**Device Management Actions:**
+
+1. **Restart a camera**: Click "Restart" button - camera stream restarts in ~10 seconds
+2. **Change settings**: Click "Config", adjust resolution/FPS, click "Save & Restart"
+3. **View logs**: Click "Logs" to troubleshoot issues
+4. **Stop streaming**: Click "Stop" to temporarily disable a camera
 
 ### Viewing Streams
 

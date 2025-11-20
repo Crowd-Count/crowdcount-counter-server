@@ -40,7 +40,18 @@ STREAM_HEALTH_CHECK_INTERVAL = 10  # Seconds between stream health checks
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 LOG_FILE = DATA_DIR / "server.log"
 
+# Database settings
+DB_PATH = DATA_DIR / "devices.db"
+
+# SSH settings for remote device control
+SSH_KEY_PATH = os.path.expanduser('~/.ssh/id_rsa')
+SSH_USER = 'pi'  # Default Raspberry Pi username
+
+# Web dashboard
+STATIC_DIR = BASE_DIR / "static"
+
 # Create directories if they don't exist
 DATA_DIR.mkdir(exist_ok=True)
 STREAMS_DIR.mkdir(exist_ok=True)
 RECORDINGS_DIR.mkdir(exist_ok=True)
+STATIC_DIR.mkdir(exist_ok=True)
