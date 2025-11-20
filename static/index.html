@@ -1,0 +1,718 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CrowdCount Device Manager</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+
+        header {
+            background: white;
+            padding: 30px;
+            border-radius: 10px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+            margin-bottom: 30px;
+        }
+
+        h1 {
+            color: #333;
+            margin-bottom: 10px;
+        }
+
+        .server-info {
+            color: #666;
+            font-size: 14px;
+            margin-top: 10px;
+        }
+
+        .server-info span {
+            margin-right: 20px;
+        }
+
+        .controls {
+            background: white;
+            padding: 20px;
+            border-radius: 10px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+            margin-bottom: 20px;
+            display: flex;
+            gap: 10px;
+            align-items: center;
+        }
+
+        .btn {
+            padding: 10px 20px;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 500;
+            transition: all 0.3s;
+        }
+
+        .btn-primary {
+            background: #667eea;
+            color: white;
+        }
+
+        .btn-primary:hover {
+            background: #5568d3;
+        }
+
+        .btn-success {
+            background: #48bb78;
+            color: white;
+        }
+
+        .btn-success:hover {
+            background: #38a169;
+        }
+
+        .btn-warning {
+            background: #ed8936;
+            color: white;
+        }
+
+        .btn-warning:hover {
+            background: #dd6b20;
+        }
+
+        .btn-danger {
+            background: #f56565;
+            color: white;
+        }
+
+        .btn-danger:hover {
+            background: #e53e3e;
+        }
+
+        .btn-secondary {
+            background: #718096;
+            color: white;
+        }
+
+        .btn-secondary:hover {
+            background: #4a5568;
+        }
+
+        .btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .devices-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(350px, 1fr));
+            gap: 20px;
+        }
+
+        .device-card {
+            background: white;
+            border-radius: 10px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+            overflow: hidden;
+            transition: transform 0.3s;
+        }
+
+        .device-card:hover {
+            transform: translateY(-5px);
+        }
+
+        .device-header {
+            padding: 20px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+        }
+
+        .device-name {
+            font-size: 20px;
+            font-weight: bold;
+            margin-bottom: 5px;
+        }
+
+        .device-stream {
+            font-size: 14px;
+            opacity: 0.9;
+        }
+
+        .device-body {
+            padding: 20px;
+        }
+
+        .device-info {
+            margin-bottom: 15px;
+        }
+
+        .info-row {
+            display: flex;
+            justify-content: space-between;
+            padding: 8px 0;
+            border-bottom: 1px solid #eee;
+        }
+
+        .info-label {
+            color: #666;
+            font-size: 14px;
+        }
+
+        .info-value {
+            color: #333;
+            font-weight: 500;
+            font-size: 14px;
+        }
+
+        .status-badge {
+            display: inline-block;
+            padding: 4px 12px;
+            border-radius: 20px;
+            font-size: 12px;
+            font-weight: 600;
+        }
+
+        .status-online {
+            background: #c6f6d5;
+            color: #22543d;
+        }
+
+        .status-offline {
+            background: #fed7d7;
+            color: #742a2a;
+        }
+
+        .device-actions {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+
+        .device-actions .btn {
+            flex: 1;
+            min-width: 100px;
+            font-size: 13px;
+            padding: 8px 12px;
+        }
+
+        .empty-state {
+            background: white;
+            padding: 60px;
+            border-radius: 10px;
+            text-align: center;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        }
+
+        .empty-state h2 {
+            color: #666;
+            margin-bottom: 10px;
+        }
+
+        .empty-state p {
+            color: #999;
+        }
+
+        .loading {
+            text-align: center;
+            padding: 40px;
+            color: white;
+            font-size: 18px;
+        }
+
+        .modal {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.7);
+            z-index: 1000;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .modal.active {
+            display: flex;
+        }
+
+        .modal-content {
+            background: white;
+            padding: 30px;
+            border-radius: 10px;
+            max-width: 600px;
+            width: 90%;
+            max-height: 80vh;
+            overflow-y: auto;
+        }
+
+        .modal-header {
+            margin-bottom: 20px;
+            border-bottom: 2px solid #eee;
+            padding-bottom: 15px;
+        }
+
+        .modal-header h2 {
+            color: #333;
+        }
+
+        .modal-body {
+            margin-bottom: 20px;
+        }
+
+        .form-group {
+            margin-bottom: 15px;
+        }
+
+        .form-group label {
+            display: block;
+            margin-bottom: 5px;
+            color: #333;
+            font-weight: 500;
+        }
+
+        .form-group input {
+            width: 100%;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+            font-size: 14px;
+        }
+
+        .logs-container {
+            background: #1a202c;
+            color: #e2e8f0;
+            padding: 15px;
+            border-radius: 5px;
+            font-family: 'Courier New', monospace;
+            font-size: 12px;
+            max-height: 400px;
+            overflow-y: auto;
+            white-space: pre-wrap;
+        }
+
+        .modal-footer {
+            display: flex;
+            gap: 10px;
+            justify-content: flex-end;
+        }
+
+        .notification {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            padding: 15px 20px;
+            border-radius: 5px;
+            color: white;
+            font-weight: 500;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.2);
+            z-index: 2000;
+            animation: slideIn 0.3s;
+        }
+
+        @keyframes slideIn {
+            from {
+                transform: translateX(400px);
+                opacity: 0;
+            }
+            to {
+                transform: translateX(0);
+                opacity: 1;
+            }
+        }
+
+        .notification.success {
+            background: #48bb78;
+        }
+
+        .notification.error {
+            background: #f56565;
+        }
+
+        .notification.info {
+            background: #4299e1;
+        }
+
+        @media (max-width: 768px) {
+            .devices-grid {
+                grid-template-columns: 1fr;
+            }
+
+            .controls {
+                flex-direction: column;
+            }
+
+            .btn {
+                width: 100%;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>CrowdCount Device Manager</h1>
+            <p>Manage your Raspberry Pi camera devices remotely</p>
+            <div class="server-info" id="serverInfo">
+                <span>Loading server information...</span>
+            </div>
+        </header>
+
+        <div class="controls">
+            <button class="btn btn-primary" onclick="refreshDevices()">Refresh</button>
+            <span style="margin-left: auto; color: #666; font-size: 14px;">
+                Auto-refresh: <span id="countdown">10</span>s
+            </span>
+        </div>
+
+        <div id="devicesContainer">
+            <div class="loading">Loading devices...</div>
+        </div>
+    </div>
+
+    <!-- Config Modal -->
+    <div class="modal" id="configModal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2>Update Device Configuration</h2>
+            </div>
+            <div class="modal-body">
+                <form id="configForm">
+                    <input type="hidden" id="configDeviceId">
+                    <div class="form-group">
+                        <label>Width (pixels)</label>
+                        <input type="number" id="configWidth" min="320" max="1920" step="1">
+                    </div>
+                    <div class="form-group">
+                        <label>Height (pixels)</label>
+                        <input type="number" id="configHeight" min="240" max="1080" step="1">
+                    </div>
+                    <div class="form-group">
+                        <label>FPS (frames per second)</label>
+                        <input type="number" id="configFps" min="1" max="60" step="1">
+                    </div>
+                </form>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" onclick="closeConfigModal()">Cancel</button>
+                <button class="btn btn-primary" onclick="saveConfig()">Save & Restart</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Logs Modal -->
+    <div class="modal" id="logsModal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2>Device Logs - <span id="logsDeviceId"></span></h2>
+            </div>
+            <div class="modal-body">
+                <div class="logs-container" id="logsContent">
+                    Loading logs...
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-primary" onclick="refreshLogs()">Refresh</button>
+                <button class="btn btn-secondary" onclick="closeLogsModal()">Close</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let devices = [];
+        let refreshInterval;
+        let countdownInterval;
+        let countdown = 10;
+
+        // Initialize
+        document.addEventListener('DOMContentLoaded', () => {
+            loadServerInfo();
+            loadDevices();
+            startAutoRefresh();
+        });
+
+        // Server info
+        async function loadServerInfo() {
+            try {
+                const response = await fetch('/api/server/info');
+                const data = await response.json();
+                document.getElementById('serverInfo').innerHTML = `
+                    <span><strong>Server IP:</strong> ${data.tailscale_ip}</span>
+                    <span><strong>RTSP Port:</strong> ${data.rtsp_port}</span>
+                    <span><strong>Orchestrator:</strong> ${data.orchestrator_port}</span>
+                `;
+            } catch (error) {
+                console.error('Error loading server info:', error);
+            }
+        }
+
+        // Load devices
+        async function loadDevices() {
+            try {
+                const response = await fetch('/api/devices');
+                devices = await response.json();
+                renderDevices();
+            } catch (error) {
+                console.error('Error loading devices:', error);
+                showNotification('Failed to load devices', 'error');
+            }
+        }
+
+        // Render devices
+        function renderDevices() {
+            const container = document.getElementById('devicesContainer');
+
+            if (devices.length === 0) {
+                container.innerHTML = `
+                    <div class="empty-state">
+                        <h2>No devices registered yet</h2>
+                        <p>Devices will appear here once they start streaming</p>
+                    </div>
+                `;
+                return;
+            }
+
+            container.innerHTML = `
+                <div class="devices-grid">
+                    ${devices.map(device => renderDeviceCard(device)).join('')}
+                </div>
+            `;
+        }
+
+        // Render device card
+        function renderDeviceCard(device) {
+            const isOnline = device.status === 'online';
+            const lastSeen = device.last_seen ? new Date(device.last_seen).toLocaleString() : 'Never';
+            const streamUrl = `rtsp://${device.tailscale_ip || 'unknown'}:8554/${device.stream_name}`;
+
+            return `
+                <div class="device-card">
+                    <div class="device-header">
+                        <div class="device-name">${device.device_id}</div>
+                        <div class="device-stream">${device.stream_name}</div>
+                    </div>
+                    <div class="device-body">
+                        <div class="device-info">
+                            <div class="info-row">
+                                <span class="info-label">Status</span>
+                                <span class="status-badge status-${isOnline ? 'online' : 'offline'}">
+                                    ${isOnline ? 'Online' : 'Offline'}
+                                </span>
+                            </div>
+                            <div class="info-row">
+                                <span class="info-label">IP Address</span>
+                                <span class="info-value">${device.tailscale_ip || 'Unknown'}</span>
+                            </div>
+                            <div class="info-row">
+                                <span class="info-label">Resolution</span>
+                                <span class="info-value">${device.width}x${device.height}</span>
+                            </div>
+                            <div class="info-row">
+                                <span class="info-label">FPS</span>
+                                <span class="info-value">${device.fps}</span>
+                            </div>
+                            <div class="info-row">
+                                <span class="info-label">Last Seen</span>
+                                <span class="info-value">${lastSeen}</span>
+                            </div>
+                        </div>
+                        <div class="device-actions">
+                            <button class="btn btn-success" onclick="startDevice('${device.device_id}')">Start</button>
+                            <button class="btn btn-warning" onclick="restartDevice('${device.device_id}')">Restart</button>
+                            <button class="btn btn-danger" onclick="stopDevice('${device.device_id}')">Stop</button>
+                            <button class="btn btn-primary" onclick="openConfigModal('${device.device_id}', ${device.width}, ${device.height}, ${device.fps})">Config</button>
+                            <button class="btn btn-secondary" onclick="viewLogs('${device.device_id}')">Logs</button>
+                            <button class="btn btn-secondary" onclick="viewStream('${streamUrl}')">View Stream</button>
+                        </div>
+                    </div>
+                </div>
+            `;
+        }
+
+        // Device actions
+        async function startDevice(deviceId) {
+            try {
+                showNotification(`Starting ${deviceId}...`, 'info');
+                const response = await fetch(`/api/device/${deviceId}/start`, { method: 'POST' });
+                const data = await response.json();
+                if (response.ok) {
+                    showNotification(`${deviceId} started successfully`, 'success');
+                    setTimeout(loadDevices, 2000);
+                } else {
+                    showNotification(`Failed to start ${deviceId}: ${data.error}`, 'error');
+                }
+            } catch (error) {
+                showNotification(`Error: ${error.message}`, 'error');
+            }
+        }
+
+        async function restartDevice(deviceId) {
+            try {
+                showNotification(`Restarting ${deviceId}...`, 'info');
+                const response = await fetch(`/api/device/${deviceId}/restart`, { method: 'POST' });
+                const data = await response.json();
+                if (response.ok) {
+                    showNotification(`${deviceId} restarted successfully`, 'success');
+                    setTimeout(loadDevices, 2000);
+                } else {
+                    showNotification(`Failed to restart ${deviceId}: ${data.error}`, 'error');
+                }
+            } catch (error) {
+                showNotification(`Error: ${error.message}`, 'error');
+            }
+        }
+
+        async function stopDevice(deviceId) {
+            try {
+                showNotification(`Stopping ${deviceId}...`, 'info');
+                const response = await fetch(`/api/device/${deviceId}/stop`, { method: 'POST' });
+                const data = await response.json();
+                if (response.ok) {
+                    showNotification(`${deviceId} stopped successfully`, 'success');
+                    setTimeout(loadDevices, 2000);
+                } else {
+                    showNotification(`Failed to stop ${deviceId}: ${data.error}`, 'error');
+                }
+            } catch (error) {
+                showNotification(`Error: ${error.message}`, 'error');
+            }
+        }
+
+        // Config modal
+        function openConfigModal(deviceId, width, height, fps) {
+            document.getElementById('configDeviceId').value = deviceId;
+            document.getElementById('configWidth').value = width;
+            document.getElementById('configHeight').value = height;
+            document.getElementById('configFps').value = fps;
+            document.getElementById('configModal').classList.add('active');
+        }
+
+        function closeConfigModal() {
+            document.getElementById('configModal').classList.remove('active');
+        }
+
+        async function saveConfig() {
+            const deviceId = document.getElementById('configDeviceId').value;
+            const width = parseInt(document.getElementById('configWidth').value);
+            const height = parseInt(document.getElementById('configHeight').value);
+            const fps = parseInt(document.getElementById('configFps').value);
+
+            try {
+                showNotification('Updating configuration...', 'info');
+                const response = await fetch(`/api/device/${deviceId}/config`, {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ width, height, fps })
+                });
+
+                const data = await response.json();
+                if (response.ok) {
+                    showNotification('Configuration updated and device restarted', 'success');
+                    closeConfigModal();
+                    setTimeout(loadDevices, 2000);
+                } else {
+                    showNotification(`Failed to update config: ${data.error}`, 'error');
+                }
+            } catch (error) {
+                showNotification(`Error: ${error.message}`, 'error');
+            }
+        }
+
+        // Logs modal
+        let currentLogsDevice = null;
+
+        async function viewLogs(deviceId) {
+            currentLogsDevice = deviceId;
+            document.getElementById('logsDeviceId').textContent = deviceId;
+            document.getElementById('logsModal').classList.add('active');
+            await refreshLogs();
+        }
+
+        async function refreshLogs() {
+            if (!currentLogsDevice) return;
+
+            try {
+                document.getElementById('logsContent').textContent = 'Loading logs...';
+                const response = await fetch(`/api/device/${currentLogsDevice}/logs?lines=100`);
+                const data = await response.json();
+                if (response.ok) {
+                    document.getElementById('logsContent').textContent = data.logs || 'No logs available';
+                } else {
+                    document.getElementById('logsContent').textContent = `Error: ${data.error}`;
+                }
+            } catch (error) {
+                document.getElementById('logsContent').textContent = `Error: ${error.message}`;
+            }
+        }
+
+        function closeLogsModal() {
+            document.getElementById('logsModal').classList.remove('active');
+            currentLogsDevice = null;
+        }
+
+        // View stream
+        function viewStream(streamUrl) {
+            showNotification(`Stream URL: ${streamUrl}`, 'info');
+            alert(`RTSP Stream URL:\n\n${streamUrl}\n\nOpen this URL in VLC or another RTSP player.`);
+        }
+
+        // Refresh
+        function refreshDevices() {
+            loadDevices();
+            resetCountdown();
+        }
+
+        // Auto-refresh
+        function startAutoRefresh() {
+            refreshInterval = setInterval(loadDevices, 10000);
+            countdownInterval = setInterval(() => {
+                countdown--;
+                document.getElementById('countdown').textContent = countdown;
+                if (countdown <= 0) {
+                    countdown = 10;
+                }
+            }, 1000);
+        }
+
+        function resetCountdown() {
+            countdown = 10;
+            document.getElementById('countdown').textContent = countdown;
+        }
+
+        // Notifications
+        function showNotification(message, type = 'info') {
+            const notification = document.createElement('div');
+            notification.className = `notification ${type}`;
+            notification.textContent = message;
+            document.body.appendChild(notification);
+
+            setTimeout(() => {
+                notification.remove();
+            }, 4000);
+        }
+
+        // Close modals on background click
+        document.querySelectorAll('.modal').forEach(modal => {
+            modal.addEventListener('click', (e) => {
+                if (e.target === modal) {
+                    modal.classList.remove('active');
+                }
+            });
+        });
+    </script>
+</body>
+</html>
