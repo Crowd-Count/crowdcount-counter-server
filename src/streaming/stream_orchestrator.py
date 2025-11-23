@@ -403,11 +403,16 @@ class StreamOrchestrator:
             return Response(generate(),
                           mimetype='multipart/x-mixed-replace; boundary=frame')
 
-        # Web Dashboard Route
+        # Web Dashboard Routes
         @self.app.route('/')
         def index():
             """Serve the web dashboard"""
             return send_from_directory(str(STATIC_DIR), 'index.html')
+
+        @self.app.route('/<path:filename>')
+        def serve_static(filename):
+            """Serve static files (CSS, JS, images, etc.)"""
+            return send_from_directory(str(STATIC_DIR), filename)
 
         # Device Management API Routes
         @self.app.route('/api/devices', methods=['GET'])
