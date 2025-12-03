@@ -71,21 +71,56 @@ def get_db():
     return conn
 
 
-def ssh_exec(ip: str, command: str) -> tuple:
-    """Execute command via SSH on remote device"""
+def ssh_exec(ip: str, command: str, device_id: str = None, password: str = None) -> tuple:
+    """
+    Execute command via SSH on remote device
+
+    Args:
+        ip: Tailscale IP address of the device
+        command: Command to execute
+        device_id: Device ID (used to determine username for developer counters)
+        password: SSH password (optional, for developer counters)
+
+    Returns:
+        tuple: (success: bool, result: str)
+    """
     try:
         ssh = paramiko.SSHClient()
         ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
-        # Try to connect with SSH key
-        ssh.connect(
-            ip,
-            username=SSH_USER,
-            key_filename=SSH_KEY_PATH,
-            timeout=10,
-            allow_agent=True,
-            look_for_keys=True
-        )
+        # Determine username based on device_id
+        # Developer counters: format is "username@hostname" (e.g., "crowdcount1@crowdcount1")
+        # Normal counters: use username "counter"
+        username = SSH_USER  # Default: 'pi'
+
+        if device_id:
+            if '@' in device_id:
+                # Developer counter: extract username from device_id
+                username = device_id.split('@')[0]
+            else:
+                # Normal counter: use "counter" as username
+                username = "counter"
+
+        # Try password authentication if provided
+        if password:
+            ssh.connect(
+                ip,
+                username=username,
+                password=password,
+                timeout=10,
+                allow_agent=False,
+                look_for_keys=False
+            )
+        else:
+            # Try key-based authentication (for normal counters or if no password)
+            ssh.connect(
+                ip,
+                username=username,
+                key_filename=SSH_KEY_PATH,
+                timeout=10,
+                allow_agent=True,
+                look_for_keys=True
+            )
 
         stdin, stdout, stderr = ssh.exec_command(command)
         output = stdout.read().decode('utf-8')
@@ -98,6 +133,8 @@ def ssh_exec(ip: str, command: str) -> tuple:
         result = output if success else error
         return success, result
 
+    except paramiko.AuthenticationException as e:
+        return False, f"Authentication failed: {str(e)}"
     except Exception as e:
         return False, str(e)
 
@@ -150,6 +187,10 @@ class StreamOrchestrator:
         # Track device information for each stream (device_id, password, etc.)
         self.device_info: Dict[str, dict] = {}
 
+        # Track SSH passwords for devices (for developer counters)
+        # Format: {device_id: password}
+        self.ssh_passwords: Dict[str, str] = {}
+
         self.running = False
         self.monitor_thread = None
 
@@ -184,6 +225,9 @@ class StreamOrchestrator:
                     # Stream already has a processor running, ignore
                     return jsonify({'status': 'ok', 'message': 'Already processing'}), 200
 
+                # Get client IP (Tailscale IP)
+                client_ip = request.remote_addr
+
                 # Get device info from pre-registration, or use defaults
                 if stream_name in self.device_info:
                     device_id = self.device_info[stream_name].get('device_id', stream_name)
@@ -198,11 +242,38 @@ class StreamOrchestrator:
                         'timestamp': time.time()
                     }
 
+                # Update device status in database
+                try:
+                    conn = get_db()
+                    c = conn.cursor()
+                    c.execute('SELECT * FROM devices WHERE device_id = ?', (device_id,))
+                    existing = c.fetchone()
+
+                    if existing:
+                        # Update existing device
+                        c.execute('''
+                            UPDATE devices
+                            SET stream_name = ?, tailscale_ip = ?, last_seen = ?, status = 'online'
+                            WHERE device_id = ?
+                        ''', (stream_name, client_ip, datetime.now(), device_id))
+                    else:
+                        # Insert new device
+                        c.execute('''
+                            INSERT INTO devices (device_id, stream_name, tailscale_ip, last_seen, status)
+                            VALUES (?, ?, ?, ?, 'online')
+                        ''', (device_id, stream_name, client_ip, datetime.now()))
+
+                    conn.commit()
+                    conn.close()
+                except Exception as e:
+                    self.logger.error(f"Error updating device status in database: {e}")
+
                 # Detailed logging for testing
                 self.logger.info("=" * 60)
                 self.logger.info(f"🔗 NEW DEVICE CONNECTED")
                 self.logger.info(f"   Stream Name: {stream_name}")
                 self.logger.info(f"   Device ID:   {device_id}")
+                self.logger.info(f"   IP Address:  {client_ip}")
                 self.logger.info(f"   Password:    {password if password else '(none)'}")
                 self.logger.info("=" * 60)
 
@@ -433,7 +504,7 @@ class StreamOrchestrator:
                 self.logger.error(f"Error listing devices: {e}")
                 return jsonify({'error': str(e)}), 500
 
-        @self.app.route('/api/device/<device_id>', methods=['GET'])
+        @self.app.route('/api/device/<path:device_id>', methods=['GET'])
         def get_device_info(device_id):
             """Get details of a specific device"""
             try:
@@ -452,7 +523,7 @@ class StreamOrchestrator:
                 self.logger.error(f"Error getting device: {e}")
                 return jsonify({'error': str(e)}), 500
 
-        @self.app.route('/api/device/<device_id>/restart', methods=['POST'])
+        @self.app.route('/api/device/<path:device_id>/restart', methods=['POST'])
         def restart_device(device_id):
             """Restart a device's camera stream service"""
             try:
@@ -467,21 +538,40 @@ class StreamOrchestrator:
 
                 ip = result['tailscale_ip']
 
+                # Get SSH password if available
+                password = self.ssh_passwords.get(device_id)
+
+                # Debug logging
+                self.logger.info(f"Restart request for device: {device_id}")
+                self.logger.info(f"  - Has '@' in device_id: {'@' in device_id}")
+                self.logger.info(f"  - Password in ssh_passwords: {device_id in self.ssh_passwords}")
+                self.logger.info(f"  - Password value: {'***' if password else 'None'}")
+
+                # Check if password is required but not provided
+                if '@' in device_id and not password:
+                    self.logger.info(f"  → Returning 401: Password required")
+                    return jsonify({
+                        'error': 'Password required',
+                        'requires_password': True
+                    }), 401
+
                 # Restart the systemd service
-                success, output = ssh_exec(ip, 'sudo systemctl restart camera-stream.service')
+                self.logger.info(f"  → Attempting SSH connection to {ip}")
+                success, output = ssh_exec(ip, 'sudo systemctl restart camera-stream.service',
+                                          device_id=device_id, password=password)
 
                 if success:
-                    self.logger.info(f"Restarted device {device_id}")
+                    self.logger.info(f"✓ Restarted device {device_id}")
                     return jsonify({'status': 'ok', 'message': 'Device restarted successfully'})
                 else:
-                    self.logger.error(f"Failed to restart {device_id}: {output}")
+                    self.logger.error(f"✗ Failed to restart {device_id}: {output}")
                     return jsonify({'error': output}), 500
 
             except Exception as e:
                 self.logger.error(f"Error restarting device: {e}")
                 return jsonify({'error': str(e)}), 500
 
-        @self.app.route('/api/device/<device_id>/stop', methods=['POST'])
+        @self.app.route('/api/device/<path:device_id>/stop', methods=['POST'])
         def stop_device(device_id):
             """Stop a device's camera stream service"""
             try:
@@ -495,7 +585,19 @@ class StreamOrchestrator:
                     return jsonify({'error': 'Device not found or no IP'}), 404
 
                 ip = result['tailscale_ip']
-                success, output = ssh_exec(ip, 'sudo systemctl stop camera-stream.service')
+
+                # Get SSH password if available
+                password = self.ssh_passwords.get(device_id)
+
+                # Check if password is required but not provided
+                if '@' in device_id and not password:
+                    return jsonify({
+                        'error': 'Password required',
+                        'requires_password': True
+                    }), 401
+
+                success, output = ssh_exec(ip, 'sudo systemctl stop camera-stream.service',
+                                          device_id=device_id, password=password)
 
                 if success:
                     self.logger.info(f"Stopped device {device_id}")
@@ -507,7 +609,7 @@ class StreamOrchestrator:
                 self.logger.error(f"Error stopping device: {e}")
                 return jsonify({'error': str(e)}), 500
 
-        @self.app.route('/api/device/<device_id>/start', methods=['POST'])
+        @self.app.route('/api/device/<path:device_id>/start', methods=['POST'])
         def start_device(device_id):
             """Start a device's camera stream service"""
             try:
@@ -521,7 +623,19 @@ class StreamOrchestrator:
                     return jsonify({'error': 'Device not found or no IP'}), 404
 
                 ip = result['tailscale_ip']
-                success, output = ssh_exec(ip, 'sudo systemctl start camera-stream.service')
+
+                # Get SSH password if available
+                password = self.ssh_passwords.get(device_id)
+
+                # Check if password is required but not provided
+                if '@' in device_id and not password:
+                    return jsonify({
+                        'error': 'Password required',
+                        'requires_password': True
+                    }), 401
+
+                success, output = ssh_exec(ip, 'sudo systemctl start camera-stream.service',
+                                          device_id=device_id, password=password)
 
                 if success:
                     self.logger.info(f"Started device {device_id}")
@@ -533,7 +647,7 @@ class StreamOrchestrator:
                 self.logger.error(f"Error starting device: {e}")
                 return jsonify({'error': str(e)}), 500
 
-        @self.app.route('/api/device/<device_id>/logs', methods=['GET'])
+        @self.app.route('/api/device/<path:device_id>/logs', methods=['GET'])
         def get_device_logs(device_id):
             """Get service logs from a device"""
             try:
@@ -549,7 +663,18 @@ class StreamOrchestrator:
                 ip = result['tailscale_ip']
                 lines = request.args.get('lines', '50')
 
-                success, output = ssh_exec(ip, f'sudo journalctl -u camera-stream.service -n {lines} --no-pager')
+                # Get SSH password if available
+                password = self.ssh_passwords.get(device_id)
+
+                # Check if password is required but not provided
+                if '@' in device_id and not password:
+                    return jsonify({
+                        'error': 'Password required',
+                        'requires_password': True
+                    }), 401
+
+                success, output = ssh_exec(ip, f'sudo journalctl -u camera-stream.service -n {lines} --no-pager',
+                                          device_id=device_id, password=password)
 
                 if success:
                     return jsonify({'logs': output})
@@ -560,7 +685,7 @@ class StreamOrchestrator:
                 self.logger.error(f"Error getting logs: {e}")
                 return jsonify({'error': str(e)}), 500
 
-        @self.app.route('/api/device/<device_id>/config', methods=['PUT'])
+        @self.app.route('/api/device/<path:device_id>/config', methods=['PUT'])
         def update_device_config(device_id):
             """Update device configuration"""
             try:
@@ -576,6 +701,17 @@ class StreamOrchestrator:
                     return jsonify({'error': 'Device not found or no IP'}), 404
 
                 ip = result['tailscale_ip']
+
+                # Get SSH password if available
+                password = self.ssh_passwords.get(device_id)
+
+                # Check if password is required but not provided
+                if '@' in device_id and not password:
+                    conn.close()
+                    return jsonify({
+                        'error': 'Password required',
+                        'requires_password': True
+                    }), 401
 
                 # Update database
                 updates = []
@@ -608,13 +744,14 @@ class StreamOrchestrator:
 
                 if commands:
                     command = ' && '.join(commands)
-                    success, output = ssh_exec(ip, command)
+                    success, output = ssh_exec(ip, command, device_id=device_id, password=password)
 
                     if not success:
                         return jsonify({'error': f'Failed to update config file: {output}'}), 500
 
                     # Restart service to apply changes
-                    success, output = ssh_exec(ip, 'sudo systemctl restart camera-stream.service')
+                    success, output = ssh_exec(ip, 'sudo systemctl restart camera-stream.service',
+                                              device_id=device_id, password=password)
                     if not success:
                         return jsonify({'error': f'Config updated but restart failed: {output}'}), 500
 
@@ -625,7 +762,7 @@ class StreamOrchestrator:
                 self.logger.error(f"Error updating config: {e}")
                 return jsonify({'error': str(e)}), 500
 
-        @self.app.route('/api/device/<device_id>/status', methods=['GET'])
+        @self.app.route('/api/device/<path:device_id>/status', methods=['GET'])
         def get_device_service_status(device_id):
             """Get current service status from device"""
             try:
@@ -639,7 +776,19 @@ class StreamOrchestrator:
                     return jsonify({'error': 'Device not found or no IP'}), 404
 
                 ip = result['tailscale_ip']
-                success, output = ssh_exec(ip, 'sudo systemctl is-active camera-stream.service')
+
+                # Get SSH password if available
+                password = self.ssh_passwords.get(device_id)
+
+                # Check if password is required but not provided
+                if '@' in device_id and not password:
+                    return jsonify({
+                        'error': 'Password required',
+                        'requires_password': True
+                    }), 401
+
+                success, output = ssh_exec(ip, 'sudo systemctl is-active camera-stream.service',
+                                          device_id=device_id, password=password)
 
                 if success:
                     status = output.strip()
@@ -666,6 +815,59 @@ class StreamOrchestrator:
                 })
             except Exception as e:
                 self.logger.error(f"Error getting server info: {e}")
+                return jsonify({'error': str(e)}), 500
+
+        # SSH Password Management Routes
+        @self.app.route('/api/device/<path:device_id>/ssh/password', methods=['POST'])
+        def set_ssh_password(device_id):
+            """Set SSH password for a device (for developer counters)"""
+            try:
+                data = request.get_json()
+                password = data.get('password', '')
+
+                if not password:
+                    return jsonify({'error': 'Password is required'}), 400
+
+                # Store password in memory
+                self.ssh_passwords[device_id] = password
+                self.logger.info(f"SSH password set for device: {device_id}")
+
+                return jsonify({'status': 'ok', 'message': 'Password stored successfully'})
+
+            except Exception as e:
+                self.logger.error(f"Error setting SSH password: {e}")
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/device/<path:device_id>/ssh/password', methods=['DELETE'])
+        def delete_ssh_password(device_id):
+            """Delete stored SSH password for a device"""
+            try:
+                if device_id in self.ssh_passwords:
+                    del self.ssh_passwords[device_id]
+                    self.logger.info(f"SSH password deleted for device: {device_id}")
+
+                return jsonify({'status': 'ok', 'message': 'Password deleted'})
+
+            except Exception as e:
+                self.logger.error(f"Error deleting SSH password: {e}")
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/device/<path:device_id>/ssh/requires-password', methods=['GET'])
+        def check_password_required(device_id):
+            """Check if device requires SSH password (developer counter)"""
+            try:
+                # Developer counters have '@' in device_id (e.g., crowdcount1@crowdcount1)
+                requires_password = '@' in device_id
+                has_password = device_id in self.ssh_passwords
+
+                return jsonify({
+                    'requires_password': requires_password,
+                    'has_password': has_password,
+                    'device_id': device_id
+                })
+
+            except Exception as e:
+                self.logger.error(f"Error checking password requirement: {e}")
                 return jsonify({'error': str(e)}), 500
 
     def start_processor(self, stream_name: str):

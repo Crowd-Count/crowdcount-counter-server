@@ -89,7 +89,7 @@ Examples:
     multiprocessing.set_start_method('spawn', force=True)
 
     # Create orchestrator with selected processor
-    orchestrator = StreamOrchestrator(processor_class=processor_class)
+    orchestrator = StreamOrchestrator(processor_class=PeopleCounterProcessor)
 
     print("Starting orchestrator...")
     print("Press Ctrl+C to stop")

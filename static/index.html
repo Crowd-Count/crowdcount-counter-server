@@ -92,12 +92,36 @@
         </div>
     </div>
 
+    <!-- Password Modal -->
+    <div class="modal" id="passwordModal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2>SSH Password Required</h2>
+            </div>
+            <div class="modal-body">
+                <p>This device requires SSH password authentication.</p>
+                <p><strong>Device:</strong> <span id="passwordDeviceId"></span></p>
+                <form id="passwordForm" onsubmit="submitPassword(event)">
+                    <div class="form-group">
+                        <label for="sshPassword">SSH Password</label>
+                        <input type="password" id="sshPassword" required autocomplete="off">
+                    </div>
+                </form>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" onclick="closePasswordModal()">Cancel</button>
+                <button class="btn btn-primary" onclick="submitPassword(event)">Submit</button>
+            </div>
+        </div>
+    </div>
+
     <script>
         let devices = [];
         let refreshInterval;
         let countdownInterval;
         let countdown = 10;
         let currentLogsDevice = null;
+        let pendingPasswordAction = null; // Stores the action to retry after password is provided
 
         document.addEventListener('DOMContentLoaded', () => {
             loadServerInfo();
@@ -215,51 +239,33 @@
 
         // Device actions
         async function startDevice(deviceId) {
-            try {
-                showNotification(`Starting ${deviceId}...`, 'info');
-                const response = await fetch(`/api/device/${deviceId}/start`, { method: 'POST' });
-                const data = await response.json();
-                if (response.ok) {
-                    showNotification(`${deviceId} started`, 'success');
-                    setTimeout(loadDevices, 2000);
-                } else {
-                    showNotification(`Failed to start ${deviceId}: ${data.error}`, 'error');
-                }
-            } catch (error) {
-                showNotification(`Error: ${error.message}`, 'error');
-            }
+            showNotification(`Starting ${deviceId}...`, 'info');
+            const encoded = encodeURIComponent(deviceId);
+            await executeDeviceAction(
+                deviceId,
+                () => fetch(`/api/device/${encoded}/start`, { method: 'POST' }),
+                'started'
+            );
         }
 
         async function restartDevice(deviceId) {
-            try {
-                showNotification(`Restarting ${deviceId}...`, 'info');
-                const response = await fetch(`/api/device/${deviceId}/restart`, { method: 'POST' });
-                const data = await response.json();
-                if (response.ok) {
-                    showNotification(`${deviceId} restarted`, 'success');
-                    setTimeout(loadDevices, 2000);
-                } else {
-                    showNotification(`Failed to restart ${deviceId}: ${data.error}`, 'error');
-                }
-            } catch (error) {
-                showNotification(`Error: ${error.message}`, 'error');
-            }
+            showNotification(`Restarting ${deviceId}...`, 'info');
+            const encoded = encodeURIComponent(deviceId);
+            await executeDeviceAction(
+                deviceId,
+                () => fetch(`/api/device/${encoded}/restart`, { method: 'POST' }),
+                'restarted'
+            );
         }
 
         async function stopDevice(deviceId) {
-            try {
-                showNotification(`Stopping ${deviceId}...`, 'info');
-                const response = await fetch(`/api/device/${deviceId}/stop`, { method: 'POST' });
-                const data = await response.json();
-                if (response.ok) {
-                    showNotification(`${deviceId} stopped`, 'success');
-                    setTimeout(loadDevices, 2000);
-                } else {
-                    showNotification(`Failed to stop ${deviceId}: ${data.error}`, 'error');
-                }
-            } catch (error) {
-                showNotification(`Error: ${error.message}`, 'error');
-            }
+            showNotification(`Stopping ${deviceId}...`, 'info');
+            const encoded = encodeURIComponent(deviceId);
+            await executeDeviceAction(
+                deviceId,
+                () => fetch(`/api/device/${encoded}/stop`, { method: 'POST' }),
+                'stopped'
+            );
         }
 
         // Config modal
@@ -281,16 +287,22 @@
             const height = parseInt(document.getElementById('configHeight').value);
             const fps = parseInt(document.getElementById('configFps').value);
 
+            showNotification('Updating configuration...', 'info');
+
             try {
-                showNotification('Updating configuration...', 'info');
-                const response = await fetch(`/api/device/${deviceId}/config`, {
+                const encoded = encodeURIComponent(deviceId);
+                const response = await fetch(`/api/device/${encoded}/config`, {
                     method: 'PUT',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ width, height, fps })
                 });
 
                 const data = await response.json();
-                if (response.ok) {
+
+                if (response.status === 401 && data.requires_password) {
+                    // Password required - prompt user and retry
+                    promptForPassword(deviceId, saveConfig);
+                } else if (response.ok) {
                     showNotification('Configuration updated and device restarted', 'success');
                     closeConfigModal();
                     setTimeout(loadDevices, 2000);
@@ -315,9 +327,15 @@
 
             try {
                 document.getElementById('logsContent').textContent = 'Loading logs...';
-                const response = await fetch(`/api/device/${currentLogsDevice}/logs?lines=100`);
+                const encoded = encodeURIComponent(currentLogsDevice);
+                const response = await fetch(`/api/device/${encoded}/logs?lines=100`);
                 const data = await response.json();
-                if (response.ok) {
+
+                if (response.status === 401 && data.requires_password) {
+                    // Password required - prompt user and retry
+                    closeLogsModal();
+                    promptForPassword(currentLogsDevice, () => viewLogs(currentLogsDevice));
+                } else if (response.ok) {
                     document.getElementById('logsContent').textContent =
                         data.logs || 'No logs available';
                 } else {
@@ -376,6 +394,104 @@
             setTimeout(() => {
                 notification.remove();
             }, 4000);
+        }
+
+        // Password Modal
+        function promptForPassword(deviceId, retryAction) {
+            pendingPasswordAction = retryAction;
+            document.getElementById('passwordDeviceId').textContent = deviceId;
+            document.getElementById('sshPassword').value = '';
+            document.getElementById('passwordModal').classList.add('active');
+            // Focus password input after modal opens
+            setTimeout(() => {
+                document.getElementById('sshPassword').focus();
+            }, 100);
+        }
+
+        function closePasswordModal() {
+            document.getElementById('passwordModal').classList.remove('active');
+            document.getElementById('sshPassword').value = '';
+            pendingPasswordAction = null;
+        }
+
+        async function submitPassword(event) {
+            if (event) event.preventDefault();
+
+            const deviceId = document.getElementById('passwordDeviceId').textContent;
+            const password = document.getElementById('sshPassword').value;
+
+            if (!password) {
+                showNotification('Password cannot be empty', 'error');
+                return;
+            }
+
+            try {
+                // Store password on server - URL encode the device_id
+                const encodedDeviceId = encodeURIComponent(deviceId);
+                const response = await fetch(`/api/device/${encodedDeviceId}/ssh/password`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ password })
+                });
+
+                console.log('Password submission response:', response.status, response.statusText);
+
+                if (response.ok) {
+                    showNotification('Password stored successfully', 'success');
+                    closePasswordModal();
+
+                    // Retry the pending action
+                    if (pendingPasswordAction) {
+                        pendingPasswordAction();
+                        pendingPasswordAction = null;
+                    }
+                } else {
+                    // Try to parse JSON, but handle non-JSON responses
+                    const text = await response.text();
+                    console.log('Error response body:', text);
+                    try {
+                        const data = JSON.parse(text);
+                        showNotification(`Failed to store password: ${data.error}`, 'error');
+                    } catch (e) {
+                        showNotification(`Failed to store password: ${response.status} ${response.statusText}`, 'error');
+                    }
+                }
+            } catch (error) {
+                console.error('Password submission error:', error);
+                showNotification(`Error: ${error.message}`, 'error');
+            }
+        }
+
+        // Helper function to handle API calls with automatic password prompting
+        async function executeDeviceAction(deviceId, actionFn, actionName) {
+            try {
+                const response = await actionFn();
+                const data = await response.json();
+
+                // Debug logging
+                console.log('Device action response:', {
+                    deviceId,
+                    actionName,
+                    status: response.status,
+                    data
+                });
+
+                if (response.status === 401 && data.requires_password) {
+                    console.log('→ Password required, showing prompt');
+                    // Password required - prompt user
+                    promptForPassword(deviceId, () => executeDeviceAction(deviceId, actionFn, actionName));
+                } else if (response.ok) {
+                    console.log('→ Action successful');
+                    showNotification(`${deviceId} ${actionName}`, 'success');
+                    setTimeout(loadDevices, 2000);
+                } else {
+                    console.log('→ Action failed:', data.error);
+                    showNotification(`Failed to ${actionName} ${deviceId}: ${data.error}`, 'error');
+                }
+            } catch (error) {
+                console.error('→ Exception:', error);
+                showNotification(`Error: ${error.message}`, 'error');
+            }
         }
     </script>
 </body>
