@@ -215,3 +215,35 @@ class CrowdCountAPIClient:
         except Exception as e:
             self.logger.warning(f"✗ Status Update Error: {e}")
             return False
+
+    def get_direction_flipped(self) -> bool:
+        """
+        Get the direction_flipped setting from the server
+
+        Returns:
+            True if direction is flipped, False otherwise (defaults to False on error)
+        """
+        if not self.enabled:
+            return False
+
+        try:
+            url = f"{self.base_url}/get_direction_flipped"
+            params = {
+                'user_id': self.device_id,
+                'password': self.password
+            }
+
+            response = requests.get(url, params=params, timeout=self.timeout)
+
+            if response.status_code == 200:
+                data = response.json()
+                flipped = data.get('direction_flipped', False)
+                self.logger.debug(f"Direction flipped setting: {flipped}")
+                return bool(flipped)
+            else:
+                self.logger.warning(f"✗ Failed to get direction_flipped: HTTP {response.status_code}")
+                return False
+
+        except Exception as e:
+            self.logger.warning(f"✗ Error getting direction_flipped: {e}")
+            return False

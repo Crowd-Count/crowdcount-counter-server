@@ -215,12 +215,20 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             timeout=5
         )
 
+        # Fetch direction flip setting and set up periodic refresh
+        self.direction_flipped = self.api_client.get_direction_flipped()
+        self.direction_refresh_timer = None
+        self.logger.info(f"Direction flipped setting initialized: {self.direction_flipped}")
+
     def on_start(self):
         """Initialize YOLO model when processor starts"""
         if not YOLO_AVAILABLE:
             print(f"ERROR: YOLO not available - cannot start people counter", flush=True)
             self.logger.error("YOLO not available - cannot start people counter")
             raise ImportError("ultralytics package required. Install with: pip install ultralytics")
+
+        # Start periodic refresh of direction_flipped setting (every 60 seconds)
+        self._schedule_direction_refresh()
 
         try:
             import torch
@@ -262,6 +270,10 @@ class PeopleCounterProcessor(BaseStreamProcessor):
 
     def on_stop(self):
         """Cleanup when processor stops"""
+        # Cancel the direction refresh timer
+        if self.direction_refresh_timer:
+            self.direction_refresh_timer.cancel()
+
         # Print summary
         total = sum(self.crossings.values())
         lr_count = self.crossings[CrossingDirection.LEFT_TO_RIGHT]
@@ -276,6 +288,25 @@ class PeopleCounterProcessor(BaseStreamProcessor):
         self.logger.info(f"  Right → Left: {rl_count}")
         self.logger.info(f"  Net Flow (L→R): {net_flow:+d}")
         self.logger.info("="*60)
+
+    def _schedule_direction_refresh(self):
+        """Schedule the next direction_flipped setting refresh"""
+        self.direction_refresh_timer = threading.Timer(60.0, self._refresh_direction_setting)
+        self.direction_refresh_timer.daemon = True
+        self.direction_refresh_timer.start()
+
+    def _refresh_direction_setting(self):
+        """Fetch the latest direction_flipped setting from API"""
+        try:
+            new_value = self.api_client.get_direction_flipped()
+            if new_value != self.direction_flipped:
+                self.logger.info(f"Direction flipped setting changed: {self.direction_flipped} → {new_value}")
+                self.direction_flipped = new_value
+        except Exception as e:
+            self.logger.warning(f"Failed to refresh direction_flipped setting: {e}")
+
+        # Schedule next refresh
+        self._schedule_direction_refresh()
 
     def extract_detections(self, frame) -> List[Detection]:
         """Extract person detections from frame using YOLO"""
@@ -403,18 +434,35 @@ class PeopleCounterProcessor(BaseStreamProcessor):
                     self.crossings[crossing_dir] += 1
 
                     # Make API call with device credentials
-                    if crossing_dir == CrossingDirection.LEFT_TO_RIGHT:
-                        threading.Thread(
-                            target=self.api_client.add_to_count,
-                            args=(1,),
-                            daemon=True
-                        ).start()
-                    elif crossing_dir == CrossingDirection.RIGHT_TO_LEFT:
-                        threading.Thread(
-                            target=self.api_client.subtract_from_count,
-                            args=(1,),
-                            daemon=True
-                        ).start()
+                    # Apply direction flip logic if enabled
+                    if self.direction_flipped:
+                        # Direction is flipped: LEFT→RIGHT becomes exit, RIGHT→LEFT becomes entry
+                        if crossing_dir == CrossingDirection.LEFT_TO_RIGHT:
+                            threading.Thread(
+                                target=self.api_client.subtract_from_count,
+                                args=(1,),
+                                daemon=True
+                            ).start()
+                        elif crossing_dir == CrossingDirection.RIGHT_TO_LEFT:
+                            threading.Thread(
+                                target=self.api_client.add_to_count,
+                                args=(1,),
+                                daemon=True
+                            ).start()
+                    else:
+                        # Normal direction: LEFT→RIGHT is entry, RIGHT→LEFT is exit
+                        if crossing_dir == CrossingDirection.LEFT_TO_RIGHT:
+                            threading.Thread(
+                                target=self.api_client.add_to_count,
+                                args=(1,),
+                                daemon=True
+                            ).start()
+                        elif crossing_dir == CrossingDirection.RIGHT_TO_LEFT:
+                            threading.Thread(
+                                target=self.api_client.subtract_from_count,
+                                args=(1,),
+                                daemon=True
+                            ).start()
 
                     # Log the crossing
                     crossing_info = {
