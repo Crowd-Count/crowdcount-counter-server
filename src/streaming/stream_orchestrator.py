@@ -24,6 +24,7 @@ from datetime import datetime, timedelta
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from api.crowdcount_api_client import CrowdCountAPIClient
 from config.server_config import (
     ORCHESTRATOR_HOST,
     ORCHESTRATOR_PORT,
@@ -179,6 +180,9 @@ class StreamOrchestrator:
 
         # Track frame queues for live viewing
         self.frame_queues: Dict[str, multiprocessing.Queue] = {}
+
+        # Track API clients for device status updates (online/offline)
+        self.api_clients: Dict[str, CrowdCountAPIClient] = {}
 
         # Track device information for each stream (device_id, password, etc.)
         self.device_info: Dict[str, dict] = {}
@@ -925,6 +929,20 @@ class StreamOrchestrator:
         self.logger.info(f"Starting processor for stream: {stream_name}")
 
         try:
+            # Create API client for status updates
+            device_id = device_info.get('device_id', stream_name)
+            password = device_info.get('password', '')
+            api_client = CrowdCountAPIClient(
+                device_id=device_id,
+                password=password,
+                base_url='https://api.crowdcount.tech',
+                timeout=5
+            )
+            self.api_clients[stream_name] = api_client
+
+            # Update device status to online
+            threading.Thread(target=api_client.update_status, args=('online',), daemon=True).start()
+
             # Create frame queue for live viewing
             frame_queue = multiprocessing.Queue(maxsize=2)  # Small queue to avoid memory issues
             self.frame_queues[stream_name] = frame_queue
@@ -975,6 +993,12 @@ class StreamOrchestrator:
             self.logger.error(f"Error stopping processor for {stream_name}: {e}")
 
         finally:
+            # Update device status to offline
+            if stream_name in self.api_clients:
+                api_client = self.api_clients[stream_name]
+                threading.Thread(target=api_client.update_status, args=('offline',), daemon=True).start()
+                del self.api_clients[stream_name]
+
             # Clean up processor entry (use pop to avoid KeyError)
             self.processors.pop(stream_name, None)
             # Clean up frame queue
@@ -1079,9 +1103,20 @@ class StreamOrchestrator:
         self.logger.info("Stopping orchestrator...")
         self.running = False
 
+        # Set all devices offline (in parallel for speed)
+        threads = []
+        for stream_name, api_client in list(self.api_clients.items()):
+            thread = threading.Thread(target=api_client.update_status, args=('offline',), daemon=False)
+            thread.start()
+            threads.append(thread)
+
         # Stop all processors
         for stream_name in list(self.processors.keys()):
             self.stop_processor(stream_name)
+
+        # Wait for all status updates to complete (max 2 seconds)
+        for thread in threads:
+            thread.join(timeout=2)
 
         # Stop MediaMTX
         self.mediamtx.stop()

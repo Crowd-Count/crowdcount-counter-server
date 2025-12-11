@@ -30,7 +30,7 @@ class CrowdCountAPIClient:
         self.timeout = timeout
         self.enabled = bool(device_id and password)  # Only enabled if both credentials provided
 
-        # Setup logging (only add handler if not already configured)
+        # Setup logging (only add handler and log once per device_id)
         self.logger = logging.getLogger(f"APIClient-{device_id}")
         if not self.logger.handlers:
             handler = logging.StreamHandler()
@@ -38,11 +38,11 @@ class CrowdCountAPIClient:
             handler.setFormatter(formatter)
             self.logger.addHandler(handler)
             self.logger.setLevel(logging.INFO)
-
-        if self.enabled:
-            self.logger.info(f"API Client initialized for device: {device_id}")
-        else:
-            self.logger.info(f"API Client disabled (no credentials provided)")
+            # Only log initialization once per device
+            if self.enabled:
+                self.logger.info(f"API Client initialized for device: {device_id}")
+            else:
+                self.logger.info(f"API Client disabled (no credentials provided)")
 
     def add_to_count(self, count: int = 1) -> bool:
         """
