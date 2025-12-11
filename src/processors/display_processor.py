@@ -90,7 +90,7 @@ class DisplayProcessor(BaseStreamProcessor):
         try:
             cv2.destroyWindow(self.window_name)
             cv2.waitKey(1)  # Process final events
-        except:
+        except Exception:
             pass
 
         self.logger.info(f"Window closed for {self.stream_name}")
@@ -134,5 +134,5 @@ class MultiStreamDisplayProcessor(BaseStreamProcessor):
         try:
             cv2.destroyWindow(self.window_name)
             cv2.waitKey(1)
-        except:
+        except Exception:
             pass

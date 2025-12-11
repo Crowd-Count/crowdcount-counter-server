@@ -6,6 +6,12 @@ bin/
 data/
 !data/.gitkeep
 
+# Database files
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
 # Python
 __pycache__/
 *.py[cod]

@@ -36,15 +36,16 @@ class BaseStreamProcessor(ABC):
         self.cap: Optional[cv2.VideoCapture] = None
         self.frame_queue = frame_queue  # Queue for live viewing
 
-        # Setup logging
+        # Setup logging (only add handler if not already configured)
         self.logger = logging.getLogger(f"Processor-{stream_name}")
-        handler = logging.StreamHandler()
-        formatter = logging.Formatter(
-            f'%(asctime)s - {stream_name} - %(levelname)s - %(message)s'
-        )
-        handler.setFormatter(formatter)
-        self.logger.addHandler(handler)
-        self.logger.setLevel(logging.INFO)
+        if not self.logger.handlers:
+            handler = logging.StreamHandler()
+            formatter = logging.Formatter(
+                f'%(asctime)s - {stream_name} - %(levelname)s - %(message)s'
+            )
+            handler.setFormatter(formatter)
+            self.logger.addHandler(handler)
+            self.logger.setLevel(logging.INFO)
 
         # Stats
         self.frames_processed = 0
@@ -121,7 +122,7 @@ class BaseStreamProcessor(ABC):
                 if self.cap:
                     try:
                         self.cap.release()
-                    except:
+                    except Exception:
                         pass
                     self.cap = None
 
@@ -234,7 +235,7 @@ class BaseStreamProcessor(ABC):
                         try:
                             # Use put_nowait to avoid blocking if queue is full
                             self.frame_queue.put_nowait(processed_frame)
-                        except:
+                        except Exception:
                             # Queue full, skip this frame
                             pass
 
