@@ -15,11 +15,12 @@ metrics: true
 metricsAddress: 0.0.0.0:9998  # Listen on all interfaces
 
 # External authentication - validate credentials against CrowdCount API
-externalAuthenticationURL: http://127.0.0.1:5000/auth
+# Disabled: Relying on network-level security (Tailscale) instead
+# externalAuthenticationURL: http://127.0.0.1:5000/auth
 
 # Internal authentication for API/Metrics access
 # Allows unauthenticated access to API/metrics endpoints from any IP
-# Stream access (publish/read) still requires external auth validation
+# Stream access (publish/read) secured at network level via Tailscale
 authInternalUsers:
   - user: any
     pass:
@@ -73,15 +74,6 @@ paths:
   # Catch-all regex pattern to match any stream name
   ~^.*$:
     source: publisher
-    # Allow any Raspberry Pi to publish
-    publishUser:
-    publishPass:
-    publishIPs: []
-
-    # Allow anyone to read (we'll secure this at the network level with Tailscale)
-    readUser:
-    readPass:
-    readIPs: []
 
     # Run a command when a stream is ready (used to notify our orchestrator)
     runOnReady: 'curl -X POST http://127.0.0.1:5000/stream/ready -H "Content-Type: application/json" -d "{\"stream\":\"$MTX_PATH\"}"'
