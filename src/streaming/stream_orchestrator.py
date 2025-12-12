@@ -292,9 +292,8 @@ class StreamOrchestrator:
                 self.logger.info(f"Received stream stopped notification: {stream_name}")
                 self.stop_processor(stream_name)
 
-                # Clean up device info for this stream
-                if stream_name in self.device_info:
-                    del self.device_info[stream_name]
+                # Keep device info in memory for reconnection
+                # (credentials are needed when device reconnects)
 
                 return jsonify({'status': 'ok'}), 200
 
@@ -1004,9 +1003,7 @@ class StreamOrchestrator:
             # Clean up frame queue
             if stream_name in self.frame_queues:
                 del self.frame_queues[stream_name]
-            # Clean up device info
-            if stream_name in self.device_info:
-                del self.device_info[stream_name]
+            # Keep device info for reconnection (don't delete credentials)
 
     def monitor_streams(self):
         """
