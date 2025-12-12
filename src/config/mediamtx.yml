@@ -14,13 +14,13 @@ apiAddress: 0.0.0.0:9997  # Listen on all interfaces (accessible over Tailscale)
 metrics: true
 metricsAddress: 0.0.0.0:9998  # Listen on all interfaces
 
-# External authentication - validate credentials against CrowdCount API
-# Disabled: Relying on network-level security (Tailscale) instead
-# externalAuthenticationURL: http://127.0.0.1:5000/auth
+# External authentication - DISABLED
+# Security model: Tailscale VPN provides network-level isolation
+# Only devices on the Tailscale network can publish/read streams
+# No application-level authentication required
 
 # Internal authentication for API/Metrics access
-# Allows unauthenticated access to API/metrics endpoints from any IP
-# Stream access (publish/read) secured at network level via Tailscale
+# Allows unauthenticated access from any IP (protected by Tailscale)
 authInternalUsers:
   - user: any
     pass:
