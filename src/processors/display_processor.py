@@ -14,9 +14,8 @@ class DisplayProcessor(BaseStreamProcessor):
     Useful for monitoring and debugging streams
     """
 
-    def __init__(self, stream_name: str, rtsp_url: str, device_info: dict = None):
-        super().__init__(stream_name, rtsp_url)
-        self.device_info = device_info or {}
+    def __init__(self, stream_name: str, rtsp_url: str, device_info: dict = None, frame_queue=None):
+        super().__init__(stream_name, rtsp_url, device_info, frame_queue)
         self.window_name = f"Stream: {stream_name}"
 
     def on_start(self):
@@ -102,9 +101,8 @@ class MultiStreamDisplayProcessor(BaseStreamProcessor):
     Shows stream in a smaller window suitable for monitoring many streams
     """
 
-    def __init__(self, stream_name: str, rtsp_url: str, device_info: dict = None):
-        super().__init__(stream_name, rtsp_url)
-        self.device_info = device_info or {}
+    def __init__(self, stream_name: str, rtsp_url: str, device_info: dict = None, frame_queue=None):
+        super().__init__(stream_name, rtsp_url, device_info, frame_queue)
         self.window_name = f"{stream_name}"
 
     def on_start(self):

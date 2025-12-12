@@ -8,11 +8,11 @@ logFile: data/mediamtx.log
 
 # API server for monitoring and management
 api: true
-apiAddress: 127.0.0.1:9997
+apiAddress: 0.0.0.0:9997  # Listen on all interfaces (accessible over Tailscale)
 
 # Metrics for monitoring
 metrics: true
-metricsAddress: 127.0.0.1:9998
+metricsAddress: 0.0.0.0:9998  # Listen on all interfaces
 
 # Performance settings - optimized for 30fps streaming
 readTimeout: 10s
