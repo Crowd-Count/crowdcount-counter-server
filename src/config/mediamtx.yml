@@ -18,14 +18,16 @@ metricsAddress: 0.0.0.0:9998  # Listen on all interfaces
 externalAuthenticationURL: http://127.0.0.1:5000/auth
 
 # Internal authentication for API/Metrics access
-# Requires external auth to verify credentials
+# Allows unauthenticated access to API/metrics endpoints from any IP
+# Stream access (publish/read) still requires external auth validation
 authInternalUsers:
   - user: any
+    pass:
     ips: []
     permissions:
-      - api
-      - metrics
-      - pprof
+      - action: api
+      - action: metrics
+      - action: pprof
 
 # Performance settings - optimized for 30fps streaming
 readTimeout: 10s
