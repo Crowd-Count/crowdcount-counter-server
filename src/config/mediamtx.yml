@@ -29,6 +29,9 @@ authInternalUsers:
       - action: api
       - action: metrics
       - action: pprof
+      - action: publish
+      - action: read
+      - action: playback
 
 # Performance settings - optimized for 30fps streaming
 readTimeout: 10s
