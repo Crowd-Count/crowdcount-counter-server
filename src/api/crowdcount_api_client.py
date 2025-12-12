@@ -248,3 +248,41 @@ class CrowdCountAPIClient:
         except Exception as e:
             self.logger.warning(f"✗ Error getting direction_flipped: {e}")
             return False
+
+    @staticmethod
+    def check_password(user_id: str, password: str, base_url: str = 'https://api.crowdcount.tech', timeout: int = 5) -> bool:
+        """
+        Check if a password is correct for a given user_id
+
+        Args:
+            user_id: Device/user identifier
+            password: Password to validate
+            base_url: Base URL for the CrowdCount API
+            timeout: Request timeout in seconds
+
+        Returns:
+            True if password is correct, False otherwise
+        """
+        try:
+            url = f"{base_url.rstrip('/')}/check_password"
+            params = {
+                'user_id': user_id,
+                'password': password
+            }
+
+            response = requests.get(url, params=params, timeout=timeout)
+
+            if response.status_code == 200:
+                data = response.json()
+                is_correct = data.get('is_password_correct', False)
+                return bool(is_correct)
+            elif response.status_code == 404:
+                # User does not exist
+                return False
+            else:
+                # Other errors - fail closed (deny access)
+                return False
+
+        except Exception as e:
+            # On error, fail closed (deny access)
+            return False

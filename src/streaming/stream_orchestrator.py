@@ -299,6 +299,39 @@ class StreamOrchestrator:
 
             return jsonify({'status': 'error', 'message': 'No stream name provided'}), 400
 
+        @self.app.route('/auth', methods=['POST'])
+        def auth_device():
+            """
+            Authentication endpoint for MediaMTX
+            Validates device credentials against CrowdCount API
+
+            Expected MediaMTX format:
+            {
+                "user": "device_id",
+                "password": "api_password",
+                "ip": "client_ip",
+                "action": "publish" or "read" or "api"
+            }
+            """
+            data = request.get_json() or {}
+            user = data.get('user', '')
+            password = data.get('password', '')
+            action = data.get('action', '')
+
+            if not user or not password:
+                self.logger.warning(f"✗ Auth attempt with missing credentials from {request.remote_addr}")
+                return '', 401  # Unauthorized
+
+            # Validate against CrowdCount API
+            is_valid = CrowdCountAPIClient.check_password(user, password)
+
+            if is_valid:
+                self.logger.info(f"✓ Device authenticated: {user} (action: {action})")
+                return '', 200  # OK
+            else:
+                self.logger.warning(f"✗ Authentication failed for {user}: Invalid credentials")
+                return '', 401  # Unauthorized
+
         @self.app.route('/status', methods=['GET'])
         def status():
             """Get orchestrator status"""

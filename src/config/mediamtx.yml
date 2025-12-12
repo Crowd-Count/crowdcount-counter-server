@@ -14,6 +14,19 @@ apiAddress: 0.0.0.0:9997  # Listen on all interfaces (accessible over Tailscale)
 metrics: true
 metricsAddress: 0.0.0.0:9998  # Listen on all interfaces
 
+# External authentication - validate credentials against CrowdCount API
+externalAuthenticationURL: http://127.0.0.1:5000/auth
+
+# Internal authentication for API/Metrics access
+# Requires external auth to verify credentials
+authInternalUsers:
+  - user: any
+    ips: []
+    permissions:
+      - api
+      - metrics
+      - pprof
+
 # Performance settings - optimized for 30fps streaming
 readTimeout: 10s
 writeTimeout: 10s
