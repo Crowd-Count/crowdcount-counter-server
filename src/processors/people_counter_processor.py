@@ -97,7 +97,7 @@ class PersonTracker:
         self.detection_count = 0  # Total detections for this track
         self.min_detections_to_count = 3  # Require at least N detections before counting
         self.consecutive_side_detections = 0  # Consecutive detections on same side
-        self.min_consecutive_for_crossing = 2  # Require N consecutive on new side
+        self.min_consecutive_for_crossing = 1  # Reduced from 2 - trajectory validation handles consistency
 
         # ReID appearance features
         self.appearance_history = deque(maxlen=10)  # Store recent appearance embeddings
@@ -198,7 +198,7 @@ class PersonTracker:
         crossing_direction = None
         current_time = time.time()
 
-        # Detect potential crossing
+        # Detect potential crossing (side changed from last confirmed side)
         potential_crossing = None
         if self.last_side == 'left' and self.current_side == 'right':
             potential_crossing = CrossingDirection.LEFT_TO_RIGHT
@@ -213,10 +213,14 @@ class PersonTracker:
                     self.total_crossings += 1
                     self.crossing_events.append((current_time, potential_crossing))
                     self.last_crossing_time = current_time
-
-        # Update last side only after valid position
-        if self.current_side in ['left', 'right']:
-            self.last_side = self.current_side
+                    # Only update last_side AFTER successful crossing validation
+                    self.last_side = self.current_side
+        else:
+            # No crossing detected - update last_side to track position
+            # (only when sides match, not during a pending crossing)
+            if self.current_side == self.last_side:
+                pass  # Already matching, nothing to do
+            # Don't update last_side if we're waiting for validation
 
         return crossing_direction
 
@@ -230,21 +234,23 @@ class PersonTracker:
             return False
 
         # Check for consistent movement direction in recent positions
-        if len(self.positions) < 4:
+        if len(self.positions) < 3:
             return True  # Not enough data, allow crossing
 
-        recent_positions = list(self.positions)[-6:]  # Last 6 positions
-        if len(recent_positions) < 3:
+        recent_positions = list(self.positions)[-5:]  # Last 5 positions (reduced from 6)
+        if len(recent_positions) < 2:
             return True
 
         # Calculate movement direction consistency
         x_movements = []
         for i in range(1, len(recent_positions)):
             dx = recent_positions[i][0] - recent_positions[i-1][0]
-            x_movements.append(dx)
+            # Only count significant movements (ignore jitter)
+            if abs(dx) > 2:  # More than 2 pixels
+                x_movements.append(dx)
 
         if not x_movements:
-            return True
+            return True  # No significant movement detected, allow crossing
 
         # Check if movement is consistently in one direction (not bouncing)
         positive_moves = sum(1 for m in x_movements if m > 0)
@@ -252,11 +258,11 @@ class PersonTracker:
         total_moves = positive_moves + negative_moves
 
         if total_moves == 0:
-            return False  # No significant movement
+            return True  # Changed: allow crossing if no significant movement
 
-        # Require at least 60% of movements in same direction
+        # Require at least 50% of movements in same direction (relaxed from 60%)
         consistency = max(positive_moves, negative_moves) / total_moves
-        return consistency >= 0.6
+        return consistency >= 0.5
 
     def get_smooth_velocity(self) -> Tuple[float, float]:
         """Get smoothed velocity estimate"""
