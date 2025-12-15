@@ -4,6 +4,9 @@
 opencv-python>=4.8.0
 ultralytics>=8.0.0  # YOLO for people counter processor
 
+# Deep ReID for person re-identification
+torchreid>=0.2.5  # OSNet for robust appearance matching during occlusion
+
 # Web Framework
 Flask>=2.3.0
 Flask-CORS>=4.0.0

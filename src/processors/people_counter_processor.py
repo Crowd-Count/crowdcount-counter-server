@@ -45,6 +45,9 @@ except ImportError:
     TORCH_AVAILABLE = False
     print("Warning: torch not installed. ReID features disabled.")
 
+# Import deep ReID extractor
+from .deep_reid import create_reid_extractor, TORCHREID_AVAILABLE
+
 
 class CrossingDirection(Enum):
     """Direction of crossing the doorway line"""
@@ -307,13 +310,14 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             'yolo_conf_threshold': 0.25,  # TUNED: Lowered from 0.3 to catch more people in groups
             'yolo_iou_threshold': 0.3,   # TUNED: Lowered from 0.45 to separate overlapping people
             'min_crossing_interval': 0.5,  # TUNED: Increased from 0.3 to prevent double counts
-            'reid_similarity_threshold': 0.5,  # NEW: Minimum similarity for ReID matching
+            'reid_similarity_threshold': 0.6,  # TUNED: Increased for deep ReID (more discriminative)
             'use_bytetrack': True,       # NEW: Enable ByteTrack
             'use_reid': True,            # NEW: Enable ReID features
+            'reid_model': 'osnet_x1_0',  # Deep ReID model: osnet_x1_0 (best), osnet_x0_5, osnet_x0_25 (fastest)
         }
 
-        # ReID feature extractor (lazy loaded)
-        self._reid_model = None
+        # Deep ReID feature extractor (initialized in on_start)
+        self.reid_extractor = None
 
         # Tracking
         self.trackers: Dict[int, PersonTracker] = {}
@@ -395,6 +399,17 @@ class PeopleCounterProcessor(BaseStreamProcessor):
 
             print("✓ YOLO + ByteTrack loaded successfully with CUDA!" if cuda_available else "✓ YOLO + ByteTrack loaded (CPU mode)", flush=True)
             self.logger.info("YOLO model with ByteTrack loaded successfully")
+
+            # Initialize Deep ReID extractor
+            if self.doorway_config['use_reid']:
+                print(f"Loading Deep ReID model: {self.doorway_config['reid_model']}...", flush=True)
+                self.reid_extractor = create_reid_extractor(
+                    model_name=self.doorway_config['reid_model'],
+                    device=self.device,
+                    verbose=True
+                )
+                print(f"✓ Deep ReID loaded (feature dim: {self.reid_extractor.feature_dim})", flush=True)
+                self.logger.info(f"Deep ReID initialized: {self.doorway_config['reid_model']}")
 
         except Exception as e:
             print(f"ERROR: Failed to load YOLO model: {e}", flush=True)
@@ -526,67 +541,14 @@ class PeopleCounterProcessor(BaseStreamProcessor):
 
     def _extract_appearance_features(self, frame, x1: int, y1: int, x2: int, y2: int) -> Optional[np.ndarray]:
         """
-        Extract appearance features from a person bounding box for ReID.
-        Uses color histogram and simple CNN features for matching.
+        Extract deep ReID appearance features from a person bounding box.
+        Uses OSNet pretrained on person re-identification datasets.
+        Returns 512-dimensional L2-normalized feature vector.
         """
-        try:
-            # Ensure valid coordinates
-            h, w = frame.shape[:2]
-            x1, y1 = max(0, x1), max(0, y1)
-            x2, y2 = min(w, x2), min(h, y2)
-
-            if x2 <= x1 or y2 <= y1:
-                return None
-
-            # Crop person region
-            person_crop = frame[y1:y2, x1:x2]
-
-            if person_crop.size == 0:
-                return None
-
-            # Resize to standard size for consistent features
-            target_size = (64, 128)  # Width x Height (typical ReID aspect ratio)
-            person_resized = cv2.resize(person_crop, target_size)
-
-            # Extract multi-scale color histogram features (simple but effective)
-            features = []
-
-            # HSV color histogram (captures color regardless of lighting)
-            hsv = cv2.cvtColor(person_resized, cv2.COLOR_BGR2HSV)
-
-            # Split into upper and lower body (helps distinguish people)
-            h_split = target_size[1] // 2
-            upper = hsv[:h_split, :]
-            lower = hsv[h_split:, :]
-
-            for region in [upper, lower]:
-                # Hue histogram (color)
-                h_hist = cv2.calcHist([region], [0], None, [16], [0, 180])
-                # Saturation histogram
-                s_hist = cv2.calcHist([region], [1], None, [8], [0, 256])
-                # Value histogram (brightness)
-                v_hist = cv2.calcHist([region], [2], None, [8], [0, 256])
-
-                # Normalize
-                h_hist = h_hist.flatten() / (h_hist.sum() + 1e-6)
-                s_hist = s_hist.flatten() / (s_hist.sum() + 1e-6)
-                v_hist = v_hist.flatten() / (v_hist.sum() + 1e-6)
-
-                features.extend([h_hist, s_hist, v_hist])
-
-            # Combine all features
-            feature_vector = np.concatenate(features)
-
-            # L2 normalize the final feature vector
-            norm = np.linalg.norm(feature_vector)
-            if norm > 0:
-                feature_vector = feature_vector / norm
-
-            return feature_vector
-
-        except Exception as e:
-            self.logger.debug(f"ReID feature extraction error: {e}")
+        if self.reid_extractor is None:
             return None
+
+        return self.reid_extractor.extract(frame, x1, y1, x2, y2)
 
     def match_detection_to_tracker(self, detection: Detection) -> Optional[int]:
         """
