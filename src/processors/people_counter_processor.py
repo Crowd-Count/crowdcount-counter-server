@@ -283,6 +283,66 @@ class PersonTracker:
         """Time since last update"""
         return time.time() - self.last_update_time
 
+    def get_predicted_position(self, current_time: float = None) -> Tuple[int, int]:
+        """
+        Get predicted position based on velocity interpolation.
+        Used to maintain tracking through dropped frames.
+
+        Args:
+            current_time: Current timestamp. If None, uses time.time()
+
+        Returns:
+            Predicted (x, y) position tuple
+        """
+        if not self.positions:
+            return (0, 0)
+
+        last_pos = self.positions[-1]
+
+        if current_time is None:
+            current_time = time.time()
+
+        time_delta = current_time - self.last_update_time
+
+        # Don't extrapolate too far into the future (max 1 second)
+        time_delta = min(time_delta, 1.0)
+
+        # Get velocity and predict new position
+        vx, vy = self.get_smooth_velocity()
+
+        predicted_x = last_pos[0] + vx * time_delta
+        predicted_y = last_pos[1] + vy * time_delta
+
+        return (int(predicted_x), int(predicted_y))
+
+    def interpolate_positions(self, current_time: float, num_steps: int = 3) -> List[Tuple[int, int]]:
+        """
+        Generate interpolated positions between last known position and predicted current position.
+        Useful for checking crossings that may have occurred during dropped frames.
+
+        Args:
+            current_time: Current timestamp
+            num_steps: Number of intermediate positions to generate
+
+        Returns:
+            List of interpolated (x, y) positions
+        """
+        if not self.positions:
+            return []
+
+        last_pos = self.positions[-1]
+        predicted_pos = self.get_predicted_position(current_time)
+
+        # Generate intermediate positions
+        positions = []
+        for i in range(1, num_steps + 1):
+            t = i / num_steps
+            interp_x = int(last_pos[0] + (predicted_pos[0] - last_pos[0]) * t)
+            interp_y = int(last_pos[1] + (predicted_pos[1] - last_pos[1]) * t)
+            positions.append((interp_x, interp_y))
+
+        return positions
+
 
 class PeopleCounterProcessor(BaseStreamProcessor):
     """
@@ -772,6 +832,73 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             # Create new tracker (ensure we don't overwrite existing)
             if new_id not in self.trackers:
                 self.trackers[new_id] = PersonTracker(new_id, detection)
+
+        # Check for crossings on unmatched trackers using interpolation
+        # This catches crossings that may have occurred during dropped frames
+        for track_id, tracker in self.trackers.items():
+            if track_id in matched_trackers:
+                continue  # Already processed
+
+            time_gap = tracker.time_since_update()
+
+            # Only interpolate if there's a significant time gap (dropped frames)
+            # but not too stale (likely lost track)
+            if 0.1 < time_gap < 1.0 and len(tracker.positions) >= 2:
+                # Get interpolated positions through the gap
+                interpolated = tracker.interpolate_positions(current_time, num_steps=5)
+
+                for interp_pos in interpolated:
+                    # Temporarily add interpolated position to check crossing
+                    original_positions = list(tracker.positions)
+                    tracker.positions.append(interp_pos)
+
+                    crossing_dir = tracker.check_crossing(
+                        width,
+                        self.doorway_config['doorway_center'],
+                        self.doorway_config['doorway_width']
+                    )
+
+                    # Restore original positions
+                    tracker.positions = deque(original_positions, maxlen=60)
+
+                    if crossing_dir and crossing_dir != CrossingDirection.NONE:
+                        # Interpolation detected a crossing during frame gap
+                        self.crossings[crossing_dir] += 1
+
+                        # Make API call
+                        if self.direction_flipped:
+                            if crossing_dir == CrossingDirection.LEFT_TO_RIGHT:
+                                threading.Thread(
+                                    target=self.api_client.subtract_from_count,
+                                    args=(1,),
+                                    daemon=True
+                                ).start()
+                            elif crossing_dir == CrossingDirection.RIGHT_TO_LEFT:
+                                threading.Thread(
+                                    target=self.api_client.add_to_count,
+                                    args=(1,),
+                                    daemon=True
+                                ).start()
+                        else:
+                            if crossing_dir == CrossingDirection.LEFT_TO_RIGHT:
+                                threading.Thread(
+                                    target=self.api_client.add_to_count,
+                                    args=(1,),
+                                    daemon=True
+                                ).start()
+                            elif crossing_dir == CrossingDirection.RIGHT_TO_LEFT:
+                                threading.Thread(
+                                    target=self.api_client.subtract_from_count,
+                                    args=(1,),
+                                    daemon=True
+                                ).start()
+
+                        total = sum(self.crossings.values())
+                        self.logger.info(f"INTERPOLATED CROSSING #{total}: {crossing_dir.value} | "
+                                       f"Track #{track_id} (gap: {time_gap:.2f}s) | "
+                                       f"L->R: {self.crossings[CrossingDirection.LEFT_TO_RIGHT]} | "
+                                       f"R->L: {self.crossings[CrossingDirection.RIGHT_TO_LEFT]}")
+                        break  # Only count one crossing per interpolation check
 
         # Remove stale trackers
         trackers_to_remove = []

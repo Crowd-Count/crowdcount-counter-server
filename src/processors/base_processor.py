@@ -77,9 +77,9 @@ class BaseStreamProcessor(ABC):
                 # Create VideoCapture with RTSP options for low latency
                 self.cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_FFMPEG)
 
-                # Set buffer size to 3 for balance between latency and stability
-                # Size of 1 is too aggressive and drops frames if processing is slow
-                self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 3)
+                # Set buffer size to 1 for lowest latency - always get latest frame
+                # Track interpolation compensates for any dropped frames
+                self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
                 # Request specific FPS (helps OpenCV's frame timing)
                 self.cap.set(cv2.CAP_PROP_FPS, 30)
