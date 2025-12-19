@@ -443,6 +443,29 @@ class StreamOrchestrator:
                         text-align: center;
                         color: #00ff00;
                     }
+                    .controls {
+                        text-align: center;
+                        margin: 15px 0;
+                    }
+                    .toggle-btn {
+                        background: #333;
+                        border: 2px solid #00ff00;
+                        color: #00ff00;
+                        padding: 10px 20px;
+                        font-size: 14px;
+                        border-radius: 6px;
+                        cursor: pointer;
+                        transition: all 0.2s ease;
+                        font-weight: bold;
+                    }
+                    .toggle-btn:hover {
+                        background: #00ff00;
+                        color: #1a1a1a;
+                    }
+                    .toggle-btn.active {
+                        background: #00ff00;
+                        color: #1a1a1a;
+                    }
                     .video-container {
                         text-align: center;
                         margin: 20px 0;
@@ -457,17 +480,66 @@ class StreamOrchestrator:
                         margin: 10px 0;
                         color: #aaa;
                     }
+                    .status-indicator {
+                        display: inline-block;
+                        padding: 4px 12px;
+                        border-radius: 4px;
+                        font-size: 12px;
+                        margin-left: 10px;
+                    }
+                    .status-overlay {
+                        background: #00ff00;
+                        color: #1a1a1a;
+                    }
+                    .status-clean {
+                        background: #3498db;
+                        color: #fff;
+                    }
                 </style>
             </head>
             <body>
                 <div class="container">
-                    <h1>🎥 CrowdCount Stream Viewer</h1>
+                    <h1>CrowdCount Stream Viewer</h1>
                     <div class="info">Stream: {{ stream_name }}</div>
-                    <div class="video-container">
-                        <img src="/video_feed/{{ stream_name }}" alt="Live Stream">
+                    <div class="controls">
+                        <button id="toggleBtn" class="toggle-btn active" onclick="toggleOverlay()">
+                            Show Overlay: ON
+                        </button>
+                        <span id="statusIndicator" class="status-indicator status-overlay">Tracking Enabled</span>
                     </div>
-                    <div class="info">Live YOLO Detection Feed</div>
+                    <div class="video-container">
+                        <img id="streamImg" src="/video_feed/{{ stream_name }}?overlay=true" alt="Live Stream">
+                    </div>
+                    <div class="info" id="feedInfo">Live YOLO Detection Feed</div>
                 </div>
+                <script>
+                    let overlayEnabled = true;
+                    const streamName = '{{ stream_name }}';
+
+                    function toggleOverlay() {
+                        overlayEnabled = !overlayEnabled;
+                        const img = document.getElementById('streamImg');
+                        const btn = document.getElementById('toggleBtn');
+                        const status = document.getElementById('statusIndicator');
+                        const feedInfo = document.getElementById('feedInfo');
+
+                        if (overlayEnabled) {
+                            img.src = '/video_feed/' + streamName + '?overlay=true';
+                            btn.textContent = 'Show Overlay: ON';
+                            btn.classList.add('active');
+                            status.textContent = 'Tracking Enabled';
+                            status.className = 'status-indicator status-overlay';
+                            feedInfo.textContent = 'Live YOLO Detection Feed';
+                        } else {
+                            img.src = '/video_feed/' + streamName + '?overlay=false';
+                            btn.textContent = 'Show Overlay: OFF';
+                            btn.classList.remove('active');
+                            status.textContent = 'Clean Stream';
+                            status.className = 'status-indicator status-clean';
+                            feedInfo.textContent = 'Clean Video Feed (No Annotations)';
+                        }
+                    }
+                </script>
             </body>
             </html>
             """
@@ -475,7 +547,14 @@ class StreamOrchestrator:
 
         @self.app.route('/video_feed/<stream_name>')
         def video_feed(stream_name):
-            """Serve MJPEG video feed for a stream"""
+            """Serve MJPEG video feed for a stream
+
+            Query params:
+                overlay: 'true' (default) for annotated stream, 'false' for clean stream
+            """
+            # Check if overlay should be shown (default: true)
+            show_overlay = request.args.get('overlay', 'true').lower() != 'false'
+
             def generate():
                 if stream_name not in self.frame_queues:
                     return
@@ -484,8 +563,15 @@ class StreamOrchestrator:
 
                 while True:
                     try:
-                        # Get frame from queue with timeout
-                        frame = frame_queue.get(timeout=1.0)
+                        # Get frame data from queue with timeout
+                        frame_data = frame_queue.get(timeout=1.0)
+
+                        # Handle both old format (single frame) and new format (dict with clean/annotated)
+                        if isinstance(frame_data, dict):
+                            frame = frame_data['annotated'] if show_overlay else frame_data['clean']
+                        else:
+                            # Backwards compatibility: single frame
+                            frame = frame_data
 
                         # Encode frame as JPEG
                         ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])

@@ -63,9 +63,9 @@ Examples:
     parser.add_argument(
         '--processor', '-p',
         type=str,
-        default='display',
+        default='counter',
         choices=PROCESSORS.keys(),
-        help='Processor type to use for streams (default: display)'
+        help='Processor type to use for streams (default: counter)'
     )
 
     args = parser.parse_args()

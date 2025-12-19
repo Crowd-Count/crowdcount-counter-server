@@ -230,11 +230,16 @@ class BaseStreamProcessor(ABC):
                 try:
                     processed_frame = self.process_frame(frame, frame_number, timestamp)
 
-                    # Send processed frame to queue for live viewing (non-blocking)
+                    # Send both clean and processed frames to queue for live viewing (non-blocking)
                     if self.frame_queue is not None and processed_frame is not None:
                         try:
+                            # Send both frames as a dict so viewer can toggle between them
+                            frame_data = {
+                                'clean': frame.copy(),
+                                'annotated': processed_frame
+                            }
                             # Use put_nowait to avoid blocking if queue is full
-                            self.frame_queue.put_nowait(processed_frame)
+                            self.frame_queue.put_nowait(frame_data)
                         except Exception:
                             # Queue full, skip this frame
                             pass
