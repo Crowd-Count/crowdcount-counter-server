@@ -9,8 +9,8 @@ track_low_thresh: 0.1      # Low confidence threshold for second association (ca
 new_track_thresh: 0.3      # Threshold for creating new tracks
 
 # Track buffer and matching
-track_buffer: 60           # Frames to keep lost tracks (increased for slow-moving groups)
-match_thresh: 0.85         # IoU threshold for matching (higher = stricter matching)
+track_buffer: 90           # Frames to keep lost tracks (~3 sec at 30fps for doorway dropout)
+match_thresh: 0.75         # IoU threshold for matching (relaxed for reacquisition through doorway)
 
 # Motion model (Kalman filter)
 # For overhead view, people move more uniformly

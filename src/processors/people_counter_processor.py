@@ -374,7 +374,7 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             'min_path_length': 50,      # Minimum pixels traveled
             'max_tracking_distance': 100,  # TUNED: Reduced from 120 for tighter matching
             'tracker_timeout': 3.0,     # TUNED: Increased from 2.0 for slow-moving groups
-            'yolo_conf_threshold': 0.25,  # TUNED: Lowered from 0.3 to catch more people in groups
+            'yolo_conf_threshold': 0.20,  # TUNED: Lowered to catch detections in doorway zone
             'yolo_iou_threshold': 0.3,   # TUNED: Lowered from 0.45 to separate overlapping people
             'min_crossing_interval': 0.5,  # TUNED: Increased from 0.3 to prevent double counts
             'reid_similarity_threshold': 0.6,  # TUNED: Increased for deep ReID (more discriminative)
