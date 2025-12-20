@@ -134,28 +134,35 @@ class PersonTracker:
         # Update ReID appearance features
         if detection.appearance_features is not None:
             self.appearance_history.append(detection.appearance_features)
-            # Update running mean of appearance
+            # Update running mean of appearance (re-normalize to maintain L2 norm)
             if len(self.appearance_history) > 0:
                 self.mean_appearance = np.mean(list(self.appearance_history), axis=0)
+                norm = np.linalg.norm(self.mean_appearance)
+                if norm > 0:
+                    self.mean_appearance = self.mean_appearance / norm
 
     def update_appearance(self, features: np.ndarray):
         """Update appearance features separately"""
         if features is not None:
             self.appearance_history.append(features)
+            # Update running mean of appearance (re-normalize to maintain L2 norm)
             if len(self.appearance_history) > 0:
                 self.mean_appearance = np.mean(list(self.appearance_history), axis=0)
+                norm = np.linalg.norm(self.mean_appearance)
+                if norm > 0:
+                    self.mean_appearance = self.mean_appearance / norm
 
     def get_appearance_similarity(self, features: np.ndarray) -> float:
-        """Calculate cosine similarity with this tracker's appearance"""
+        """Calculate cosine similarity with this tracker's appearance.
+
+        Note: Features are already L2-normalized, so cosine similarity = dot product.
+        """
         if self.mean_appearance is None or features is None:
             return 0.0
-        # Cosine similarity
-        dot_product = np.dot(self.mean_appearance, features)
-        norm_a = np.linalg.norm(self.mean_appearance)
-        norm_b = np.linalg.norm(features)
-        if norm_a > 0 and norm_b > 0:
-            return dot_product / (norm_a * norm_b)
-        return 0.0
+        # For L2-normalized vectors, cosine similarity is just the dot product
+        similarity = np.dot(self.mean_appearance, features)
+        # Clamp to [0, 1] range (can be slightly out of range due to floating point)
+        return max(0.0, min(1.0, float(similarity)))
 
     def check_crossing(self, frame_width: int, doorway_center: float, doorway_width: float) -> Optional[CrossingDirection]:
         """
@@ -373,7 +380,7 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             'reid_similarity_threshold': 0.6,  # TUNED: Increased for deep ReID (more discriminative)
             'use_bytetrack': True,       # NEW: Enable ByteTrack
             'use_reid': True,            # NEW: Enable ReID features
-            'reid_model': 'osnet_x1_0',  # Deep ReID model: osnet_x1_0 (best), osnet_x0_5, osnet_x0_25 (fastest)
+            'reid_model': 'osnet_x0_25',  # Deep ReID model: osnet_x0_25 (fastest ~3ms GPU) - was osnet_x1_0
         }
 
         # Deep ReID feature extractor (initialized in on_start)
@@ -546,7 +553,10 @@ class PeopleCounterProcessor(BaseStreamProcessor):
                 result = results[0]
 
                 if result.boxes is not None and len(result.boxes) > 0:
-                    # Process each detection
+                    # First pass: collect all detection info and bounding boxes
+                    detection_infos = []  # Store (center, bbox, confidence, class_id, class_name, track_id, box_coords)
+                    reid_boxes = []  # Bounding boxes for batch ReID extraction
+
                     for i, box in enumerate(result.boxes):
                         # Get confidence and class
                         confidence = float(box.conf[0])
@@ -571,23 +581,32 @@ class PeopleCounterProcessor(BaseStreamProcessor):
                         width = int(x2 - x1)
                         height = int(y2 - y1)
 
-                        # Extract ReID appearance features if enabled
-                        appearance_features = None
-                        if self.doorway_config['use_reid']:
-                            appearance_features = self._extract_appearance_features(
-                                frame, int(x1), int(y1), int(x2), int(y2)
-                            )
+                        detection_infos.append({
+                            'center': (center_x, center_y),
+                            'bbox': (int(x1), int(y1), width, height),
+                            'confidence': confidence,
+                            'class_id': class_id,
+                            'class_name': class_name,
+                            'track_id': track_id,
+                        })
+                        reid_boxes.append((int(x1), int(y1), int(x2), int(y2)))
 
-                        # Create detection with track ID and ReID features
+                    # Batch extract ReID features (single forward pass for all detections)
+                    appearance_features_list = [None] * len(detection_infos)
+                    if self.doorway_config['use_reid'] and self.reid_extractor and reid_boxes:
+                        appearance_features_list = self.reid_extractor.extract_batch(frame, reid_boxes)
+
+                    # Second pass: create Detection objects with features
+                    for i, info in enumerate(detection_infos):
                         detection = Detection(
-                            center=(center_x, center_y),
-                            bbox=(int(x1), int(y1), width, height),
-                            confidence=confidence,
+                            center=info['center'],
+                            bbox=info['bbox'],
+                            confidence=info['confidence'],
                             timestamp=time.time(),
-                            class_id=class_id,
-                            class_name=class_name,
-                            track_id=track_id,
-                            appearance_features=appearance_features
+                            class_id=info['class_id'],
+                            class_name=info['class_name'],
+                            track_id=info['track_id'],
+                            appearance_features=appearance_features_list[i]
                         )
 
                         detections.append(detection)
