@@ -6,7 +6,6 @@ Abstract base class for all stream processors
 import cv2
 import time
 import logging
-import os
 from abc import ABC, abstractmethod
 from typing import Optional
 import numpy as np
@@ -76,8 +75,6 @@ class BaseStreamProcessor(ABC):
                 self.logger.info(f"Connecting to stream (attempt {attempt}/{max_retries}): {self.rtsp_url}")
 
                 # Create VideoCapture with RTSP options for low latency
-                # Use FFmpeg options for minimal buffering
-                os.environ['OPENCV_FFMPEG_CAPTURE_OPTIONS'] = 'rtsp_transport;udp|fflags;nobuffer|flags;low_delay'
                 self.cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_FFMPEG)
 
                 # Set buffer size to 1 for lowest latency - always get latest frame
