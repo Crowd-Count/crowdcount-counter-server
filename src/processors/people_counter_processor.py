@@ -553,10 +553,6 @@ class PeopleCounterProcessor(BaseStreamProcessor):
                 result = results[0]
 
                 if result.boxes is not None and len(result.boxes) > 0:
-                    # First pass: collect all detection info and bounding boxes
-                    detection_infos = []  # Store (center, bbox, confidence, class_id, class_name, track_id, box_coords)
-                    reid_boxes = []  # Bounding boxes for batch ReID extraction
-
                     for i, box in enumerate(result.boxes):
                         # Get confidence and class
                         confidence = float(box.conf[0])
@@ -581,34 +577,18 @@ class PeopleCounterProcessor(BaseStreamProcessor):
                         width = int(x2 - x1)
                         height = int(y2 - y1)
 
-                        detection_infos.append({
-                            'center': (center_x, center_y),
-                            'bbox': (int(x1), int(y1), width, height),
-                            'confidence': confidence,
-                            'class_id': class_id,
-                            'class_name': class_name,
-                            'track_id': track_id,
-                        })
-                        reid_boxes.append((int(x1), int(y1), int(x2), int(y2)))
-
-                    # Batch extract ReID features (single forward pass for all detections)
-                    appearance_features_list = [None] * len(detection_infos)
-                    if self.doorway_config['use_reid'] and self.reid_extractor and reid_boxes:
-                        appearance_features_list = self.reid_extractor.extract_batch(frame, reid_boxes)
-
-                    # Second pass: create Detection objects with features
-                    for i, info in enumerate(detection_infos):
+                        # Create detection WITHOUT ReID features
+                        # ReID is extracted later only for unmatched detections (performance optimization)
                         detection = Detection(
-                            center=info['center'],
-                            bbox=info['bbox'],
-                            confidence=info['confidence'],
+                            center=(center_x, center_y),
+                            bbox=(int(x1), int(y1), width, height),
+                            confidence=confidence,
                             timestamp=time.time(),
-                            class_id=info['class_id'],
-                            class_name=info['class_name'],
-                            track_id=info['track_id'],
-                            appearance_features=appearance_features_list[i]
+                            class_id=class_id,
+                            class_name=class_name,
+                            track_id=track_id,
+                            appearance_features=None  # Extracted on-demand in update_trackers
                         )
-
                         detections.append(detection)
 
         except Exception as e:
@@ -628,6 +608,107 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             return None
 
         return self.reid_extractor.extract(frame, x1, y1, x2, y2)
+
+    def _check_and_handle_crossing(self, track_id: int, detection: Detection, frame_width: int, current_time: float):
+        """Check for crossing and handle API calls if crossing detected."""
+        crossing_dir = self.trackers[track_id].check_crossing(
+            frame_width,
+            self.doorway_config['doorway_center'],
+            self.doorway_config['doorway_width']
+        )
+
+        if crossing_dir and crossing_dir != CrossingDirection.NONE:
+            # A validated crossing occurred!
+            self.crossings[crossing_dir] += 1
+
+            # Make API call with device credentials
+            # Apply direction flip logic if enabled
+            if self.direction_flipped:
+                if crossing_dir == CrossingDirection.LEFT_TO_RIGHT:
+                    threading.Thread(target=self.api_client.subtract_from_count, args=(1,), daemon=True).start()
+                elif crossing_dir == CrossingDirection.RIGHT_TO_LEFT:
+                    threading.Thread(target=self.api_client.add_to_count, args=(1,), daemon=True).start()
+            else:
+                if crossing_dir == CrossingDirection.LEFT_TO_RIGHT:
+                    threading.Thread(target=self.api_client.add_to_count, args=(1,), daemon=True).start()
+                elif crossing_dir == CrossingDirection.RIGHT_TO_LEFT:
+                    threading.Thread(target=self.api_client.subtract_from_count, args=(1,), daemon=True).start()
+
+            # Log the crossing
+            crossing_info = {
+                'timestamp': current_time,
+                'track_id': track_id,
+                'direction': crossing_dir.value,
+                'confidence': self.trackers[track_id].peak_confidence,
+                'total_crossings_by_person': self.trackers[track_id].total_crossings,
+                'position': detection.center,
+                'detection_count': self.trackers[track_id].detection_count
+            }
+            self.crossing_log.append(crossing_info)
+
+            total = sum(self.crossings.values())
+            self.logger.info(f"CROSSING #{total}: {crossing_dir.value} | "
+                           f"Track #{track_id} (detections: {self.trackers[track_id].detection_count}) | "
+                           f"L->R: {self.crossings[CrossingDirection.LEFT_TO_RIGHT]} | "
+                           f"R->L: {self.crossings[CrossingDirection.RIGHT_TO_LEFT]}")
+
+    def _match_by_position_and_reid(self, detection: Detection) -> Optional[int]:
+        """
+        Match detection to tracker using position distance and ReID similarity.
+        Used for detections that ByteTrack couldn't match directly.
+        """
+        if not self.trackers:
+            return None
+
+        best_match_id = None
+        best_score = float('inf')
+
+        for track_id, tracker in self.trackers.items():
+            if len(tracker.positions) == 0:
+                continue
+
+            # Calculate distance to last known position
+            last_pos = tracker.positions[-1]
+            dist = math.sqrt(
+                (detection.center[0] - last_pos[0])**2 +
+                (detection.center[1] - last_pos[1])**2
+            )
+
+            # Consider velocity for prediction
+            vx, vy = tracker.get_smooth_velocity()
+            time_diff = detection.timestamp - tracker.last_update_time
+
+            predicted_x = last_pos[0] + vx * time_diff
+            predicted_y = last_pos[1] + vy * time_diff
+
+            pred_dist = math.sqrt(
+                (detection.center[0] - predicted_x)**2 +
+                (detection.center[1] - predicted_y)**2
+            )
+
+            position_dist = min(dist, pred_dist)
+
+            if position_dist > self.doorway_config['max_tracking_distance']:
+                continue
+
+            # Calculate ReID similarity score (if available)
+            reid_score = 0.0
+            if (self.doorway_config['use_reid'] and
+                detection.appearance_features is not None and
+                tracker.mean_appearance is not None):
+                reid_score = tracker.get_appearance_similarity(detection.appearance_features)
+
+            # Combined score: weight position and appearance
+            if reid_score > self.doorway_config['reid_similarity_threshold']:
+                final_score = position_dist * (1.0 - reid_score * 0.5)
+            else:
+                final_score = position_dist
+
+            if final_score < best_score:
+                best_score = final_score
+                best_match_id = track_id
+
+        return best_match_id
 
     def match_detection_to_tracker(self, detection: Detection) -> Optional[int]:
         """
@@ -744,98 +825,66 @@ class PeopleCounterProcessor(BaseStreamProcessor):
         """
         Update trackers with new detections and check for crossings.
         Uses ByteTrack IDs when available, falls back to ReID and position matching.
+
+        Performance optimization: ReID features are only extracted for unmatched detections,
+        not for every detection on every frame.
         """
         height, width = frame.shape[:2]
         current_time = time.time()
 
-        # Match detections to existing trackers
+        # PHASE 1: Fast matching using ByteTrack IDs only (no ReID yet)
         matched_trackers = set()
         unmatched_detections = []
 
         for detection in detections:
-            track_id = self.match_detection_to_tracker(detection)
-
-            if track_id is not None:
+            # Quick check: does ByteTrack ID match an existing tracker?
+            if detection.track_id is not None and detection.track_id in self.trackers:
+                track_id = detection.track_id
                 # Update existing tracker
                 self.trackers[track_id].update(detection)
                 matched_trackers.add(track_id)
 
                 # Check for crossing with trajectory validation
-                crossing_dir = self.trackers[track_id].check_crossing(
-                    width,
-                    self.doorway_config['doorway_center'],
-                    self.doorway_config['doorway_width']
-                )
-
-                if crossing_dir and crossing_dir != CrossingDirection.NONE:
-                    # A validated crossing occurred!
-                    self.crossings[crossing_dir] += 1
-
-                    # Make API call with device credentials
-                    # Apply direction flip logic if enabled
-                    if self.direction_flipped:
-                        # Direction is flipped: LEFT->RIGHT becomes exit, RIGHT->LEFT becomes entry
-                        if crossing_dir == CrossingDirection.LEFT_TO_RIGHT:
-                            threading.Thread(
-                                target=self.api_client.subtract_from_count,
-                                args=(1,),
-                                daemon=True
-                            ).start()
-                        elif crossing_dir == CrossingDirection.RIGHT_TO_LEFT:
-                            threading.Thread(
-                                target=self.api_client.add_to_count,
-                                args=(1,),
-                                daemon=True
-                            ).start()
-                    else:
-                        # Normal direction: LEFT->RIGHT is entry, RIGHT->LEFT is exit
-                        if crossing_dir == CrossingDirection.LEFT_TO_RIGHT:
-                            threading.Thread(
-                                target=self.api_client.add_to_count,
-                                args=(1,),
-                                daemon=True
-                            ).start()
-                        elif crossing_dir == CrossingDirection.RIGHT_TO_LEFT:
-                            threading.Thread(
-                                target=self.api_client.subtract_from_count,
-                                args=(1,),
-                                daemon=True
-                            ).start()
-
-                    # Log the crossing
-                    crossing_info = {
-                        'timestamp': current_time,
-                        'track_id': track_id,
-                        'direction': crossing_dir.value,
-                        'confidence': self.trackers[track_id].peak_confidence,
-                        'total_crossings_by_person': self.trackers[track_id].total_crossings,
-                        'position': detection.center,
-                        'detection_count': self.trackers[track_id].detection_count
-                    }
-                    self.crossing_log.append(crossing_info)
-
-                    # Log crossing event with trajectory info
-                    total = sum(self.crossings.values())
-                    self.logger.info(f"CROSSING #{total}: {crossing_dir.value} | "
-                                   f"Track #{track_id} (detections: {self.trackers[track_id].detection_count}) | "
-                                   f"L->R: {self.crossings[CrossingDirection.LEFT_TO_RIGHT]} | "
-                                   f"R->L: {self.crossings[CrossingDirection.RIGHT_TO_LEFT]}")
+                self._check_and_handle_crossing(track_id, detection, width, current_time)
             else:
+                # No ByteTrack match - will need ReID
                 unmatched_detections.append(detection)
 
-        # Try to recover unmatched detections using ReID (for group occlusions)
+        # PHASE 2: Extract ReID features ONLY for unmatched detections (performance optimization)
+        if unmatched_detections and self.doorway_config['use_reid'] and self.reid_extractor:
+            # Collect bounding boxes for batch extraction
+            reid_boxes = []
+            for det in unmatched_detections:
+                x, y, w, h = det.bbox
+                reid_boxes.append((x, y, x + w, y + h))
+
+            # Single batch forward pass for all unmatched detections
+            features_list = self.reid_extractor.extract_batch(frame, reid_boxes)
+
+            # Assign features to detections
+            for i, det in enumerate(unmatched_detections):
+                det.appearance_features = features_list[i]
+
+        # PHASE 3: Try to match unmatched detections using ReID + position
         still_unmatched = []
         for detection in unmatched_detections:
-            if self.doorway_config['use_reid']:
-                # Try to find a lost tracker using appearance matching
-                reid_match = self._find_best_reid_match(detection)
-                if reid_match is not None:
-                    # Recovered a lost track via ReID
-                    self.trackers[reid_match].update(detection)
-                    matched_trackers.add(reid_match)
-                    self.logger.debug(f"ReID recovered track #{reid_match}")
-                    continue
-            still_unmatched.append(detection)
+            # Try position + ReID matching
+            track_id = self._match_by_position_and_reid(detection)
+
+            if track_id is not None:
+                self.trackers[track_id].update(detection)
+                matched_trackers.add(track_id)
+                self._check_and_handle_crossing(track_id, detection, width, current_time)
+            else:
+                # Try ReID recovery for lost tracks
+                if self.doorway_config['use_reid']:
+                    reid_match = self._find_best_reid_match(detection)
+                    if reid_match is not None:
+                        self.trackers[reid_match].update(detection)
+                        matched_trackers.add(reid_match)
+                        self.logger.debug(f"ReID recovered track #{reid_match}")
+                        continue
+                still_unmatched.append(detection)
 
         # Create new trackers for truly unmatched detections
         for detection in still_unmatched:
