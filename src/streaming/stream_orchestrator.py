@@ -566,6 +566,13 @@ class StreamOrchestrator:
                         # Get frame data from queue with timeout
                         frame_data = frame_queue.get(timeout=1.0)
 
+                        # Drain queue to get the LATEST frame (reduces lag)
+                        while True:
+                            try:
+                                frame_data = frame_queue.get_nowait()
+                            except queue.Empty:
+                                break
+
                         # Handle both old format (single frame) and new format (dict with clean/annotated)
                         if isinstance(frame_data, dict):
                             frame = frame_data['annotated'] if show_overlay else frame_data['clean']

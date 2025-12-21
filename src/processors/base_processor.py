@@ -6,6 +6,7 @@ Abstract base class for all stream processors
 import cv2
 import time
 import logging
+import os
 from abc import ABC, abstractmethod
 from typing import Optional
 import numpy as np
@@ -75,6 +76,8 @@ class BaseStreamProcessor(ABC):
                 self.logger.info(f"Connecting to stream (attempt {attempt}/{max_retries}): {self.rtsp_url}")
 
                 # Create VideoCapture with RTSP options for low latency
+                # Use FFmpeg options for minimal buffering
+                os.environ['OPENCV_FFMPEG_CAPTURE_OPTIONS'] = 'rtsp_transport;udp|fflags;nobuffer|flags;low_delay'
                 self.cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_FFMPEG)
 
                 # Set buffer size to 1 for lowest latency - always get latest frame
@@ -228,6 +231,9 @@ class BaseStreamProcessor(ABC):
 
                 # Process the frame (custom logic)
                 try:
+                    # Save clean frame before processing (in case process_frame modifies in-place)
+                    clean_frame = frame.copy() if self.frame_queue is not None else None
+
                     processed_frame = self.process_frame(frame, frame_number, timestamp)
 
                     # Send both clean and processed frames to queue for live viewing (non-blocking)
@@ -235,7 +241,7 @@ class BaseStreamProcessor(ABC):
                         try:
                             # Send both frames as a dict so viewer can toggle between them
                             frame_data = {
-                                'clean': frame.copy(),
+                                'clean': clean_frame,
                                 'annotated': processed_frame
                             }
                             # Use put_nowait to avoid blocking if queue is full
