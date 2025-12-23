@@ -60,13 +60,13 @@ class CrowdCountAPIClient:
         try:
             url = f"{self.base_url}/add_to_count"
             data = {
-                'user_id': self.device_id,
+                'device_id': self.device_id,
                 'password': self.password,
                 'count_to_add': str(count)
             }
 
             self.logger.debug(f"POST {url} - Adding {count} to count")
-            response = requests.post(url, data=data, timeout=self.timeout)
+            response = requests.post(url, json=data, timeout=self.timeout)
 
             if response.status_code == 200:
                 self.logger.info(f"✓ Added {count} to remote count")
@@ -101,13 +101,13 @@ class CrowdCountAPIClient:
         try:
             url = f"{self.base_url}/sub_from_count"
             data = {
-                'user_id': self.device_id,
+                'device_id': self.device_id,
                 'password': self.password,
                 'count_to_sub': str(count)
             }
 
             self.logger.debug(f"POST {url} - Subtracting {count} from count")
-            response = requests.post(url, data=data, timeout=self.timeout)
+            response = requests.post(url, json=data, timeout=self.timeout)
 
             if response.status_code == 200:
                 self.logger.info(f"✓ Subtracted {count} from remote count")
@@ -138,12 +138,12 @@ class CrowdCountAPIClient:
 
         try:
             url = f"{self.base_url}/get_count"
-            params = {
-                'user_id': self.device_id,
+            data = {
+                'device_id': self.device_id,
                 'password': self.password
             }
 
-            response = requests.get(url, params=params, timeout=self.timeout)
+            response = requests.post(url, json=data, timeout=self.timeout)
 
             if response.status_code == 200:
                 data = response.json()
@@ -192,13 +192,13 @@ class CrowdCountAPIClient:
         try:
             url = f"{self.base_url}/update_status"
             data = {
-                'user_id': self.device_id,
+                'device_id': self.device_id,
                 'password': self.password,
                 'status': status
             }
 
             self.logger.debug(f"POST {url} - Updating status to {status}")
-            response = requests.post(url, data=data, timeout=self.timeout)
+            response = requests.post(url, json=data, timeout=self.timeout)
 
             if response.status_code == 200:
                 self.logger.info(f"✓ Device status updated to {status}")
@@ -229,12 +229,12 @@ class CrowdCountAPIClient:
 
         try:
             url = f"{self.base_url}/get_direction_flipped"
-            params = {
-                'user_id': self.device_id,
+            data = {
+                'device_id': self.device_id,
                 'password': self.password
             }
 
-            response = requests.get(url, params=params, timeout=self.timeout)
+            response = requests.post(url, json=data, timeout=self.timeout)
 
             if response.status_code == 200:
                 data = response.json()
@@ -250,12 +250,12 @@ class CrowdCountAPIClient:
             return False
 
     @staticmethod
-    def check_password(user_id: str, password: str, base_url: str = 'https://api.crowdcount.tech', timeout: int = 5) -> bool:
+    def check_password(device_id: str, password: str, base_url: str = 'https://api.crowdcount.tech', timeout: int = 5) -> bool:
         """
-        Check if a password is correct for a given user_id
+        Check if a password is correct for a given device_id
 
         Args:
-            user_id: Device/user identifier
+            device_id: Device identifier
             password: Password to validate
             base_url: Base URL for the CrowdCount API
             timeout: Request timeout in seconds
@@ -265,24 +265,24 @@ class CrowdCountAPIClient:
         """
         try:
             url = f"{base_url.rstrip('/')}/check_password"
-            params = {
-                'user_id': user_id,
+            data = {
+                'device_id': device_id,
                 'password': password
             }
 
-            response = requests.get(url, params=params, timeout=timeout)
+            response = requests.post(url, json=data, timeout=timeout)
 
             if response.status_code == 200:
-                data = response.json()
-                is_correct = data.get('is_password_correct', False)
+                resp_data = response.json()
+                is_correct = resp_data.get('is_password_correct', False)
                 return bool(is_correct)
             elif response.status_code == 404:
-                # User does not exist
+                # Device does not exist
                 return False
             else:
                 # Other errors - fail closed (deny access)
                 return False
 
-        except Exception as e:
+        except Exception:
             # On error, fail closed (deny access)
             return False
