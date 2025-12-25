@@ -1,7 +1,13 @@
 """
-People Counter Processor
+People Counter Processor - Method 1: Enhanced Single-Line Crossing
 Enhanced overhead doorway person counter using YOLO with ByteTrack tracking
-Optimized for group detection with ReID and trajectory validation
+
+METHOD 1: Enhanced Single-Line Centroid Crossing with Direction Vector
+- Direction vector computed from last N positions to validate crossing direction
+- Velocity threshold gating to filter jitter/oscillation
+- Bbox area change detection for occlusion hints
+- Loitering detection (max dwell on line)
+- Hysteresis to prevent false crossings from noise
 """
 
 import cv2
@@ -74,7 +80,22 @@ class Detection:
 
 
 class PersonTracker:
-    """Enhanced person tracker with trajectory validation, ReID, and improved crossing detection"""
+    """
+    METHOD 1: Enhanced Single-Line Crossing with Direction Vector
+
+    Key features:
+    - Direction vector computed from N-frame window for crossing validation
+    - Velocity threshold gating (min px/frame to confirm direction)
+    - Bbox area tracking for occlusion detection
+    - Loitering detection (max dwell time on line)
+    - Enhanced trajectory validation with hysteresis
+    """
+
+    # Method 1 configuration constants
+    DIRECTION_VECTOR_FRAMES = 5       # Frames for velocity/direction calculation
+    MIN_VELOCITY_THRESHOLD = 2.0      # Minimum px/frame to confirm crossing direction
+    MAX_DWELL_ON_LINE = 2.0           # Maximum seconds on the line before requiring re-entry
+    BBOX_AREA_DROP_THRESHOLD = 0.4    # 40% area drop suggests occlusion
 
     def __init__(self, track_id: int, initial_detection: Detection):
         self.track_id = track_id
@@ -110,6 +131,12 @@ class PersonTracker:
         self.pending_crossing = None  # (direction, timestamp) if crossing needs validation
         self.crossing_start_position = None  # Position when crossing started
 
+        # METHOD 1: Enhanced tracking state
+        self.bbox_areas = deque(maxlen=30)     # Track bbox areas for occlusion detection
+        self.on_line_since = None              # Timestamp when person entered the line zone
+        self.loitering_warned = False          # Whether we've already flagged loitering
+        self.direction_vectors = deque(maxlen=10)  # Recent direction vectors for smoothing
+
         # Add initial detection
         self.update(initial_detection)
 
@@ -121,6 +148,10 @@ class PersonTracker:
         self.peak_confidence = max(self.peak_confidence, detection.confidence)
         self.detection_count += 1
 
+        # METHOD 1: Track bbox area for occlusion detection
+        bbox_area = detection.bbox[2] * detection.bbox[3]  # width * height
+        self.bbox_areas.append(bbox_area)
+
         # Calculate velocity
         if len(self.positions) >= 2:
             dx = self.positions[-1][0] - self.positions[-2][0]
@@ -130,6 +161,14 @@ class PersonTracker:
                 vx = dx / dt
                 vy = dy / dt
                 self.velocities.append((vx, vy))
+
+        # METHOD 1: Compute and store direction vector (N-frame window)
+        if len(self.positions) >= self.DIRECTION_VECTOR_FRAMES:
+            old_pos = self.positions[-self.DIRECTION_VECTOR_FRAMES]
+            new_pos = self.positions[-1]
+            direction_x = (new_pos[0] - old_pos[0]) / self.DIRECTION_VECTOR_FRAMES
+            direction_y = (new_pos[1] - old_pos[1]) / self.DIRECTION_VECTOR_FRAMES
+            self.direction_vectors.append((direction_x, direction_y))
 
         # Update ReID appearance features
         if detection.appearance_features is not None:
@@ -166,8 +205,13 @@ class PersonTracker:
 
     def check_crossing(self, frame_width: int, doorway_center: float, doorway_width: float) -> Optional[CrossingDirection]:
         """
-        Check if a crossing has occurred with trajectory validation.
-        Requires minimum detections and consistent movement to count.
+        METHOD 1: Enhanced Single-Line Crossing with Direction Vector
+
+        Check if a crossing has occurred using:
+        1. Direction vector validation (N-frame window)
+        2. Velocity threshold gating
+        3. Loitering detection
+        4. Bbox area change detection for occlusion
         """
         if len(self.positions) < 2:
             return None
@@ -179,16 +223,40 @@ class PersonTracker:
         current_x = self.positions[-1][0]
         center_x = frame_width * doorway_center
         half_width = frame_width * doorway_width / 2
+        current_time = time.time()
 
-        # Determine which side of the center line the person is on
+        # Determine zone: left, on_line, or right
         previous_side = self.current_side
+        is_on_line = (center_x - half_width) <= current_x <= (center_x + half_width)
+
         if current_x < (center_x - half_width):
-            self.current_side = 'left'
+            new_side = 'left'
         elif current_x > (center_x + half_width):
-            self.current_side = 'right'
+            new_side = 'right'
         else:
-            # Person is on the line - don't update side yet
+            new_side = 'on_line'
+
+        # METHOD 1: Loitering detection
+        if is_on_line:
+            if self.on_line_since is None:
+                self.on_line_since = current_time
+            elif current_time - self.on_line_since > self.MAX_DWELL_ON_LINE:
+                # Person has been on line too long - require them to leave and re-enter
+                if not self.loitering_warned:
+                    self.loitering_warned = True
+                # Don't process crossing until they leave the line
+                return None
+        else:
+            # Person left the line zone
+            if self.on_line_since is not None:
+                self.on_line_since = None
+                self.loitering_warned = False
+
+        # Person is on the line - don't update side yet, but track loitering
+        if is_on_line:
             return None
+
+        self.current_side = new_side
 
         # Track side history for validation
         self.side_history.append(self.current_side)
@@ -204,10 +272,6 @@ class PersonTracker:
             self.last_side = self.current_side
             return None
 
-        # Check for crossing with validation
-        crossing_direction = None
-        current_time = time.time()
-
         # Detect potential crossing (side changed from last confirmed side)
         potential_crossing = None
         if self.last_side == 'left' and self.current_side == 'right':
@@ -215,39 +279,74 @@ class PersonTracker:
         elif self.last_side == 'right' and self.current_side == 'left':
             potential_crossing = CrossingDirection.RIGHT_TO_LEFT
 
+        crossing_direction = None
         if potential_crossing:
-            # Validate crossing with trajectory analysis
-            if self._validate_crossing(frame_width, doorway_center):
+            # METHOD 1: Validate crossing with direction vector + velocity gating
+            if self._validate_crossing_method1(potential_crossing, frame_width, doorway_center):
                 if current_time - self.last_crossing_time >= self.min_crossing_interval:
                     crossing_direction = potential_crossing
                     self.total_crossings += 1
                     self.crossing_events.append((current_time, potential_crossing))
                     self.last_crossing_time = current_time
-                    # Only update last_side AFTER successful crossing validation
                     self.last_side = self.current_side
-        else:
-            # No crossing detected - update last_side to track position
-            # (only when sides match, not during a pending crossing)
-            if self.current_side == self.last_side:
-                pass  # Already matching, nothing to do
-            # Don't update last_side if we're waiting for validation
 
         return crossing_direction
 
-    def _validate_crossing(self, frame_width: int, doorway_center: float) -> bool:
+    def _validate_crossing_method1(self, potential_direction: CrossingDirection,
+                                    frame_width: int, doorway_center: float) -> bool:
         """
-        Validate that a crossing is legitimate using trajectory analysis.
-        Returns True if crossing should be counted.
+        METHOD 1: Validate crossing using direction vector and velocity thresholds.
+
+        Validation criteria:
+        1. Direction vector must be consistent with crossing direction
+        2. Velocity must exceed minimum threshold
+        3. Bbox area should not have dropped significantly (occlusion check)
+        4. Movement consistency check
         """
         # Require minimum consecutive detections on new side
         if self.consecutive_side_detections < self.min_consecutive_for_crossing:
             return False
 
-        # Check for consistent movement direction in recent positions
-        if len(self.positions) < 3:
-            return True  # Not enough data, allow crossing
+        # Check direction vector if available
+        if len(self.direction_vectors) > 0:
+            # Get recent direction vector (average of last few)
+            recent_dirs = list(self.direction_vectors)[-3:] if len(self.direction_vectors) >= 3 else list(self.direction_vectors)
+            avg_dir_x = sum(d[0] for d in recent_dirs) / len(recent_dirs)
 
-        recent_positions = list(self.positions)[-5:]  # Last 5 positions (reduced from 6)
+            # VELOCITY THRESHOLD GATING: Require minimum velocity to confirm direction
+            if abs(avg_dir_x) < self.MIN_VELOCITY_THRESHOLD:
+                # Movement too slow - could be noise/jitter
+                return False
+
+            # Verify direction vector matches the claimed crossing direction
+            if potential_direction == CrossingDirection.LEFT_TO_RIGHT and avg_dir_x <= 0:
+                # Claiming left-to-right but direction vector points left
+                return False
+            if potential_direction == CrossingDirection.RIGHT_TO_LEFT and avg_dir_x >= 0:
+                # Claiming right-to-left but direction vector points right
+                return False
+
+        # METHOD 1: Check for bbox area drop (occlusion hint)
+        if len(self.bbox_areas) >= 5:
+            recent_areas = list(self.bbox_areas)[-5:]
+            earlier_areas = list(self.bbox_areas)[-10:-5] if len(self.bbox_areas) >= 10 else list(self.bbox_areas)[:5]
+
+            if earlier_areas:
+                avg_recent = sum(recent_areas) / len(recent_areas)
+                avg_earlier = sum(earlier_areas) / len(earlier_areas)
+
+                if avg_earlier > 0:
+                    area_ratio = avg_recent / avg_earlier
+                    if area_ratio < (1 - self.BBOX_AREA_DROP_THRESHOLD):
+                        # Significant bbox area drop - possible occlusion
+                        # Hold the crossing count until area stabilizes
+                        return False
+
+        # Standard movement consistency check
+        if len(self.positions) < 3:
+            return True
+
+        recent_positions = list(self.positions)[-self.DIRECTION_VECTOR_FRAMES:]
         if len(recent_positions) < 2:
             return True
 
@@ -255,24 +354,27 @@ class PersonTracker:
         x_movements = []
         for i in range(1, len(recent_positions)):
             dx = recent_positions[i][0] - recent_positions[i-1][0]
-            # Only count significant movements (ignore jitter)
             if abs(dx) > 2:  # More than 2 pixels
                 x_movements.append(dx)
 
         if not x_movements:
-            return True  # No significant movement detected, allow crossing
+            return True
 
-        # Check if movement is consistently in one direction (not bouncing)
+        # Check if movement is consistently in one direction
         positive_moves = sum(1 for m in x_movements if m > 0)
         negative_moves = sum(1 for m in x_movements if m < 0)
         total_moves = positive_moves + negative_moves
 
         if total_moves == 0:
-            return True  # Changed: allow crossing if no significant movement
+            return True
 
-        # Require at least 50% of movements in same direction (relaxed from 60%)
+        # Require at least 50% of movements in same direction
         consistency = max(positive_moves, negative_moves) / total_moves
         return consistency >= 0.5
+
+    def _validate_crossing(self, frame_width: int, doorway_center: float) -> bool:
+        """Legacy validation method - delegates to Method 1 validation."""
+        return self._validate_crossing_method1(CrossingDirection.NONE, frame_width, doorway_center)
 
     def get_smooth_velocity(self) -> Tuple[float, float]:
         """Get smoothed velocity estimate"""
@@ -381,6 +483,11 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             'use_bytetrack': True,       # NEW: Enable ByteTrack
             'use_reid': True,            # NEW: Enable ReID features
             'reid_model': 'osnet_x0_25',  # Deep ReID model: osnet_x0_25 (fastest ~3ms GPU) - was osnet_x1_0
+            # METHOD 1: Enhanced Single-Line Crossing parameters
+            'direction_vector_frames': 5,     # Frames for direction/velocity calculation
+            'min_velocity_threshold': 2.0,    # Min px/frame to confirm crossing direction
+            'max_dwell_on_line': 2.0,         # Max seconds on line before loitering
+            'bbox_area_drop_threshold': 0.4,  # 40% area drop triggers occlusion check
         }
 
         # Deep ReID feature extractor (initialized in on_start)
