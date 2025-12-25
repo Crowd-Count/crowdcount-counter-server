@@ -1,7 +1,12 @@
 """
-People Counter Processor
+People Counter Processor - Method 4: Probabilistic Filter
 Enhanced overhead doorway person counter using YOLO with ByteTrack tracking
-Optimized for group detection with ReID and trajectory validation
+
+METHOD 4: Track-Level Probabilistic Filter with Consensus
+- EMA smoothing for position and velocity
+- Continuous crossing_score in [-1, 1] range
+- Consensus requirement: N frames must agree on direction
+- Natural handling of varying speeds and partial occlusions
 """
 
 import cv2
@@ -74,7 +79,24 @@ class Detection:
 
 
 class PersonTracker:
-    """Enhanced person tracker with trajectory validation, ReID, and improved crossing detection"""
+    """
+    METHOD 4: Track-Level Probabilistic Filter with Consensus
+
+    Key features:
+    - EMA (Exponential Moving Average) smoothing for position and velocity
+    - Continuous crossing_score in [-1, 1]: negative=exit, positive=enter
+    - Consensus buffer: last N crossing_scores must agree
+    - Velocity gating: ignore signals when stationary
+    """
+
+    # Method 4 configuration constants
+    EMA_ALPHA_POSITION = 0.3      # EMA alpha for position smoothing
+    EMA_ALPHA_VELOCITY = 0.2      # EMA alpha for velocity smoothing
+    EMA_ALPHA_SCORE = 0.4         # EMA alpha for crossing score
+    CROSSING_THRESHOLD = 0.7      # Threshold for strong crossing signal
+    CONSENSUS_WINDOW = 10         # Number of frames for consensus
+    CONSENSUS_THRESHOLD = 0.5     # Mean consensus threshold
+    MIN_VELOCITY_FOR_SIGNAL = 1.0 # Minimum px/frame to generate signal
 
     def __init__(self, track_id: int, initial_detection: Detection):
         self.track_id = track_id
@@ -110,6 +132,13 @@ class PersonTracker:
         self.pending_crossing = None  # (direction, timestamp) if crossing needs validation
         self.crossing_start_position = None  # Position when crossing started
 
+        # METHOD 4: EMA and probabilistic state
+        self.position_ema_x = None                    # EMA of x position
+        self.velocity_ema_x = 0.0                     # EMA of x velocity
+        self.crossing_score = 0.0                     # Current crossing score [-1, 1]
+        self.consensus_buffer = deque(maxlen=self.CONSENSUS_WINDOW)  # Recent scores
+        self.last_position_for_ema = None            # For computing velocity
+
         # Add initial detection
         self.update(initial_detection)
 
@@ -121,7 +150,23 @@ class PersonTracker:
         self.peak_confidence = max(self.peak_confidence, detection.confidence)
         self.detection_count += 1
 
-        # Calculate velocity
+        current_x = detection.center[0]
+
+        # METHOD 4: Update EMA for position
+        if self.position_ema_x is None:
+            self.position_ema_x = current_x
+        else:
+            self.position_ema_x = (self.EMA_ALPHA_POSITION * current_x +
+                                   (1 - self.EMA_ALPHA_POSITION) * self.position_ema_x)
+
+        # METHOD 4: Update EMA for velocity
+        if self.last_position_for_ema is not None:
+            instant_velocity = current_x - self.last_position_for_ema
+            self.velocity_ema_x = (self.EMA_ALPHA_VELOCITY * instant_velocity +
+                                   (1 - self.EMA_ALPHA_VELOCITY) * self.velocity_ema_x)
+        self.last_position_for_ema = current_x
+
+        # Calculate velocity (legacy)
         if len(self.positions) >= 2:
             dx = self.positions[-1][0] - self.positions[-2][0]
             dy = self.positions[-1][1] - self.positions[-2][1]
@@ -164,115 +209,112 @@ class PersonTracker:
         # Clamp to [0, 1] range (can be slightly out of range due to floating point)
         return max(0.0, min(1.0, float(similarity)))
 
-    def check_crossing(self, frame_width: int, doorway_center: float, doorway_width: float) -> Optional[CrossingDirection]:
+    def _sigmoid(self, x: float) -> float:
+        """Sigmoid function for smooth signal mapping."""
+        return 1.0 / (1.0 + math.exp(-x)) if -700 < x < 700 else (0.0 if x <= -700 else 1.0)
+
+    def check_crossing(self, frame_width: int, doorway_center: float, doorway_width: float,
+                       approach_zone: float = 0.15) -> Optional[CrossingDirection]:
         """
-        Check if a crossing has occurred with trajectory validation.
-        Requires minimum detections and consistent movement to count.
+        METHOD 4: Track-Level Probabilistic Filter with Consensus
+
+        Each frame:
+        1. Compute instantaneous crossing signal based on velocity and position
+        2. Update crossing_score with EMA
+        3. Add to consensus buffer
+        4. Emit crossing when score exceeds threshold AND consensus agrees
         """
-        if len(self.positions) < 2:
+        if self.position_ema_x is None:
             return None
 
-        # Don't count crossings until we have enough detections (trajectory validation)
-        if self.detection_count < self.min_detections_to_count:
-            return None
-
-        current_x = self.positions[-1][0]
-        center_x = frame_width * doorway_center
-        half_width = frame_width * doorway_width / 2
-
-        # Determine which side of the center line the person is on
-        previous_side = self.current_side
-        if current_x < (center_x - half_width):
-            self.current_side = 'left'
-        elif current_x > (center_x + half_width):
-            self.current_side = 'right'
-        else:
-            # Person is on the line - don't update side yet
-            return None
-
-        # Track side history for validation
-        self.side_history.append(self.current_side)
-
-        # Track consecutive detections on same side
-        if previous_side == self.current_side:
-            self.consecutive_side_detections += 1
-        else:
-            self.consecutive_side_detections = 1
-
-        # Check if we have a previous side recorded
-        if self.last_side is None:
-            self.last_side = self.current_side
-            return None
-
-        # Check for crossing with validation
-        crossing_direction = None
+        current_x = self.positions[-1][0] if self.positions else 0
         current_time = time.time()
 
-        # Detect potential crossing (side changed from last confirmed side)
-        potential_crossing = None
-        if self.last_side == 'left' and self.current_side == 'right':
-            potential_crossing = CrossingDirection.LEFT_TO_RIGHT
-        elif self.last_side == 'right' and self.current_side == 'left':
-            potential_crossing = CrossingDirection.RIGHT_TO_LEFT
+        # Calculate line position and approach zone
+        center_x = frame_width * doorway_center
+        approach_width = frame_width * approach_zone
 
-        if potential_crossing:
-            # Validate crossing with trajectory analysis
-            if self._validate_crossing(frame_width, doorway_center):
-                if current_time - self.last_crossing_time >= self.min_crossing_interval:
-                    crossing_direction = potential_crossing
-                    self.total_crossings += 1
-                    self.crossing_events.append((current_time, potential_crossing))
-                    self.last_crossing_time = current_time
-                    # Only update last_side AFTER successful crossing validation
-                    self.last_side = self.current_side
+        # Compute distance to line (normalized)
+        distance_to_line = self.position_ema_x - center_x
+        normalized_distance = distance_to_line / approach_width if approach_width > 0 else 0
+
+        # VELOCITY GATING: Only generate signal if moving
+        if abs(self.velocity_ema_x) < self.MIN_VELOCITY_FOR_SIGNAL:
+            crossing_signal = 0.0
         else:
-            # No crossing detected - update last_side to track position
-            # (only when sides match, not during a pending crossing)
-            if self.current_side == self.last_side:
-                pass  # Already matching, nothing to do
-            # Don't update last_side if we're waiting for validation
+            # Compute crossing signal:
+            # - High when moving fast AND near the line
+            # - Positive for left-to-right (positive velocity)
+            # - Negative for right-to-left (negative velocity)
 
-        return crossing_direction
+            # Velocity component: sigmoid maps velocity to [-1, 1] range
+            velocity_factor = 2.0 * self._sigmoid(self.velocity_ema_x * 0.5) - 1.0
+
+            # Proximity component: peaks at the line (normalized_distance = 0)
+            proximity_factor = max(0, 1.0 - abs(normalized_distance))
+
+            # Combined signal: strong when moving fast near the line
+            crossing_signal = velocity_factor * proximity_factor
+
+        # Update crossing_score with EMA
+        self.crossing_score = (self.EMA_ALPHA_SCORE * crossing_signal +
+                               (1 - self.EMA_ALPHA_SCORE) * self.crossing_score)
+
+        # Add to consensus buffer
+        self.consensus_buffer.append(self.crossing_score)
+
+        # Update side tracking for visualization
+        if current_x < center_x:
+            self.current_side = 'left'
+        else:
+            self.current_side = 'right'
+
+        if self.last_side is None:
+            self.last_side = self.current_side
+
+        # Check for crossing emission
+        crossing_to_emit = None
+
+        if abs(self.crossing_score) > self.CROSSING_THRESHOLD and len(self.consensus_buffer) >= 5:
+            # Strong signal - check consensus
+            consensus = sum(self.consensus_buffer) / len(self.consensus_buffer)
+            recent_scores = list(self.consensus_buffer)[-5:]
+
+            if consensus > self.CONSENSUS_THRESHOLD:
+                # Check all recent scores agree on positive (ENTER)
+                if all(s > 0.3 for s in recent_scores):
+                    # Verify position actually moved from left to right
+                    if self.last_side == 'left' and self.current_side == 'right':
+                        if current_time - self.last_crossing_time >= self.min_crossing_interval:
+                            crossing_to_emit = CrossingDirection.LEFT_TO_RIGHT
+                            self.total_crossings += 1
+                            self.crossing_events.append((current_time, crossing_to_emit))
+                            self.last_crossing_time = current_time
+                            self.last_side = self.current_side
+                            # Reset crossing score after emission
+                            self.crossing_score = 0.0
+                            self.consensus_buffer.clear()
+
+            elif consensus < -self.CONSENSUS_THRESHOLD:
+                # Check all recent scores agree on negative (EXIT)
+                if all(s < -0.3 for s in recent_scores):
+                    # Verify position actually moved from right to left
+                    if self.last_side == 'right' and self.current_side == 'left':
+                        if current_time - self.last_crossing_time >= self.min_crossing_interval:
+                            crossing_to_emit = CrossingDirection.RIGHT_TO_LEFT
+                            self.total_crossings += 1
+                            self.crossing_events.append((current_time, crossing_to_emit))
+                            self.last_crossing_time = current_time
+                            self.last_side = self.current_side
+                            # Reset crossing score after emission
+                            self.crossing_score = 0.0
+                            self.consensus_buffer.clear()
+
+        return crossing_to_emit
 
     def _validate_crossing(self, frame_width: int, doorway_center: float) -> bool:
-        """
-        Validate that a crossing is legitimate using trajectory analysis.
-        Returns True if crossing should be counted.
-        """
-        # Require minimum consecutive detections on new side
-        if self.consecutive_side_detections < self.min_consecutive_for_crossing:
-            return False
-
-        # Check for consistent movement direction in recent positions
-        if len(self.positions) < 3:
-            return True  # Not enough data, allow crossing
-
-        recent_positions = list(self.positions)[-5:]  # Last 5 positions (reduced from 6)
-        if len(recent_positions) < 2:
-            return True
-
-        # Calculate movement direction consistency
-        x_movements = []
-        for i in range(1, len(recent_positions)):
-            dx = recent_positions[i][0] - recent_positions[i-1][0]
-            # Only count significant movements (ignore jitter)
-            if abs(dx) > 2:  # More than 2 pixels
-                x_movements.append(dx)
-
-        if not x_movements:
-            return True  # No significant movement detected, allow crossing
-
-        # Check if movement is consistently in one direction (not bouncing)
-        positive_moves = sum(1 for m in x_movements if m > 0)
-        negative_moves = sum(1 for m in x_movements if m < 0)
-        total_moves = positive_moves + negative_moves
-
-        if total_moves == 0:
-            return True  # Changed: allow crossing if no significant movement
-
-        # Require at least 50% of movements in same direction (relaxed from 60%)
-        consistency = max(positive_moves, negative_moves) / total_moves
-        return consistency >= 0.5
+        """Legacy validation method - always returns True for Method 4."""
+        return True
 
     def get_smooth_velocity(self) -> Tuple[float, float]:
         """Get smoothed velocity estimate"""
@@ -381,6 +423,13 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             'use_bytetrack': True,       # NEW: Enable ByteTrack
             'use_reid': True,            # NEW: Enable ReID features
             'reid_model': 'osnet_x0_25',  # Deep ReID model: osnet_x0_25 (fastest ~3ms GPU) - was osnet_x1_0
+            # METHOD 4: Probabilistic Filter parameters
+            'ema_alpha_position': 0.3,      # EMA alpha for position smoothing
+            'ema_alpha_velocity': 0.2,      # EMA alpha for velocity smoothing
+            'ema_alpha_score': 0.4,         # EMA alpha for crossing score
+            'crossing_threshold': 0.7,      # Threshold for strong crossing signal
+            'consensus_window': 10,         # Frames for consensus
+            'consensus_threshold': 0.5,     # Mean consensus threshold
         }
 
         # Deep ReID feature extractor (initialized in on_start)
@@ -614,7 +663,8 @@ class PeopleCounterProcessor(BaseStreamProcessor):
         crossing_dir = self.trackers[track_id].check_crossing(
             frame_width,
             self.doorway_config['doorway_center'],
-            self.doorway_config['doorway_width']
+            self.doorway_config['doorway_width'],
+            self.doorway_config['approach_zone']  # METHOD 4: pass approach_zone for proximity calculation
         )
 
         if crossing_dir and crossing_dir != CrossingDirection.NONE:
@@ -923,7 +973,8 @@ class PeopleCounterProcessor(BaseStreamProcessor):
                     crossing_dir = tracker.check_crossing(
                         width,
                         self.doorway_config['doorway_center'],
-                        self.doorway_config['doorway_width']
+                        self.doorway_config['doorway_width'],
+                        self.doorway_config['approach_zone']  # METHOD 4: pass approach_zone
                     )
 
                     # Restore original positions
