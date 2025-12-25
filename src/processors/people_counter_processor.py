@@ -1,7 +1,13 @@
 """
-People Counter Processor
+People Counter Processor - Method 3: Dual-Line Gate
 Enhanced overhead doorway person counter using YOLO with ByteTrack tracking
-Optimized for group detection with ReID and trajectory validation
+
+METHOD 3: Dual-Line Gate (Two Parallel Lines)
+- Two parallel lines (LINE_A and LINE_B) separated by a configurable gap
+- Direction determined by which line is crossed first
+- Requires crossing both lines in sequence to count
+- Robust: impossible to count without crossing both lines
+- Resistant to on-line oscillation
 """
 
 import cv2
@@ -74,7 +80,22 @@ class Detection:
 
 
 class PersonTracker:
-    """Enhanced person tracker with trajectory validation, ReID, and improved crossing detection"""
+    """
+    METHOD 3: Dual-Line Gate (Two Parallel Lines)
+
+    Key features:
+    - Two parallel lines (LINE_A at 45%, LINE_B at 55% of frame width)
+    - Direction determined by which line is crossed first
+    - Must cross both lines in sequence within time limit
+    - Anti-bounce logic prevents oscillation from causing false counts
+    """
+
+    # Method 3 configuration constants
+    DUAL_LINE_GAP = 0.10              # Gap between lines (10% of frame width)
+    MIN_TRANSIT_TIME = 0.05           # Minimum seconds between line A and B crossings
+    MAX_TRANSIT_TIME = 3.0            # Maximum seconds between line A and B crossings
+    MAX_OSCILLATIONS = 3              # Max line crossings in short period before ignore
+    OSCILLATION_WINDOW = 2.0          # Time window for oscillation detection
 
     def __init__(self, track_id: int, initial_detection: Detection):
         self.track_id = track_id
@@ -109,6 +130,18 @@ class PersonTracker:
         # Pending crossing validation
         self.pending_crossing = None  # (direction, timestamp) if crossing needs validation
         self.crossing_start_position = None  # Position when crossing started
+
+        # METHOD 3: Dual-line gate state
+        self.crossed_line_a = False           # Whether LINE_A has been crossed
+        self.crossed_line_b = False           # Whether LINE_B has been crossed
+        self.line_a_cross_time = None         # Timestamp when LINE_A was crossed
+        self.line_b_cross_time = None         # Timestamp when LINE_B was crossed
+        self.line_a_direction = None          # Direction when crossing LINE_A
+        self.line_b_direction = None          # Direction when crossing LINE_B
+        self.line_a_position = None           # Position when crossing LINE_A (for ReID checkpoint)
+        self.previous_line_a_side = None      # Previous side relative to LINE_A
+        self.previous_line_b_side = None      # Previous side relative to LINE_B
+        self.line_crossing_history = deque(maxlen=10)  # Recent line crossings for anti-bounce
 
         # Add initial detection
         self.update(initial_detection)
@@ -164,115 +197,148 @@ class PersonTracker:
         # Clamp to [0, 1] range (can be slightly out of range due to floating point)
         return max(0.0, min(1.0, float(similarity)))
 
-    def check_crossing(self, frame_width: int, doorway_center: float, doorway_width: float) -> Optional[CrossingDirection]:
+    def _reset_gate_state(self):
+        """METHOD 3: Reset the dual-line gate state."""
+        self.crossed_line_a = False
+        self.crossed_line_b = False
+        self.line_a_cross_time = None
+        self.line_b_cross_time = None
+        self.line_a_direction = None
+        self.line_b_direction = None
+        self.line_a_position = None
+
+    def _is_oscillating(self, current_time: float) -> bool:
+        """METHOD 3: Check if track is oscillating (bouncing between lines)."""
+        recent_crossings = [t for t in self.line_crossing_history
+                           if current_time - t < self.OSCILLATION_WINDOW]
+        return len(recent_crossings) >= self.MAX_OSCILLATIONS
+
+    def check_crossing(self, frame_width: int, doorway_center: float, doorway_width: float,
+                       dual_line_gap: float = None) -> Optional[CrossingDirection]:
         """
-        Check if a crossing has occurred with trajectory validation.
-        Requires minimum detections and consistent movement to count.
+        METHOD 3: Dual-Line Gate (Two Parallel Lines)
+
+        Two lines separated by a gap:
+        - LINE_A at (center - gap/2)
+        - LINE_B at (center + gap/2)
+
+        A crossing is only counted when:
+        1. Track crosses LINE_A (records direction and time)
+        2. Track crosses LINE_B within time window
+        3. Both crossings are in the same direction
+        4. Transit time is within valid range
+
+        Anti-bounce: Ignores tracks that oscillate too frequently.
         """
         if len(self.positions) < 2:
             return None
 
-        # Don't count crossings until we have enough detections (trajectory validation)
-        if self.detection_count < self.min_detections_to_count:
-            return None
-
         current_x = self.positions[-1][0]
-        center_x = frame_width * doorway_center
-        half_width = frame_width * doorway_width / 2
-
-        # Determine which side of the center line the person is on
-        previous_side = self.current_side
-        if current_x < (center_x - half_width):
-            self.current_side = 'left'
-        elif current_x > (center_x + half_width):
-            self.current_side = 'right'
-        else:
-            # Person is on the line - don't update side yet
-            return None
-
-        # Track side history for validation
-        self.side_history.append(self.current_side)
-
-        # Track consecutive detections on same side
-        if previous_side == self.current_side:
-            self.consecutive_side_detections += 1
-        else:
-            self.consecutive_side_detections = 1
-
-        # Check if we have a previous side recorded
-        if self.last_side is None:
-            self.last_side = self.current_side
-            return None
-
-        # Check for crossing with validation
-        crossing_direction = None
+        previous_x = self.positions[-2][0] if len(self.positions) >= 2 else current_x
         current_time = time.time()
 
-        # Detect potential crossing (side changed from last confirmed side)
-        potential_crossing = None
-        if self.last_side == 'left' and self.current_side == 'right':
-            potential_crossing = CrossingDirection.LEFT_TO_RIGHT
-        elif self.last_side == 'right' and self.current_side == 'left':
-            potential_crossing = CrossingDirection.RIGHT_TO_LEFT
+        # Use configured gap or default
+        gap = dual_line_gap if dual_line_gap is not None else self.DUAL_LINE_GAP
 
-        if potential_crossing:
-            # Validate crossing with trajectory analysis
-            if self._validate_crossing(frame_width, doorway_center):
-                if current_time - self.last_crossing_time >= self.min_crossing_interval:
-                    crossing_direction = potential_crossing
-                    self.total_crossings += 1
-                    self.crossing_events.append((current_time, potential_crossing))
-                    self.last_crossing_time = current_time
-                    # Only update last_side AFTER successful crossing validation
-                    self.last_side = self.current_side
+        # Calculate line positions
+        center_x = frame_width * doorway_center
+        half_gap = frame_width * gap / 2
+        line_a_x = center_x - half_gap  # Left line
+        line_b_x = center_x + half_gap  # Right line
+
+        # Determine current side relative to each line
+        current_side_a = 'left' if current_x < line_a_x else 'right'
+        current_side_b = 'left' if current_x < line_b_x else 'right'
+
+        # Check for oscillation (anti-bounce)
+        if self._is_oscillating(current_time):
+            return None
+
+        # Check for LINE_A crossing
+        if self.previous_line_a_side is not None and current_side_a != self.previous_line_a_side:
+            # Crossed LINE_A
+            self.line_crossing_history.append(current_time)
+
+            if self.previous_line_a_side == 'left' and current_side_a == 'right':
+                self.line_a_direction = 'left_to_right'
+            else:
+                self.line_a_direction = 'right_to_left'
+
+            self.crossed_line_a = True
+            self.line_a_cross_time = current_time
+            self.line_a_position = self.positions[-1]
+
+        self.previous_line_a_side = current_side_a
+
+        # Check for LINE_B crossing
+        if self.previous_line_b_side is not None and current_side_b != self.previous_line_b_side:
+            # Crossed LINE_B
+            self.line_crossing_history.append(current_time)
+
+            if self.previous_line_b_side == 'left' and current_side_b == 'right':
+                self.line_b_direction = 'left_to_right'
+            else:
+                self.line_b_direction = 'right_to_left'
+
+            self.crossed_line_b = True
+            self.line_b_cross_time = current_time
+
+        self.previous_line_b_side = current_side_b
+
+        # Check if gate crossing is complete
+        crossing_to_emit = None
+
+        if self.crossed_line_a and self.crossed_line_b:
+            # Both lines crossed - validate the crossing
+            time_diff = abs(self.line_b_cross_time - self.line_a_cross_time)
+
+            if self.MIN_TRANSIT_TIME <= time_diff <= self.MAX_TRANSIT_TIME:
+                # Valid transit time
+                if self.line_a_direction == self.line_b_direction:
+                    # Consistent direction through gate
+
+                    # Determine which line was crossed first
+                    if self.line_a_cross_time < self.line_b_cross_time:
+                        # Crossed A first, then B -> left to right
+                        if self.line_a_direction == 'left_to_right':
+                            if current_time - self.last_crossing_time >= self.min_crossing_interval:
+                                crossing_to_emit = CrossingDirection.LEFT_TO_RIGHT
+                                self.total_crossings += 1
+                                self.crossing_events.append((current_time, crossing_to_emit))
+                                self.last_crossing_time = current_time
+                                self.last_side = 'right'
+                                self.current_side = 'right'
+                    else:
+                        # Crossed B first, then A -> right to left
+                        if self.line_b_direction == 'right_to_left':
+                            if current_time - self.last_crossing_time >= self.min_crossing_interval:
+                                crossing_to_emit = CrossingDirection.RIGHT_TO_LEFT
+                                self.total_crossings += 1
+                                self.crossing_events.append((current_time, crossing_to_emit))
+                                self.last_crossing_time = current_time
+                                self.last_side = 'left'
+                                self.current_side = 'left'
+
+            # Reset gate state after processing
+            self._reset_gate_state()
+
+        # Check for timeout on pending LINE_A crossing
+        if self.crossed_line_a and not self.crossed_line_b:
+            if self.line_a_cross_time and (current_time - self.line_a_cross_time > self.MAX_TRANSIT_TIME):
+                # Timeout - reset gate
+                self._reset_gate_state()
+
+        # Update legacy side tracking for visualization compatibility
+        if current_x < center_x:
+            self.current_side = 'left'
         else:
-            # No crossing detected - update last_side to track position
-            # (only when sides match, not during a pending crossing)
-            if self.current_side == self.last_side:
-                pass  # Already matching, nothing to do
-            # Don't update last_side if we're waiting for validation
+            self.current_side = 'right'
 
-        return crossing_direction
+        return crossing_to_emit
 
     def _validate_crossing(self, frame_width: int, doorway_center: float) -> bool:
-        """
-        Validate that a crossing is legitimate using trajectory analysis.
-        Returns True if crossing should be counted.
-        """
-        # Require minimum consecutive detections on new side
-        if self.consecutive_side_detections < self.min_consecutive_for_crossing:
-            return False
-
-        # Check for consistent movement direction in recent positions
-        if len(self.positions) < 3:
-            return True  # Not enough data, allow crossing
-
-        recent_positions = list(self.positions)[-5:]  # Last 5 positions (reduced from 6)
-        if len(recent_positions) < 2:
-            return True
-
-        # Calculate movement direction consistency
-        x_movements = []
-        for i in range(1, len(recent_positions)):
-            dx = recent_positions[i][0] - recent_positions[i-1][0]
-            # Only count significant movements (ignore jitter)
-            if abs(dx) > 2:  # More than 2 pixels
-                x_movements.append(dx)
-
-        if not x_movements:
-            return True  # No significant movement detected, allow crossing
-
-        # Check if movement is consistently in one direction (not bouncing)
-        positive_moves = sum(1 for m in x_movements if m > 0)
-        negative_moves = sum(1 for m in x_movements if m < 0)
-        total_moves = positive_moves + negative_moves
-
-        if total_moves == 0:
-            return True  # Changed: allow crossing if no significant movement
-
-        # Require at least 50% of movements in same direction (relaxed from 60%)
-        consistency = max(positive_moves, negative_moves) / total_moves
-        return consistency >= 0.5
+        """Legacy validation method - always returns True for Method 3."""
+        return True
 
     def get_smooth_velocity(self) -> Tuple[float, float]:
         """Get smoothed velocity estimate"""
@@ -381,6 +447,12 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             'use_bytetrack': True,       # NEW: Enable ByteTrack
             'use_reid': True,            # NEW: Enable ReID features
             'reid_model': 'osnet_x0_25',  # Deep ReID model: osnet_x0_25 (fastest ~3ms GPU) - was osnet_x1_0
+            # METHOD 3: Dual-Line Gate parameters
+            'dual_line_gap': 0.10,          # Gap between lines (10% of frame width)
+            'min_transit_time': 0.05,       # Min seconds between line crossings
+            'max_transit_time': 3.0,        # Max seconds between line crossings
+            'max_oscillations': 3,          # Max crossings before anti-bounce
+            'oscillation_window': 2.0,      # Time window for oscillation detection
         }
 
         # Deep ReID feature extractor (initialized in on_start)
@@ -614,7 +686,8 @@ class PeopleCounterProcessor(BaseStreamProcessor):
         crossing_dir = self.trackers[track_id].check_crossing(
             frame_width,
             self.doorway_config['doorway_center'],
-            self.doorway_config['doorway_width']
+            self.doorway_config['doorway_width'],
+            self.doorway_config['dual_line_gap']  # METHOD 3: pass dual_line_gap for gate width
         )
 
         if crossing_dir and crossing_dir != CrossingDirection.NONE:
@@ -923,7 +996,8 @@ class PeopleCounterProcessor(BaseStreamProcessor):
                     crossing_dir = tracker.check_crossing(
                         width,
                         self.doorway_config['doorway_center'],
-                        self.doorway_config['doorway_width']
+                        self.doorway_config['doorway_width'],
+                        self.doorway_config['dual_line_gap']  # METHOD 3: pass dual_line_gap
                     )
 
                     # Restore original positions
