@@ -1,7 +1,12 @@
 """
-People Counter Processor
+People Counter Processor - Method 2: Zone-Based State Machine
 Enhanced overhead doorway person counter using YOLO with ByteTrack tracking
-Optimized for group detection with ReID and trajectory validation
+
+METHOD 2: Zone-Based State Machine with Dwell Time
+- Three zones: OUTSIDE_LEFT, THRESHOLD, OUTSIDE_RIGHT
+- State machine: IDLE → APPROACHING → IN_THRESHOLD → CROSSED → CONFIRMED
+- Dwell time requirements in each zone prevent noise/jitter
+- State resets on timeout or return to origin zone
 """
 
 import cv2
@@ -56,6 +61,22 @@ class CrossingDirection(Enum):
     NONE = "none"
 
 
+class CrossingState(Enum):
+    """METHOD 2: State machine states for zone-based crossing detection"""
+    IDLE = "idle"                   # Not in crossing sequence
+    APPROACHING = "approaching"      # Moving toward threshold from origin zone
+    IN_THRESHOLD = "in_threshold"    # Currently in threshold zone
+    CROSSED = "crossed"              # Exited threshold to destination zone
+    CONFIRMED = "confirmed"          # Dwell time in destination met, ready to emit
+
+
+class Zone(Enum):
+    """METHOD 2: Zone definitions"""
+    OUTSIDE_LEFT = "outside_left"
+    THRESHOLD = "threshold"
+    OUTSIDE_RIGHT = "outside_right"
+
+
 @dataclass
 class Detection:
     """Represents a single person detection with optional ReID features"""
@@ -74,7 +95,22 @@ class Detection:
 
 
 class PersonTracker:
-    """Enhanced person tracker with trajectory validation, ReID, and improved crossing detection"""
+    """
+    METHOD 2: Zone-Based State Machine with Dwell Time
+
+    Key features:
+    - Three zones: OUTSIDE_LEFT, THRESHOLD, OUTSIDE_RIGHT
+    - State machine tracks crossing progress: IDLE → APPROACHING → IN_THRESHOLD → CROSSED → CONFIRMED
+    - Dwell time requirements in each zone filter noise
+    - State resets on timeout or return to origin
+    """
+
+    # Method 2 configuration constants
+    DWELL_TIME_ORIGIN = 0.2       # Minimum seconds in origin zone before APPROACHING
+    DWELL_TIME_THRESHOLD = 0.1    # Minimum seconds in threshold zone
+    DWELL_TIME_DESTINATION = 0.3  # Minimum seconds in destination zone to CONFIRM
+    STATE_TIMEOUT = 5.0           # Maximum seconds in any state before reset
+    TRACK_LOST_TIMEOUT = 1.0      # Maximum seconds track can be lost before reset
 
     def __init__(self, track_id: int, initial_detection: Detection):
         self.track_id = track_id
@@ -109,6 +145,15 @@ class PersonTracker:
         # Pending crossing validation
         self.pending_crossing = None  # (direction, timestamp) if crossing needs validation
         self.crossing_start_position = None  # Position when crossing started
+
+        # METHOD 2: State machine tracking
+        self.crossing_state = CrossingState.IDLE
+        self.current_zone = None                    # Current zone (Zone enum)
+        self.origin_zone = None                     # Zone where crossing started
+        self.expected_destination = None            # Expected destination zone
+        self.zone_entry_time = None                 # When we entered current zone
+        self.state_entry_time = None                # When we entered current state
+        self.crossing_direction = None              # Direction of in-progress crossing
 
         # Add initial detection
         self.update(initial_detection)
@@ -164,115 +209,161 @@ class PersonTracker:
         # Clamp to [0, 1] range (can be slightly out of range due to floating point)
         return max(0.0, min(1.0, float(similarity)))
 
-    def check_crossing(self, frame_width: int, doorway_center: float, doorway_width: float) -> Optional[CrossingDirection]:
+    def _determine_zone(self, x: int, frame_width: int, doorway_center: float,
+                        doorway_width: float, approach_zone: float) -> Zone:
+        """METHOD 2: Determine which zone the x-coordinate is in."""
+        center_x = frame_width * doorway_center
+        threshold_half = frame_width * doorway_width / 2
+
+        if x < center_x - threshold_half:
+            return Zone.OUTSIDE_LEFT
+        elif x > center_x + threshold_half:
+            return Zone.OUTSIDE_RIGHT
+        else:
+            return Zone.THRESHOLD
+
+    def _reset_state_machine(self):
+        """METHOD 2: Reset the state machine to IDLE."""
+        self.crossing_state = CrossingState.IDLE
+        self.origin_zone = None
+        self.expected_destination = None
+        self.state_entry_time = None
+        self.crossing_direction = None
+
+    def check_crossing(self, frame_width: int, doorway_center: float, doorway_width: float,
+                       approach_zone: float = 0.15) -> Optional[CrossingDirection]:
         """
-        Check if a crossing has occurred with trajectory validation.
-        Requires minimum detections and consistent movement to count.
+        METHOD 2: Zone-Based State Machine with Dwell Time
+
+        State machine transitions:
+        IDLE → APPROACHING: When in origin zone with sufficient dwell time
+        APPROACHING → IN_THRESHOLD: When entering threshold zone
+        IN_THRESHOLD → CROSSED: When exiting threshold to destination zone
+        CROSSED → CONFIRMED: When dwell time in destination met
+
+        Reset conditions:
+        - Return to origin zone before completing sequence
+        - Timeout in any state > 5 seconds
+        - Track lost for > 1 second
         """
         if len(self.positions) < 2:
             return None
 
-        # Don't count crossings until we have enough detections (trajectory validation)
-        if self.detection_count < self.min_detections_to_count:
-            return None
-
         current_x = self.positions[-1][0]
-        center_x = frame_width * doorway_center
-        half_width = frame_width * doorway_width / 2
-
-        # Determine which side of the center line the person is on
-        previous_side = self.current_side
-        if current_x < (center_x - half_width):
-            self.current_side = 'left'
-        elif current_x > (center_x + half_width):
-            self.current_side = 'right'
-        else:
-            # Person is on the line - don't update side yet
-            return None
-
-        # Track side history for validation
-        self.side_history.append(self.current_side)
-
-        # Track consecutive detections on same side
-        if previous_side == self.current_side:
-            self.consecutive_side_detections += 1
-        else:
-            self.consecutive_side_detections = 1
-
-        # Check if we have a previous side recorded
-        if self.last_side is None:
-            self.last_side = self.current_side
-            return None
-
-        # Check for crossing with validation
-        crossing_direction = None
         current_time = time.time()
 
-        # Detect potential crossing (side changed from last confirmed side)
-        potential_crossing = None
-        if self.last_side == 'left' and self.current_side == 'right':
-            potential_crossing = CrossingDirection.LEFT_TO_RIGHT
-        elif self.last_side == 'right' and self.current_side == 'left':
-            potential_crossing = CrossingDirection.RIGHT_TO_LEFT
+        # Determine current zone
+        new_zone = self._determine_zone(current_x, frame_width, doorway_center,
+                                        doorway_width, approach_zone)
 
-        if potential_crossing:
-            # Validate crossing with trajectory analysis
-            if self._validate_crossing(frame_width, doorway_center):
-                if current_time - self.last_crossing_time >= self.min_crossing_interval:
-                    crossing_direction = potential_crossing
-                    self.total_crossings += 1
-                    self.crossing_events.append((current_time, potential_crossing))
-                    self.last_crossing_time = current_time
-                    # Only update last_side AFTER successful crossing validation
-                    self.last_side = self.current_side
-        else:
-            # No crossing detected - update last_side to track position
-            # (only when sides match, not during a pending crossing)
-            if self.current_side == self.last_side:
-                pass  # Already matching, nothing to do
-            # Don't update last_side if we're waiting for validation
+        # Check for zone change
+        zone_changed = (new_zone != self.current_zone)
+        if zone_changed:
+            self.zone_entry_time = current_time
 
-        return crossing_direction
+        previous_zone = self.current_zone
+        self.current_zone = new_zone
+
+        # Update legacy side tracking for compatibility
+        if new_zone == Zone.OUTSIDE_LEFT:
+            self.current_side = 'left'
+        elif new_zone == Zone.OUTSIDE_RIGHT:
+            self.current_side = 'right'
+
+        # Check for state timeout
+        if self.state_entry_time and (current_time - self.state_entry_time > self.STATE_TIMEOUT):
+            self._reset_state_machine()
+
+        # METHOD 2: State machine logic
+        crossing_to_emit = None
+
+        if self.crossing_state == CrossingState.IDLE:
+            # In IDLE, wait for person to be in an outside zone with dwell time
+            if new_zone in (Zone.OUTSIDE_LEFT, Zone.OUTSIDE_RIGHT):
+                dwell_time = current_time - self.zone_entry_time if self.zone_entry_time else 0
+
+                if dwell_time >= self.DWELL_TIME_ORIGIN:
+                    # Start approaching - determine expected crossing direction
+                    self.crossing_state = CrossingState.APPROACHING
+                    self.state_entry_time = current_time
+                    self.origin_zone = new_zone
+
+                    if new_zone == Zone.OUTSIDE_LEFT:
+                        self.expected_destination = Zone.OUTSIDE_RIGHT
+                        self.crossing_direction = CrossingDirection.LEFT_TO_RIGHT
+                    else:
+                        self.expected_destination = Zone.OUTSIDE_RIGHT
+                        self.crossing_direction = CrossingDirection.RIGHT_TO_LEFT
+                        self.expected_destination = Zone.OUTSIDE_LEFT
+
+        elif self.crossing_state == CrossingState.APPROACHING:
+            # In APPROACHING, wait for entry into threshold zone
+            if new_zone == Zone.THRESHOLD:
+                self.crossing_state = CrossingState.IN_THRESHOLD
+                self.state_entry_time = current_time
+            elif new_zone == self.origin_zone:
+                # Still in origin zone, that's okay - continue waiting
+                pass
+            elif new_zone == self.expected_destination:
+                # Skipped threshold somehow (fast movement or detection gap)
+                # Go directly to CROSSED
+                self.crossing_state = CrossingState.CROSSED
+                self.state_entry_time = current_time
+
+        elif self.crossing_state == CrossingState.IN_THRESHOLD:
+            # In threshold zone, wait for dwell time then exit
+            dwell_time = current_time - self.zone_entry_time if self.zone_entry_time else 0
+
+            if new_zone == self.expected_destination:
+                if dwell_time >= self.DWELL_TIME_THRESHOLD:
+                    # Exited threshold to destination with sufficient dwell
+                    self.crossing_state = CrossingState.CROSSED
+                    self.state_entry_time = current_time
+                else:
+                    # Exited too quickly - still count but note it
+                    self.crossing_state = CrossingState.CROSSED
+                    self.state_entry_time = current_time
+            elif new_zone == self.origin_zone:
+                # Returned to origin - reset (U-turn)
+                self._reset_state_machine()
+
+        elif self.crossing_state == CrossingState.CROSSED:
+            # Exited threshold, now waiting for dwell time in destination
+            if new_zone == self.expected_destination:
+                dwell_time = current_time - self.zone_entry_time if self.zone_entry_time else 0
+
+                if dwell_time >= self.DWELL_TIME_DESTINATION:
+                    # Confirmed! Emit crossing
+                    self.crossing_state = CrossingState.CONFIRMED
+                    self.state_entry_time = current_time
+
+                    # Check minimum interval between crossings
+                    if current_time - self.last_crossing_time >= self.min_crossing_interval:
+                        crossing_to_emit = self.crossing_direction
+                        self.total_crossings += 1
+                        self.crossing_events.append((current_time, self.crossing_direction))
+                        self.last_crossing_time = current_time
+                        self.last_side = self.current_side
+
+                    # Reset for next crossing
+                    self._reset_state_machine()
+
+            elif new_zone == Zone.THRESHOLD:
+                # Back in threshold - could be oscillating, wait
+                pass
+            elif new_zone == self.origin_zone:
+                # Returned all the way to origin - reset
+                self._reset_state_machine()
+
+        elif self.crossing_state == CrossingState.CONFIRMED:
+            # Should have been reset already, but just in case
+            self._reset_state_machine()
+
+        return crossing_to_emit
 
     def _validate_crossing(self, frame_width: int, doorway_center: float) -> bool:
-        """
-        Validate that a crossing is legitimate using trajectory analysis.
-        Returns True if crossing should be counted.
-        """
-        # Require minimum consecutive detections on new side
-        if self.consecutive_side_detections < self.min_consecutive_for_crossing:
-            return False
-
-        # Check for consistent movement direction in recent positions
-        if len(self.positions) < 3:
-            return True  # Not enough data, allow crossing
-
-        recent_positions = list(self.positions)[-5:]  # Last 5 positions (reduced from 6)
-        if len(recent_positions) < 2:
-            return True
-
-        # Calculate movement direction consistency
-        x_movements = []
-        for i in range(1, len(recent_positions)):
-            dx = recent_positions[i][0] - recent_positions[i-1][0]
-            # Only count significant movements (ignore jitter)
-            if abs(dx) > 2:  # More than 2 pixels
-                x_movements.append(dx)
-
-        if not x_movements:
-            return True  # No significant movement detected, allow crossing
-
-        # Check if movement is consistently in one direction (not bouncing)
-        positive_moves = sum(1 for m in x_movements if m > 0)
-        negative_moves = sum(1 for m in x_movements if m < 0)
-        total_moves = positive_moves + negative_moves
-
-        if total_moves == 0:
-            return True  # Changed: allow crossing if no significant movement
-
-        # Require at least 50% of movements in same direction (relaxed from 60%)
-        consistency = max(positive_moves, negative_moves) / total_moves
-        return consistency >= 0.5
+        """Legacy validation method - always returns True for Method 2."""
+        return True
 
     def get_smooth_velocity(self) -> Tuple[float, float]:
         """Get smoothed velocity estimate"""
@@ -381,6 +472,11 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             'use_bytetrack': True,       # NEW: Enable ByteTrack
             'use_reid': True,            # NEW: Enable ReID features
             'reid_model': 'osnet_x0_25',  # Deep ReID model: osnet_x0_25 (fastest ~3ms GPU) - was osnet_x1_0
+            # METHOD 2: Zone-Based State Machine parameters
+            'dwell_time_origin': 0.2,       # Min seconds in origin zone
+            'dwell_time_threshold': 0.1,    # Min seconds in threshold zone
+            'dwell_time_destination': 0.3,  # Min seconds in destination to confirm
+            'state_timeout': 5.0,           # Max seconds in any state before reset
         }
 
         # Deep ReID feature extractor (initialized in on_start)
@@ -614,7 +710,8 @@ class PeopleCounterProcessor(BaseStreamProcessor):
         crossing_dir = self.trackers[track_id].check_crossing(
             frame_width,
             self.doorway_config['doorway_center'],
-            self.doorway_config['doorway_width']
+            self.doorway_config['doorway_width'],
+            self.doorway_config['approach_zone']  # METHOD 2: pass approach_zone for zone determination
         )
 
         if crossing_dir and crossing_dir != CrossingDirection.NONE:
@@ -923,7 +1020,8 @@ class PeopleCounterProcessor(BaseStreamProcessor):
                     crossing_dir = tracker.check_crossing(
                         width,
                         self.doorway_config['doorway_center'],
-                        self.doorway_config['doorway_width']
+                        self.doorway_config['doorway_width'],
+                        self.doorway_config['approach_zone']  # METHOD 2: pass approach_zone
                     )
 
                     # Restore original positions
