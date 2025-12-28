@@ -497,6 +497,10 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             'checkpoint_timeout': 5.0,          # Max seconds to search for lost track
             'relink_similarity_threshold': 0.55,  # ReID match threshold for relinking (lower OK for occlusion)
             'lingering_timeout': 10.0,          # Extended timeout for slow-moving people
+            # Night mode: CLAHE preprocessing for low-light enhancement
+            'use_clahe': True,                  # Enable CLAHE preprocessing for night/low-light
+            'clahe_clip_limit': 2.0,            # Contrast limit (1.5-3.0, higher = more contrast but more noise)
+            'clahe_tile_size': 8,               # Tile grid size (8 is standard)
         }
 
         # METHOD 5: Active checkpoints for lost track recovery
@@ -504,6 +508,9 @@ class PeopleCounterProcessor(BaseStreamProcessor):
 
         # Deep ReID feature extractor (initialized in on_start)
         self.reid_extractor = None
+
+        # CLAHE preprocessor for night mode (initialized in on_start)
+        self.clahe = None
 
         # Tracking
         self.trackers: Dict[int, PersonTracker] = {}
@@ -597,6 +604,17 @@ class PeopleCounterProcessor(BaseStreamProcessor):
                 print(f"✓ Deep ReID loaded (feature dim: {self.reid_extractor.feature_dim})", flush=True)
                 self.logger.info(f"Deep ReID initialized: {self.doorway_config['reid_model']}")
 
+            # Initialize CLAHE for night mode preprocessing
+            if self.doorway_config['use_clahe']:
+                clip_limit = self.doorway_config['clahe_clip_limit']
+                tile_size = self.doorway_config['clahe_tile_size']
+                self.clahe = cv2.createCLAHE(
+                    clipLimit=clip_limit,
+                    tileGridSize=(tile_size, tile_size)
+                )
+                print(f"✓ CLAHE night mode enabled (clipLimit={clip_limit}, tileSize={tile_size}x{tile_size})", flush=True)
+                self.logger.info(f"CLAHE initialized: clipLimit={clip_limit}, tileGridSize={tile_size}")
+
         except Exception as e:
             print(f"ERROR: Failed to load YOLO model: {e}", flush=True)
             self.logger.error(f"Failed to load YOLO model: {e}")
@@ -642,9 +660,35 @@ class PeopleCounterProcessor(BaseStreamProcessor):
         # Schedule next refresh
         self._schedule_direction_refresh()
 
+    def _apply_clahe(self, frame: np.ndarray) -> np.ndarray:
+        """Apply CLAHE preprocessing to enhance visibility in low-light conditions.
+
+        Applies contrast enhancement to the luminance channel only,
+        preserving color information while improving feature visibility.
+        """
+        if self.clahe is None:
+            return frame
+
+        # Convert BGR to LAB color space
+        lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+        l_channel, a_channel, b_channel = cv2.split(lab)
+
+        # Apply CLAHE to luminance channel only
+        l_enhanced = self.clahe.apply(l_channel)
+
+        # Merge channels and convert back to BGR
+        lab_enhanced = cv2.merge([l_enhanced, a_channel, b_channel])
+        enhanced_frame = cv2.cvtColor(lab_enhanced, cv2.COLOR_LAB2BGR)
+
+        return enhanced_frame
+
     def extract_detections(self, frame) -> List[Detection]:
         """Extract person detections from frame using YOLO with ByteTrack tracking"""
         detections = []
+
+        # Apply CLAHE preprocessing for night mode if enabled
+        if self.doorway_config['use_clahe'] and self.clahe is not None:
+            frame = self._apply_clahe(frame)
 
         try:
             if self.doorway_config['use_bytetrack']:
