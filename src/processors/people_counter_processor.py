@@ -136,7 +136,7 @@ class PersonTracker:
         # Trajectory validation for counting
         self.side_history = deque(maxlen=10)  # Track recent side positions
         self.detection_count = 0  # Total detections for this track
-        self.min_detections_to_count = 3  # Require at least N detections before counting
+        self.min_detections_to_count = 5  # TUNED: Raised from 3 to filter momentary shadows/reflections
         self.consecutive_side_detections = 0  # Consecutive detections on same side
         self.min_consecutive_for_crossing = 1  # Reduced from 2 - trajectory validation handles consistency
 
@@ -484,9 +484,10 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             'min_path_length': 50,      # Minimum pixels traveled
             'max_tracking_distance': 100,  # TUNED: Reduced from 120 for tighter matching
             'tracker_timeout': 3.0,     # TUNED: Increased from 2.0 for slow-moving groups
-            'yolo_conf_threshold': 0.20,  # TUNED: Lowered to catch detections in doorway zone
+            'yolo_conf_threshold': 0.35,  # TUNED: Raised from 0.20 to filter shadows/reflections at night
             'yolo_iou_threshold': 0.3,   # TUNED: Lowered from 0.45 to separate overlapping people
             'min_crossing_interval': 0.5,  # TUNED: Increased from 0.3 to prevent double counts
+            'min_peak_confidence': 0.40,  # NEW: Min peak confidence for a track to count crossings
             'reid_similarity_threshold': 0.6,  # TUNED: Increased for deep ReID (more discriminative)
             'use_bytetrack': True,       # NEW: Enable ByteTrack
             'use_reid': True,            # NEW: Enable ReID features
@@ -729,7 +730,15 @@ class PeopleCounterProcessor(BaseStreamProcessor):
 
     def _check_and_handle_crossing(self, track_id: int, detection: Detection, frame_width: int, current_time: float):
         """Check for crossing and handle API calls if crossing detected."""
-        crossing_dir = self.trackers[track_id].check_crossing(
+        tracker = self.trackers[track_id]
+
+        # Skip crossing check if track hasn't met minimum confidence threshold
+        # This filters out shadows, reflections, and other low-confidence artifacts
+        min_conf = self.doorway_config.get('min_peak_confidence', 0.40)
+        if tracker.peak_confidence < min_conf:
+            return  # Track hasn't proven to be a real person yet
+
+        crossing_dir = tracker.check_crossing(
             frame_width,
             self.doorway_config['doorway_center'],
             self.doorway_config['doorway_width'],
@@ -1030,7 +1039,9 @@ class PeopleCounterProcessor(BaseStreamProcessor):
 
             # Only interpolate if there's a significant time gap (dropped frames)
             # but not too stale (likely lost track)
-            if 0.1 < time_gap < 1.0 and len(tracker.positions) >= 2:
+            # Also require minimum peak confidence to avoid counting shadows/reflections
+            min_conf = self.doorway_config.get('min_peak_confidence', 0.40)
+            if 0.1 < time_gap < 1.0 and len(tracker.positions) >= 2 and tracker.peak_confidence >= min_conf:
                 # Get interpolated positions through the gap
                 interpolated = tracker.interpolate_positions(current_time, num_steps=5)
 
