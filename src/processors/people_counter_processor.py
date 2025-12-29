@@ -680,16 +680,15 @@ class PeopleCounterProcessor(BaseStreamProcessor):
 
         latest_frame = current_frame
         frames_drained = 0
+        max_drain = 5  # Limit to prevent infinite loop on live streams
 
-        # Non-blocking read to drain any buffered frames
-        while True:
-            # Use grab() which is faster than read() - doesn't decode
-            grabbed = self.cap.grab()
-            if not grabbed:
-                break
-
-            # Only retrieve (decode) if we successfully grabbed
-            ret, frame = self.cap.retrieve()
+        # Drain up to max_drain buffered frames
+        # Note: On live RTSP streams, grab() blocks if buffer is empty,
+        # so we limit iterations and use the frame we already have as fallback
+        while frames_drained < max_drain:
+            # Quick non-blocking check using read with minimal timeout isn't possible,
+            # so we just do a limited number of grabs
+            ret, frame = self.cap.read()
             if ret and frame is not None:
                 latest_frame = frame
                 frames_drained += 1
@@ -1355,9 +1354,9 @@ class PeopleCounterProcessor(BaseStreamProcessor):
 
     def process_frame(self, frame: np.ndarray, frame_number: int, timestamp: float) -> Optional[np.ndarray]:
         """Process a single frame - main processing logic"""
-        # Drain any buffered frames to prevent buildup during slow processing (e.g., night mode)
-        # This ensures we always process the most recent frame
-        frame = self._drain_frame_buffer(frame)
+        # Note: Buffer draining disabled - OpenCV read() blocks on live RTSP streams
+        # The base processor already sets CAP_PROP_BUFFERSIZE=1 for low latency
+        # frame = self._drain_frame_buffer(frame)
 
         # Extract detections using YOLO
         detections = self.extract_detections(frame)
