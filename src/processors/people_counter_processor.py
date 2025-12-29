@@ -501,6 +501,7 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             'use_clahe': True,                  # Enable CLAHE preprocessing for night/low-light
             'clahe_clip_limit': 2.0,            # Contrast limit (1.5-3.0, higher = more contrast but more noise)
             'clahe_tile_size': 8,               # Tile grid size (8 is standard)
+            'clahe_brightness_threshold': 80,   # Only apply CLAHE when mean brightness < this value (0-255)
         }
 
         # METHOD 5: Active checkpoints for lost track recovery
@@ -608,12 +609,13 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             if self.doorway_config['use_clahe']:
                 clip_limit = self.doorway_config['clahe_clip_limit']
                 tile_size = self.doorway_config['clahe_tile_size']
+                brightness_threshold = self.doorway_config['clahe_brightness_threshold']
                 self.clahe = cv2.createCLAHE(
                     clipLimit=clip_limit,
                     tileGridSize=(tile_size, tile_size)
                 )
-                print(f"✓ CLAHE night mode enabled (clipLimit={clip_limit}, tileSize={tile_size}x{tile_size})", flush=True)
-                self.logger.info(f"CLAHE initialized: clipLimit={clip_limit}, tileGridSize={tile_size}")
+                print(f"✓ CLAHE night mode enabled (clipLimit={clip_limit}, tileSize={tile_size}x{tile_size}, brightness<{brightness_threshold})", flush=True)
+                self.logger.info(f"CLAHE initialized: clipLimit={clip_limit}, tileGridSize={tile_size}, brightnessThreshold={brightness_threshold}")
 
         except Exception as e:
             print(f"ERROR: Failed to load YOLO model: {e}", flush=True)
@@ -660,13 +662,65 @@ class PeopleCounterProcessor(BaseStreamProcessor):
         # Schedule next refresh
         self._schedule_direction_refresh()
 
+    def _drain_frame_buffer(self, current_frame: np.ndarray) -> np.ndarray:
+        """Drain any buffered frames and return the most recent one.
+
+        This prevents buffer buildup when processing is slower than frame rate
+        (e.g., during night mode with CLAHE). By always processing the latest
+        frame, we avoid decode errors while maintaining tracking accuracy.
+
+        Args:
+            current_frame: The frame we already have from the main loop
+
+        Returns:
+            The most recent frame available (may be the same as current_frame)
+        """
+        if self.cap is None:
+            return current_frame
+
+        latest_frame = current_frame
+        frames_drained = 0
+
+        # Non-blocking read to drain any buffered frames
+        while True:
+            # Use grab() which is faster than read() - doesn't decode
+            grabbed = self.cap.grab()
+            if not grabbed:
+                break
+
+            # Only retrieve (decode) if we successfully grabbed
+            ret, frame = self.cap.retrieve()
+            if ret and frame is not None:
+                latest_frame = frame
+                frames_drained += 1
+            else:
+                break
+
+        if frames_drained > 0:
+            self.logger.debug(f"Drained {frames_drained} buffered frames")
+
+        return latest_frame
+
     def _apply_clahe(self, frame: np.ndarray) -> np.ndarray:
         """Apply CLAHE preprocessing to enhance visibility in low-light conditions.
+
+        Only applies when frame brightness is below threshold to avoid
+        unnecessary processing during daytime and prevent buffer overflows.
 
         Applies contrast enhancement to the luminance channel only,
         preserving color information while improving feature visibility.
         """
         if self.clahe is None:
+            return frame
+
+        # Check frame brightness - only apply CLAHE if dark enough
+        # This saves processing time during daytime and prevents decode errors
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        mean_brightness = np.mean(gray)
+
+        brightness_threshold = self.doorway_config.get('clahe_brightness_threshold', 80)
+        if mean_brightness >= brightness_threshold:
+            # Frame is bright enough, skip CLAHE
             return frame
 
         # Convert BGR to LAB color space
@@ -1301,6 +1355,10 @@ class PeopleCounterProcessor(BaseStreamProcessor):
 
     def process_frame(self, frame: np.ndarray, frame_number: int, timestamp: float) -> Optional[np.ndarray]:
         """Process a single frame - main processing logic"""
+        # Drain any buffered frames to prevent buildup during slow processing (e.g., night mode)
+        # This ensures we always process the most recent frame
+        frame = self._drain_frame_buffer(frame)
+
         # Extract detections using YOLO
         detections = self.extract_detections(frame)
 
