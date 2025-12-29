@@ -498,7 +498,7 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             'relink_similarity_threshold': 0.55,  # ReID match threshold for relinking (lower OK for occlusion)
             'lingering_timeout': 10.0,          # Extended timeout for slow-moving people
             # Night mode: CLAHE preprocessing for low-light enhancement
-            'use_clahe': False,                 # TEMPORARILY DISABLED - debugging stream crash
+            'use_clahe': True,                  # Enable CLAHE preprocessing for night/low-light
             'clahe_clip_limit': 2.0,            # Contrast limit (1.5-3.0, higher = more contrast but more noise)
             'clahe_tile_size': 8,               # Tile grid size (8 is standard)
             'clahe_brightness_threshold': 80,   # Only apply CLAHE when mean brightness < this value (0-255)
@@ -709,31 +709,45 @@ class PeopleCounterProcessor(BaseStreamProcessor):
         Applies contrast enhancement to the luminance channel only,
         preserving color information while improving feature visibility.
         """
-        if self.clahe is None:
+        try:
+            if self.clahe is None:
+                return frame
+
+            # Validate frame
+            if frame is None or frame.size == 0:
+                return frame
+
+            # Ensure frame is 3-channel BGR
+            if len(frame.shape) != 3 or frame.shape[2] != 3:
+                return frame
+
+            # Check frame brightness - only apply CLAHE if dark enough
+            # This saves processing time during daytime and prevents decode errors
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            mean_brightness = np.mean(gray)
+
+            brightness_threshold = self.doorway_config.get('clahe_brightness_threshold', 80)
+            if mean_brightness >= brightness_threshold:
+                # Frame is bright enough, skip CLAHE
+                return frame
+
+            # Convert BGR to LAB color space
+            lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+            l_channel, a_channel, b_channel = cv2.split(lab)
+
+            # Apply CLAHE to luminance channel only
+            l_enhanced = self.clahe.apply(l_channel)
+
+            # Merge channels and convert back to BGR
+            lab_enhanced = cv2.merge([l_enhanced, a_channel, b_channel])
+            enhanced_frame = cv2.cvtColor(lab_enhanced, cv2.COLOR_LAB2BGR)
+
+            return enhanced_frame
+
+        except Exception as e:
+            # If CLAHE fails for any reason, return original frame
+            self.logger.warning(f"CLAHE preprocessing failed: {e}")
             return frame
-
-        # Check frame brightness - only apply CLAHE if dark enough
-        # This saves processing time during daytime and prevents decode errors
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        mean_brightness = np.mean(gray)
-
-        brightness_threshold = self.doorway_config.get('clahe_brightness_threshold', 80)
-        if mean_brightness >= brightness_threshold:
-            # Frame is bright enough, skip CLAHE
-            return frame
-
-        # Convert BGR to LAB color space
-        lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
-        l_channel, a_channel, b_channel = cv2.split(lab)
-
-        # Apply CLAHE to luminance channel only
-        l_enhanced = self.clahe.apply(l_channel)
-
-        # Merge channels and convert back to BGR
-        lab_enhanced = cv2.merge([l_enhanced, a_channel, b_channel])
-        enhanced_frame = cv2.cvtColor(lab_enhanced, cv2.COLOR_LAB2BGR)
-
-        return enhanced_frame
 
     def extract_detections(self, frame) -> List[Detection]:
         """Extract person detections from frame using YOLO with ByteTrack tracking"""
