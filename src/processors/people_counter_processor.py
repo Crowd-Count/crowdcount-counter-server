@@ -136,7 +136,7 @@ class PersonTracker:
         # Trajectory validation for counting
         self.side_history = deque(maxlen=10)  # Track recent side positions
         self.detection_count = 0  # Total detections for this track
-        self.min_detections_to_count = 5  # TUNED: Raised from 3 to filter momentary shadows/reflections
+        self.min_detections_to_count = 4  # TUNED: Balanced between filtering noise and catching real people
         self.consecutive_side_detections = 0  # Consecutive detections on same side
         self.min_consecutive_for_crossing = 1  # Reduced from 2 - trajectory validation handles consistency
 
@@ -484,10 +484,10 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             'min_path_length': 50,      # Minimum pixels traveled
             'max_tracking_distance': 100,  # TUNED: Reduced from 120 for tighter matching
             'tracker_timeout': 3.0,     # TUNED: Increased from 2.0 for slow-moving groups
-            'yolo_conf_threshold': 0.35,  # TUNED: Raised from 0.20 to filter shadows/reflections at night
+            'yolo_conf_threshold': 0.25,  # TUNED: Balanced - catches people but filters noise
             'yolo_iou_threshold': 0.3,   # TUNED: Lowered from 0.45 to separate overlapping people
             'min_crossing_interval': 0.5,  # TUNED: Increased from 0.3 to prevent double counts
-            'min_peak_confidence': 0.40,  # NEW: Min peak confidence for a track to count crossings
+            'min_peak_confidence': 0.30,  # TUNED: Lowered from 0.40 for better daytime accuracy
             'reid_similarity_threshold': 0.6,  # TUNED: Increased for deep ReID (more discriminative)
             'use_bytetrack': True,       # NEW: Enable ByteTrack
             'use_reid': True,            # NEW: Enable ReID features
