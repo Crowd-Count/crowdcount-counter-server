@@ -498,7 +498,7 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             'relink_similarity_threshold': 0.55,  # ReID match threshold for relinking (lower OK for occlusion)
             'lingering_timeout': 10.0,          # Extended timeout for slow-moving people
             # Night mode: CLAHE preprocessing for low-light enhancement
-            'use_clahe': True,                  # Enable CLAHE preprocessing for night/low-light
+            'use_clahe': False,                 # TEMPORARILY DISABLED - debugging stream crash
             'clahe_clip_limit': 2.0,            # Contrast limit (1.5-3.0, higher = more contrast but more noise)
             'clahe_tile_size': 8,               # Tile grid size (8 is standard)
             'clahe_brightness_threshold': 80,   # Only apply CLAHE when mean brightness < this value (0-255)
