@@ -54,6 +54,11 @@ class BaseStreamProcessor(ABC):
         self.last_log_time = None
         self.frames_since_log = 0
 
+        # Frame validation and recovery
+        self.last_valid_frame: Optional[np.ndarray] = None
+        self.corrupted_frame_count = 0
+        self.max_corrupted_before_warn = 10
+
     def connect_stream(self, max_retries: int = 10, initial_delay: float = 0.5) -> bool:
         """
         Connect to the RTSP stream with retry logic
@@ -74,7 +79,21 @@ class BaseStreamProcessor(ABC):
             try:
                 self.logger.info(f"Connecting to stream (attempt {attempt}/{max_retries}): {self.rtsp_url}")
 
-                # Create VideoCapture with RTSP options for low latency
+                # Set FFmpeg options for robust RTSP streaming before creating VideoCapture
+                # These options help prevent decode errors especially in low-light conditions
+                import os
+                os.environ['OPENCV_FFMPEG_CAPTURE_OPTIONS'] = '|'.join([
+                    'rtsp_transport;tcp',         # Use TCP instead of UDP (more reliable)
+                    'stimeout;5000000',           # Socket timeout 5 seconds (in microseconds)
+                    'max_delay;500000',           # Max demux delay 500ms
+                    'reorder_queue_size;0',       # Disable packet reordering (lower latency)
+                    'fflags;nobuffer+discardcorrupt',  # No buffering + discard corrupt packets
+                    'flags;low_delay',            # Enable low delay mode
+                    'analyzeduration;1000000',    # Reduce stream analysis time to 1s
+                    'probesize;1000000',          # Reduce probe size to 1MB
+                ])
+
+                # Create VideoCapture with FFmpeg backend
                 self.cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_FFMPEG)
 
                 # Set buffer size to 1 for lowest latency - always get latest frame
@@ -140,6 +159,113 @@ class BaseStreamProcessor(ABC):
             self.cap.release()
             self.cap = None
             self.logger.info("Disconnected from stream")
+
+    def _validate_frame(self, frame: np.ndarray) -> tuple[bool, str]:
+        """
+        Validate that a frame is not corrupted.
+
+        Checks for common corruption indicators:
+        - Frame is None or empty
+        - Invalid shape (not 3-channel)
+        - All-zero (completely black) frames
+        - Uniform frames (all same value - compression artifact)
+        - Contains NaN or Inf values
+        - Extreme low variance (indicates freeze/corruption)
+
+        Args:
+            frame: The video frame to validate
+
+        Returns:
+            Tuple of (is_valid, reason_if_invalid)
+        """
+        # Basic null/empty check
+        if frame is None:
+            return False, "frame is None"
+
+        if frame.size == 0:
+            return False, "frame is empty"
+
+        # Shape validation - must be 3-channel BGR
+        if len(frame.shape) != 3:
+            return False, f"invalid shape: {frame.shape}"
+
+        if frame.shape[2] != 3:
+            return False, f"not 3-channel: {frame.shape[2]} channels"
+
+        # Check for NaN or Inf values (rare but can happen with codec errors)
+        if frame.dtype in [np.float32, np.float64]:
+            if np.any(np.isnan(frame)) or np.any(np.isinf(frame)):
+                return False, "contains NaN/Inf values"
+
+        # Calculate frame statistics for corruption detection
+        # Use a small sample for performance (every 10th pixel)
+        sample = frame[::10, ::10]
+
+        # Check for all-zero frame (completely black due to corruption, not just dark)
+        if np.all(sample == 0):
+            return False, "all-zero frame (corrupted black)"
+
+        # Check for uniform frame (all same value - compression artifact)
+        # This is different from a legitimately dark frame which has some variation
+        if np.std(sample) < 0.5:  # Extremely low variance indicates corruption
+            return False, f"uniform frame (std={np.std(sample):.2f})"
+
+        # Check for "green frame" corruption (common FFmpeg decode error)
+        # Green frames have very high green channel relative to R and B
+        green_mean = np.mean(sample[:, :, 1])
+        red_mean = np.mean(sample[:, :, 2])
+        blue_mean = np.mean(sample[:, :, 0])
+
+        if green_mean > 200 and red_mean < 50 and blue_mean < 50:
+            return False, "green frame corruption"
+
+        # Check for "gray static" corruption (random noise from decode failure)
+        # This has very high variance with mean around 128
+        overall_std = np.std(sample)
+        overall_mean = np.mean(sample)
+        if overall_std > 70 and 100 < overall_mean < 156:
+            # Could be static noise - check if it looks like random noise
+            # Real frames have structure, noise is uniform randomness
+            # Check a small patch for local variance consistency
+            patch = frame[100:150, 100:150] if frame.shape[0] > 150 and frame.shape[1] > 150 else sample
+            patch_std = np.std(patch)
+            if patch_std > 60:  # High local variance suggests noise
+                return False, "static noise corruption"
+
+        return True, "valid"
+
+    def _get_validated_frame(self, frame: np.ndarray) -> Optional[np.ndarray]:
+        """
+        Validate a frame and return it if valid, or return cached frame if corrupted.
+
+        Args:
+            frame: The frame to validate
+
+        Returns:
+            Valid frame (original or cached), or None if no valid frame available
+        """
+        is_valid, reason = self._validate_frame(frame)
+
+        if is_valid:
+            # Cache this valid frame
+            self.last_valid_frame = frame.copy()
+            self.corrupted_frame_count = 0
+            return frame
+
+        # Frame is corrupted
+        self.corrupted_frame_count += 1
+
+        if self.corrupted_frame_count <= self.max_corrupted_before_warn:
+            self.logger.debug(f"Corrupted frame detected: {reason}")
+        elif self.corrupted_frame_count == self.max_corrupted_before_warn + 1:
+            self.logger.warning(f"Many corrupted frames detected (>{self.max_corrupted_before_warn}), suppressing further debug logs")
+
+        # Return cached frame if available
+        if self.last_valid_frame is not None:
+            return self.last_valid_frame.copy()
+
+        # No cached frame available - return original (will likely fail gracefully downstream)
+        return frame
 
     @abstractmethod
     def process_frame(self, frame: np.ndarray, frame_number: int, timestamp: float) -> Optional[np.ndarray]:
@@ -225,6 +351,16 @@ class BaseStreamProcessor(ABC):
                 self.frames_processed += 1
                 timestamp = time.time()
                 self.last_frame_time = timestamp
+
+                # Validate frame and recover from corruption if needed
+                # This is especially important for night mode where dark frames
+                # can become corrupted due to codec/compression issues
+                validated_frame = self._get_validated_frame(frame)
+                if validated_frame is None:
+                    # Extremely rare - no valid frame and no cache
+                    self.logger.warning("No valid frame available, skipping")
+                    continue
+                frame = validated_frame
 
                 # Process the frame (custom logic)
                 try:
