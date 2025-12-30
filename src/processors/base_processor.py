@@ -54,8 +54,10 @@ class BaseStreamProcessor(ABC):
         self.last_log_time = None
         self.frames_since_log = 0
 
-        # Frame validation and recovery
-        self.last_valid_frame: Optional[np.ndarray] = None
+        # Frame validation and recovery (optimized for minimal overhead)
+        self._last_valid_frame_ref: Optional[np.ndarray] = None  # Reference only, no copy
+        self._validation_frame_counter = 0
+        self._validation_interval = 5  # Only validate every N frames
         self.corrupted_frame_count = 0
         self.max_corrupted_before_warn = 10
 
@@ -160,17 +162,11 @@ class BaseStreamProcessor(ABC):
             self.cap = None
             self.logger.info("Disconnected from stream")
 
-    def _validate_frame(self, frame: np.ndarray) -> tuple[bool, str]:
+    def _validate_frame_fast(self, frame: np.ndarray) -> tuple[bool, str]:
         """
-        Validate that a frame is not corrupted.
+        Fast frame validation with minimal overhead.
 
-        Checks for common corruption indicators:
-        - Frame is None or empty
-        - Invalid shape (not 3-channel)
-        - All-zero (completely black) frames
-        - Uniform frames (all same value - compression artifact)
-        - Contains NaN or Inf values
-        - Extreme low variance (indicates freeze/corruption)
+        Uses min/max instead of std for speed, samples center region only.
 
         Args:
             frame: The video frame to validate
@@ -178,65 +174,49 @@ class BaseStreamProcessor(ABC):
         Returns:
             Tuple of (is_valid, reason_if_invalid)
         """
-        # Basic null/empty check
+        # Basic null/empty check (very fast)
         if frame is None:
             return False, "frame is None"
 
         if frame.size == 0:
             return False, "frame is empty"
 
-        # Shape validation - must be 3-channel BGR
-        if len(frame.shape) != 3:
+        # Shape validation (very fast)
+        if len(frame.shape) != 3 or frame.shape[2] != 3:
             return False, f"invalid shape: {frame.shape}"
 
-        if frame.shape[2] != 3:
-            return False, f"not 3-channel: {frame.shape[2]} channels"
+        # Sample center 50% of frame, every 20th pixel (much smaller than before)
+        h, w = frame.shape[:2]
+        sample = frame[h//4:3*h//4:20, w//4:3*w//4:20]
 
-        # Check for NaN or Inf values (rare but can happen with codec errors)
-        if frame.dtype in [np.float32, np.float64]:
-            if np.any(np.isnan(frame)) or np.any(np.isinf(frame)):
-                return False, "contains NaN/Inf values"
+        # Use min/max instead of std (faster) for corruption detection
+        sample_min = int(sample.min())
+        sample_max = int(sample.max())
 
-        # Calculate frame statistics for corruption detection
-        # Use a small sample for performance (every 10th pixel)
-        sample = frame[::10, ::10]
+        # All-zero or uniform frame check
+        if sample_max - sample_min < 2:
+            return False, "uniform/black frame"
 
-        # Check for all-zero frame (completely black due to corruption, not just dark)
-        if np.all(sample == 0):
-            return False, "all-zero frame (corrupted black)"
-
-        # Check for uniform frame (all same value - compression artifact)
-        # This is different from a legitimately dark frame which has some variation
-        if np.std(sample) < 0.5:  # Extremely low variance indicates corruption
-            return False, f"uniform frame (std={np.std(sample):.2f})"
-
-        # Check for "green frame" corruption (common FFmpeg decode error)
-        # Green frames have very high green channel relative to R and B
-        green_mean = np.mean(sample[:, :, 1])
-        red_mean = np.mean(sample[:, :, 2])
-        blue_mean = np.mean(sample[:, :, 0])
-
-        if green_mean > 200 and red_mean < 50 and blue_mean < 50:
-            return False, "green frame corruption"
-
-        # Check for "gray static" corruption (random noise from decode failure)
-        # This has very high variance with mean around 128
-        overall_std = np.std(sample)
-        overall_mean = np.mean(sample)
-        if overall_std > 70 and 100 < overall_mean < 156:
-            # Could be static noise - check if it looks like random noise
-            # Real frames have structure, noise is uniform randomness
-            # Check a small patch for local variance consistency
-            patch = frame[100:150, 100:150] if frame.shape[0] > 150 and frame.shape[1] > 150 else sample
-            patch_std = np.std(patch)
-            if patch_std > 60:  # High local variance suggests noise
-                return False, "static noise corruption"
+        # Green frame check (common FFmpeg decode error)
+        # Only do channel analysis if max is suspiciously high
+        if sample_max > 200:
+            green_mean = sample[:, :, 1].mean()
+            if green_mean > 200:
+                red_mean = sample[:, :, 2].mean()
+                blue_mean = sample[:, :, 0].mean()
+                if red_mean < 50 and blue_mean < 50:
+                    return False, "green frame corruption"
 
         return True, "valid"
 
     def _get_validated_frame(self, frame: np.ndarray) -> Optional[np.ndarray]:
         """
-        Validate a frame and return it if valid, or return cached frame if corrupted.
+        Validate frame periodically and recover from corruption.
+
+        Optimized to:
+        - Only validate every N frames (not every frame)
+        - Store reference instead of copy for valid frames
+        - Only copy when actually recovering from corruption
 
         Args:
             frame: The frame to validate
@@ -244,11 +224,27 @@ class BaseStreamProcessor(ABC):
         Returns:
             Valid frame (original or cached), or None if no valid frame available
         """
-        is_valid, reason = self._validate_frame(frame)
+        self._validation_frame_counter += 1
+
+        # Only validate every N frames for performance
+        # But always validate if we're recovering from corrupted frames
+        should_validate = (
+            self._validation_frame_counter >= self._validation_interval or
+            self.corrupted_frame_count > 0
+        )
+
+        if not should_validate:
+            # Trust the frame, store reference (no copy!)
+            self._last_valid_frame_ref = frame
+            return frame
+
+        # Reset counter and validate
+        self._validation_frame_counter = 0
+        is_valid, reason = self._validate_frame_fast(frame)
 
         if is_valid:
-            # Cache this valid frame
-            self.last_valid_frame = frame.copy()
+            # Store reference only (no copy!) for potential future recovery
+            self._last_valid_frame_ref = frame
             self.corrupted_frame_count = 0
             return frame
 
@@ -260,11 +256,11 @@ class BaseStreamProcessor(ABC):
         elif self.corrupted_frame_count == self.max_corrupted_before_warn + 1:
             self.logger.warning(f"Many corrupted frames detected (>{self.max_corrupted_before_warn}), suppressing further debug logs")
 
-        # Return cached frame if available
-        if self.last_valid_frame is not None:
-            return self.last_valid_frame.copy()
+        # Return cached frame if available - NOW we copy (only on actual corruption)
+        if self._last_valid_frame_ref is not None:
+            return self._last_valid_frame_ref.copy()
 
-        # No cached frame available - return original (will likely fail gracefully downstream)
+        # No cached frame available - return original
         return frame
 
     @abstractmethod
@@ -372,12 +368,10 @@ class BaseStreamProcessor(ABC):
                     # Send both clean and processed frames to queue for live viewing (non-blocking)
                     if self.frame_queue is not None and processed_frame is not None:
                         try:
-                            # Send both frames as a dict so viewer can toggle between them
                             frame_data = {
                                 'clean': clean_frame,
                                 'annotated': processed_frame
                             }
-                            # Use put_nowait to avoid blocking if queue is full
                             self.frame_queue.put_nowait(frame_data)
                         except Exception:
                             # Queue full, skip this frame
