@@ -89,8 +89,10 @@ class BaseStreamProcessor(ABC):
                     'stimeout;5000000',           # Socket timeout 5 seconds (in microseconds)
                     'max_delay;500000',           # Max demux delay 500ms
                     'reorder_queue_size;0',       # Disable packet reordering (lower latency)
-                    'fflags;nobuffer+discardcorrupt',  # No buffering + discard corrupt packets
+                    'fflags;nobuffer+discardcorrupt+igndts',  # No buffering + discard corrupt + ignore DTS
                     'flags;low_delay',            # Enable low delay mode
+                    'err_detect;ignore_err',      # Ignore decoding errors (macroblock errors)
+                    'skip_frame;noref',           # Skip non-reference frames on error (faster recovery)
                     'analyzeduration;1000000',    # Reduce stream analysis time to 1s
                     'probesize;1000000',          # Reduce probe size to 1MB
                 ])
@@ -328,7 +330,18 @@ class BaseStreamProcessor(ABC):
 
         try:
             while self.running:
-                ret, frame = self.cap.read()
+                # Wrap cap.read() to catch any FFmpeg decode exceptions
+                try:
+                    ret, frame = self.cap.read()
+                except Exception as e:
+                    # FFmpeg decode error (e.g., macroblock corruption)
+                    consecutive_failures += 1
+                    self.logger.warning(f"Decode error ({consecutive_failures}/{max_consecutive_failures}): {e}")
+                    if consecutive_failures >= max_consecutive_failures:
+                        self.logger.error("Too many decode errors, stopping")
+                        break
+                    time.sleep(0.05)  # Brief pause before retry
+                    continue
 
                 if not ret or frame is None:
                     consecutive_failures += 1
