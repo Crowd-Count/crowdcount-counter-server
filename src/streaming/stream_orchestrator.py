@@ -30,6 +30,7 @@ from config.server_config import (
     ORCHESTRATOR_PORT,
     MAX_PROCESSORS,
     STREAM_HEALTH_CHECK_INTERVAL,
+    STREAM_RECONNECT_TIMEOUT,
     RTSP_HOST,
     RTSP_PORT,
     LOG_LEVEL,
@@ -191,6 +192,10 @@ class StreamOrchestrator:
         # Format: {device_id: password}
         self.ssh_passwords: Dict[str, str] = {}
 
+        # Track streams pending reconnection (grace period before marking offline)
+        # Format: {stream_name: {'stop_time': float, 'api_client': CrowdCountAPIClient}}
+        self.pending_reconnect: Dict[str, dict] = {}
+
         self.running = False
         self.monitor_thread = None
 
@@ -220,6 +225,12 @@ class StreamOrchestrator:
             stream_name = data.get('stream', '')
 
             if stream_name:
+                # Cancel any pending reconnect timeout (stream came back)
+                if stream_name in self.pending_reconnect:
+                    elapsed = time.time() - self.pending_reconnect[stream_name]['stop_time']
+                    self.logger.info(f"Stream {stream_name} reconnected after {elapsed:.1f}s - canceling offline timeout")
+                    del self.pending_reconnect[stream_name]
+
                 # Check if this stream is already being processed (avoid duplicate calls)
                 if stream_name in self.processors and self.processors[stream_name].is_alive():
                     # Stream already has a processor running, ignore
@@ -284,16 +295,15 @@ class StreamOrchestrator:
 
         @self.app.route('/stream/stopped', methods=['POST'])
         def stream_stopped():
-            """Called by MediaMTX when a stream stops"""
+            """Called by MediaMTX when a stream stops - uses grace period before marking offline"""
             data = request.get_json()
             stream_name = data.get('stream', '')
 
             if stream_name:
                 self.logger.info(f"Received stream stopped notification: {stream_name}")
-                self.stop_processor(stream_name)
 
-                # Keep device info in memory for reconnection
-                # (credentials are needed when device reconnects)
+                # Stop the processor but don't mark offline yet - use grace period
+                self._handle_stream_interruption(stream_name)
 
                 return jsonify({'status': 'ok'}), 200
 
@@ -1131,6 +1141,78 @@ class StreamOrchestrator:
                 del self.frame_queues[stream_name]
             # Keep device info for reconnection (don't delete credentials)
 
+    def _handle_stream_interruption(self, stream_name: str):
+        """
+        Handle stream interruption with reconnect grace period.
+        Stops the processor but doesn't mark offline immediately - waits for possible reconnection.
+        """
+        if stream_name in self.pending_reconnect:
+            # Already pending, just update timestamp
+            self.pending_reconnect[stream_name]['stop_time'] = time.time()
+            return
+
+        # Stop processor but preserve API client for later offline update
+        api_client = self.api_clients.pop(stream_name, None)
+
+        if stream_name in self.processors:
+            proc = self.processors[stream_name]
+            try:
+                if proc.is_alive():
+                    proc.terminate()
+                    proc.join(timeout=5)
+                    if proc.is_alive():
+                        proc.kill()
+                        proc.join()
+                self.logger.info(f"Processor stopped for {stream_name}")
+            except Exception as e:
+                self.logger.error(f"Error stopping processor for {stream_name}: {e}")
+            finally:
+                self.processors.pop(stream_name, None)
+
+        # Clean up frame queue
+        if stream_name in self.frame_queues:
+            del self.frame_queues[stream_name]
+
+        # Add to pending reconnect instead of marking offline immediately
+        self.pending_reconnect[stream_name] = {
+            'stop_time': time.time(),
+            'api_client': api_client
+        }
+        self.logger.info(f"Stream {stream_name} added to reconnect queue (timeout: {STREAM_RECONNECT_TIMEOUT}s)")
+
+    def _check_pending_reconnects(self):
+        """Check pending streams - mark offline if timeout expired, restart if reconnected."""
+        current_time = time.time()
+        active_streams = self.mediamtx.get_active_streams()
+        streams_to_remove = []
+
+        for stream_name, info in self.pending_reconnect.items():
+            elapsed = current_time - info['stop_time']
+
+            # Stream came back - restart processor
+            if stream_name in active_streams:
+                self.logger.info(f"Stream {stream_name} reappeared after {elapsed:.1f}s - restarting processor")
+                # Restore API client before starting processor
+                if info.get('api_client'):
+                    self.api_clients[stream_name] = info['api_client']
+                self.start_processor(stream_name)
+                streams_to_remove.append(stream_name)
+
+            # Timeout expired - mark offline
+            elif elapsed > STREAM_RECONNECT_TIMEOUT:
+                self.logger.warning(f"Stream {stream_name} reconnect timeout ({STREAM_RECONNECT_TIMEOUT}s) - marking offline")
+                # Now mark offline
+                if info.get('api_client'):
+                    threading.Thread(
+                        target=info['api_client'].update_status,
+                        args=('offline',),
+                        daemon=True
+                    ).start()
+                streams_to_remove.append(stream_name)
+
+        for stream_name in streams_to_remove:
+            self.pending_reconnect.pop(stream_name, None)
+
     def monitor_streams(self):
         """
         Monitor stream health and restart dead processors
@@ -1165,9 +1247,12 @@ class StreamOrchestrator:
                 # Get active streams and ensure processors exist
                 active_streams = self.mediamtx.get_active_streams()
                 for stream_name in active_streams:
-                    if stream_name not in self.processors:
+                    if stream_name not in self.processors and stream_name not in self.pending_reconnect:
                         self.logger.info(f"Found active stream without processor: {stream_name}")
                         self.start_processor(stream_name)
+
+                # Check streams pending reconnection
+                self._check_pending_reconnects()
 
             except Exception as e:
                 self.logger.error(f"Error in monitor loop: {e}")
