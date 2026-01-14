@@ -92,7 +92,6 @@ class BaseStreamProcessor(ABC):
                     'fflags;nobuffer+discardcorrupt+igndts',  # No buffering + discard corrupt + ignore DTS
                     'flags;low_delay',            # Enable low delay mode
                     'err_detect;ignore_err',      # Ignore decoding errors (macroblock errors)
-                    'skip_frame;noref',           # Skip non-reference frames on error (faster recovery)
                     'analyzeduration;1000000',    # Reduce stream analysis time to 1s
                     'probesize;1000000',          # Reduce probe size to 1MB
                 ])
