@@ -605,10 +605,10 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             'min_path_length': 50,      # Minimum pixels traveled
             'max_tracking_distance': 100,  # TUNED: Reduced from 120 for tighter matching
             'tracker_timeout': 3.0,     # TUNED: Increased from 2.0 for slow-moving groups
-            'yolo_conf_threshold': 0.10,  # YOLO26: Lowered from 0.25 - NMS-free models may output lower confidence
+            'yolo_conf_threshold': 0.25,  # TUNED: Balanced - catches people but filters noise
             'yolo_iou_threshold': 0.3,   # NOTE: YOLO26 is NMS-free, this param may be ignored
             'min_crossing_interval': 0.5,  # TUNED: Increased from 0.3 to prevent double counts
-            'min_peak_confidence': 0.15,  # YOLO26: Lowered from 0.30 - NMS-free confidence distribution differs
+            'min_peak_confidence': 0.30,  # TUNED: Lowered from 0.40 for better daytime accuracy
             'reid_similarity_threshold': 0.6,  # TUNED: Increased for deep ReID (more discriminative)
             'use_bytetrack': True,       # NEW: Enable ByteTrack
             'use_reid': True,            # NEW: Enable ReID features
