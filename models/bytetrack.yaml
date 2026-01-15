@@ -1,12 +1,12 @@
 # ByteTrack configuration optimized for overhead doorway counting
-# Tuned for better group detection and reduced ID switches
+# Tuned for YOLO26 NMS-free architecture (lower confidence outputs)
 
 tracker_type: bytetrack
 
-# Detection thresholds
-track_high_thresh: 0.25    # High confidence threshold for first association (lowered for groups)
-track_low_thresh: 0.1      # Low confidence threshold for second association (catch occluded people)
-new_track_thresh: 0.3      # Threshold for creating new tracks
+# Detection thresholds - YOLO26 TUNED (NMS-free models output lower confidence scores)
+track_high_thresh: 0.10    # YOLO26: Lowered from 0.25 - first association threshold
+track_low_thresh: 0.05     # YOLO26: Lowered from 0.1 - catch more occluded people
+new_track_thresh: 0.15     # YOLO26: Lowered from 0.3 - create tracks at lower confidence
 
 # Track buffer and matching
 track_buffer: 90           # Frames to keep lost tracks (~3 sec at 30fps for doorway dropout)
