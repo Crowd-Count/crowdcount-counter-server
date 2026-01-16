@@ -592,8 +592,9 @@ class PeopleCounterProcessor(BaseStreamProcessor):
         super().__init__(stream_name, rtsp_url, device_info, frame_queue)
 
         # YOLO model setup
+        # v2_0_0.pt is a 11s model, v2_1_0.pt is an 11n model, v2_2_0.pt is a 26n model, v2_3_0.pt is a 26s model
         self.model = None
-        self.model_path = str(MODELS_DIR / "yolo26s.pt")  # Using YOLO26 Small model (NMS-free architecture)
+        self.model_path = str(MODELS_DIR / "v2_1_0.pt")  # Using YOLOv11 Small model for better accuracy
         self.bytetrack_config = str(MODELS_DIR / "bytetrack.yaml")  # ByteTrack config for group tracking
         self.class_names = {0: 'person'}  # Default
 
