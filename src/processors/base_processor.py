@@ -10,6 +10,12 @@ from abc import ABC, abstractmethod
 from typing import Optional
 import numpy as np
 
+# Import video settings from central config
+try:
+    from config.server_config import VIDEO_FPS
+except ImportError:
+    VIDEO_FPS = 15  # Fallback default
+
 
 class BaseStreamProcessor(ABC):
     """
@@ -104,7 +110,7 @@ class BaseStreamProcessor(ABC):
                 self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
                 # Request specific FPS (helps OpenCV's frame timing)
-                self.cap.set(cv2.CAP_PROP_FPS, 30)
+                self.cap.set(cv2.CAP_PROP_FPS, VIDEO_FPS)
 
                 if not self.cap.isOpened():
                     self.logger.warning(f"Failed to open stream (attempt {attempt}/{max_retries})")

@@ -37,7 +37,10 @@ from config.server_config import (
     DB_PATH,
     SSH_KEY_PATH,
     SSH_USER,
-    STATIC_DIR
+    STATIC_DIR,
+    VIDEO_FPS,
+    VIDEO_WIDTH,
+    VIDEO_HEIGHT
 )
 from streaming.mediamtx_manager import MediaMTXManager
 from processors import BaseStreamProcessor, ExampleProcessor
@@ -48,16 +51,16 @@ def init_db():
     """Create database tables if they don't exist"""
     conn = sqlite3.connect(str(DB_PATH))
     c = conn.cursor()
-    c.execute('''
+    c.execute(f'''
         CREATE TABLE IF NOT EXISTS devices (
             device_id TEXT PRIMARY KEY,
             stream_name TEXT NOT NULL,
             tailscale_ip TEXT,
             last_seen TIMESTAMP,
             status TEXT DEFAULT 'offline',
-            width INTEGER DEFAULT 640,
-            height INTEGER DEFAULT 480,
-            fps INTEGER DEFAULT 30,
+            width INTEGER DEFAULT {VIDEO_WIDTH},
+            height INTEGER DEFAULT {VIDEO_HEIGHT},
+            fps INTEGER DEFAULT {VIDEO_FPS},
             registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')

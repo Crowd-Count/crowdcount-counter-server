@@ -9,7 +9,7 @@ track_low_thresh: 0.1      # Low confidence threshold for second association (ca
 new_track_thresh: 0.3      # Threshold for creating new tracks
 
 # Track buffer and matching
-track_buffer: 90           # Frames to keep lost tracks (~3 sec at 30fps for doorway dropout)
+track_buffer: 45           # Frames to keep lost tracks (~3 sec at 15fps). Formula: FPS * 3 seconds
 match_thresh: 0.75         # IoU threshold for matching (relaxed for reacquisition through doorway)
 
 # Motion model (Kalman filter)

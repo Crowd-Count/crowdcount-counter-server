@@ -50,6 +50,20 @@ SSH_USER = 'pi'  # Default Raspberry Pi username
 # Web dashboard
 STATIC_DIR = BASE_DIR / "static"
 
+# =============================================================================
+# VIDEO SETTINGS - Change these values to adjust FPS and resolution globally
+# =============================================================================
+VIDEO_FPS = 15              # Frames per second (was 30)
+VIDEO_WIDTH = 640           # Video width in pixels
+VIDEO_HEIGHT = 480          # Video height in pixels
+
+# ByteTrack timing (track_buffer should be ~3 seconds worth of frames)
+# At 15fps: 45 frames = 3 seconds | At 30fps: 90 frames = 3 seconds
+TRACK_BUFFER_SECONDS = 3    # How many seconds to keep lost tracks
+TRACK_BUFFER_FRAMES = VIDEO_FPS * TRACK_BUFFER_SECONDS
+
+# =============================================================================
+
 # Create directories if they don't exist
 DATA_DIR.mkdir(exist_ok=True)
 STREAMS_DIR.mkdir(exist_ok=True)
