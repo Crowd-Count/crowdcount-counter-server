@@ -393,10 +393,12 @@ class StreamOrchestrator:
                 return jsonify({'status': 'error', 'message': 'device_id and password are required'}), 400
 
             # Validate credentials against CrowdCount API
+            self.logger.info(f"Validating credentials for {device_id}...")
             is_valid = CrowdCountAPIClient.check_password(device_id, password)
             if not is_valid:
                 self.logger.warning(f"✗ Registration failed for {device_id}: Invalid credentials")
                 return jsonify({'status': 'error', 'message': 'Invalid credentials'}), 401
+            self.logger.info(f"✓ Credentials valid for {device_id}")
 
             # Get client IP (Tailscale IP)
             client_ip = request.remote_addr
