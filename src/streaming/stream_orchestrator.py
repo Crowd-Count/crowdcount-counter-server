@@ -378,7 +378,7 @@ class StreamOrchestrator:
         def register_device():
             """
             Register device information for a stream.
-            Useful for pre-registering device info before the stream connects.
+            Validates device credentials before allowing registration.
             """
             data = request.get_json()
             stream_name = data.get('stream_name', '')
@@ -387,6 +387,16 @@ class StreamOrchestrator:
 
             if not stream_name:
                 return jsonify({'status': 'error', 'message': 'stream_name is required'}), 400
+
+            if not device_id or not password:
+                self.logger.warning(f"✗ Registration attempt with missing credentials from {request.remote_addr}")
+                return jsonify({'status': 'error', 'message': 'device_id and password are required'}), 400
+
+            # Validate credentials against CrowdCount API
+            is_valid = CrowdCountAPIClient.check_password(device_id, password)
+            if not is_valid:
+                self.logger.warning(f"✗ Registration failed for {device_id}: Invalid credentials")
+                return jsonify({'status': 'error', 'message': 'Invalid credentials'}), 401
 
             # Get client IP (Tailscale IP)
             client_ip = request.remote_addr
