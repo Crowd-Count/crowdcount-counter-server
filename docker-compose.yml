@@ -1,8 +1,8 @@
 # CrowdCount Counter Server - Docker Compose
 #
 # Runs two isolated server instances:
-# - Production: Uses code from code/prod/ (main branch)
-# - Development: Uses code from code/dev/ (dev branch)
+# - Production: Uses code from prod/ (prod branch worktree)
+# - Development: Uses code from dev/ (dev branch worktree)
 #
 # Usage:
 #   docker-compose up -d              # Start both servers
@@ -22,10 +22,10 @@ services:
     container_name: crowdcount-prod
     restart: unless-stopped
 
-    # Mount production code (main branch worktree)
+    # Mount production code (prod branch worktree)
     volumes:
-      - ./code/prod:/app:ro
-      - ./code/prod/data:/app/data
+      - ./prod:/app:ro
+      - ./prod/data:/app/data
       - /opt/mediamtx:/opt/mediamtx:ro
 
     # Production ports
@@ -66,8 +66,8 @@ services:
 
     # Mount development code (dev branch worktree)
     volumes:
-      - ./code/dev:/app:ro
-      - ./code/dev/data:/app/data
+      - ./dev:/app:ro
+      - ./dev/data:/app/data
       - /opt/mediamtx:/opt/mediamtx:ro
 
     # Development ports (offset from production)

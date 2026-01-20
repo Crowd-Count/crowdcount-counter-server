@@ -7,8 +7,8 @@ data/
 !data/.gitkeep
 
 # Git worktrees (code is in separate branches)
-code/prod/
-code/dev/
+prod/
+dev/
 
 # Database files
 *.db
