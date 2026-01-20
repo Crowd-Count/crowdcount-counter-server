@@ -621,10 +621,10 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             # METHOD 5.4: Velocity-gated crossing validation (reflection prevention)
             'velocity_validation_enabled': True,        # Enable velocity-based crossing validation
             'velocity_min_approach_speed': 15.0,        # Min pixels/sec toward crossing line to be valid
-            'velocity_min_approach_frames': 5,          # Min frames with approach velocity before crossing
+            'velocity_min_approach_frames': 3,          # Min frames with approach velocity before crossing (was 5 at 30fps)
             'velocity_approach_ratio_threshold': 0.5,   # Min ratio of frames moving toward line (0.0-1.0)
-            'velocity_min_transit_frames': 2,           # Min frames detected in danger zone (anti-teleport)
-            'velocity_validation_window': 20,           # Frames to analyze for velocity validation
+            'velocity_min_transit_frames': 1,           # Min frames detected in danger zone (anti-teleport, was 2 at 30fps)
+            'velocity_validation_window': 10,           # Frames to analyze for velocity validation (was 20 at 30fps)
             # Night mode: CLAHE preprocessing for low-light enhancement
             'use_clahe': True,                  # Enable CLAHE preprocessing for night/low-light
             'clahe_clip_limit': 2.0,            # Contrast limit (1.5-3.0, higher = more contrast but more noise)
