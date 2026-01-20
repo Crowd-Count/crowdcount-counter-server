@@ -2,6 +2,28 @@
 prod/
 dev/
 
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+*.egg
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Runtime directories (keep structure via .gitkeep)
+bin/*
+!bin/.gitkeep
+data/*
+!data/.gitkeep
+src/
+
 # OS
 .DS_Store
 Thumbs.db

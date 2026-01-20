@@ -4,7 +4,7 @@
 # The actual application code is mounted at runtime via docker-compose volumes,
 # allowing different code (prod vs dev) to run in separate containers.
 
-FROM python:3.11-slim
+FROM nvidia/cuda:12.8.0-runtime-ubuntu24.04
 
 # Prevent Python from writing bytecode and enable unbuffered output
 ENV PYTHONDONTWRITEBYTECODE=1
@@ -13,8 +13,15 @@ ENV PYTHONUNBUFFERED=1
 # Set working directory
 WORKDIR /app
 
-# Install system dependencies
+# Create directories needed for tmpfs mounts (must exist before read-only volume mount)
+RUN mkdir -p /app/bin
+
+# Install system dependencies including Python
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    # Python
+    python3 \
+    python3-venv \
+    python3-pip \
     # OpenCV dependencies
     libgl1 \
     libglib2.0-0 \
@@ -32,7 +39,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     g++ \
     # envsubst for template substitution
     gettext-base \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -sf /usr/bin/python3 /usr/bin/python
 
 # Download and install MediaMTX
 ARG MEDIAMTX_VERSION=1.9.1
@@ -45,8 +53,9 @@ RUN mkdir -p /opt/mediamtx && \
 # Copy requirements first for better layer caching
 COPY requirements.txt /tmp/requirements.txt
 
-# Install Python dependencies
-RUN pip install --no-cache-dir -r /tmp/requirements.txt
+# Install PyTorch nightly with CUDA 12.8 support (for RTX 50 series Blackwell sm_120)
+RUN pip install --no-cache-dir --break-system-packages --pre torch torchvision --index-url https://download.pytorch.org/whl/nightly/cu128 \
+    && pip install --no-cache-dir --break-system-packages -r /tmp/requirements.txt
 
 # Copy entrypoint script
 COPY docker-entrypoint.sh /usr/local/bin/

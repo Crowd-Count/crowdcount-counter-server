@@ -1,0 +1,26 @@
+# Python dependencies for CrowdCount Counter Server
+
+# Computer Vision
+opencv-python>=4.8.0
+ultralytics>=8.0.0  # YOLO for people counter processor
+lap>=0.5.12  # ByteTrack tracking dependency
+
+# Deep ReID for person re-identification
+torchreid>=0.2.5  # OSNet for robust appearance matching during occlusion
+
+# Web Framework
+Flask>=2.3.0
+Flask-CORS>=4.0.0
+
+# SSH for remote device control
+paramiko>=3.4.0
+
+# HTTP Requests
+requests>=2.31.0
+
+# Numerical Operations
+numpy>=1.24.0
+
+# Optional but recommended
+# Gunicorn for production deployment
+# gunicorn>=21.0.0
