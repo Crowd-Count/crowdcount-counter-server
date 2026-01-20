@@ -1,6 +1,8 @@
 """
 Server Configuration
 Central configuration for the CrowdCount Counter Server
+
+All port settings can be overridden via environment variables for Docker deployment.
 """
 
 import os
@@ -13,19 +15,27 @@ DATA_DIR = BASE_DIR / "data"
 STREAMS_DIR = DATA_DIR / "streams"
 RECORDINGS_DIR = DATA_DIR / "recordings"
 
+# =============================================================================
+# PORT CONFIGURATION (overridable via environment variables)
+# =============================================================================
+RTSP_PORT = int(os.getenv("RTSP_PORT", "8554"))
+ORCHESTRATOR_PORT = int(os.getenv("ORCHESTRATOR_PORT", "5000"))
+HLS_PORT = int(os.getenv("HLS_PORT", "8888"))
+WEBRTC_PORT = int(os.getenv("WEBRTC_PORT", "8889"))
+MEDIAMTX_API_PORT = int(os.getenv("MEDIAMTX_API_PORT", "9997"))
+MEDIAMTX_METRICS_PORT = int(os.getenv("MEDIAMTX_METRICS_PORT", "9998"))
+
 # MediaMTX settings
 MEDIAMTX_BINARY = BASE_DIR / "bin" / "mediamtx"
 MEDIAMTX_CONFIG = SRC_DIR / "config" / "mediamtx.yml"
-MEDIAMTX_API_URL = "http://127.0.0.1:9997"
-MEDIAMTX_METRICS_URL = "http://127.0.0.1:9998/metrics"
+MEDIAMTX_API_URL = f"http://127.0.0.1:{MEDIAMTX_API_PORT}"
+MEDIAMTX_METRICS_URL = f"http://127.0.0.1:{MEDIAMTX_METRICS_PORT}/metrics"
 
 # RTSP settings
 RTSP_HOST = "127.0.0.1"
-RTSP_PORT = 8554
 
 # Orchestrator settings
 ORCHESTRATOR_HOST = "0.0.0.0"
-ORCHESTRATOR_PORT = 5000
 
 # Stream processor settings
 PROCESSOR_TYPE = "subprocess"  # Options: "subprocess", "docker" (docker not implemented yet)

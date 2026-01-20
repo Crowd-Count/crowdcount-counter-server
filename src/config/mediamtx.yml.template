@@ -1,0 +1,92 @@
+# MediaMTX Configuration Template for CrowdCount Counter Server
+# This template uses environment variable placeholders for Docker deployment.
+# The docker-entrypoint.sh script substitutes these with actual values.
+#
+# Documentation: https://github.com/bluenviron/mediamtx
+
+# General settings
+logLevel: info
+logDestinations: [stdout]
+logFile: data/mediamtx.log
+
+# API server for monitoring and management
+api: true
+apiAddress: 0.0.0.0:${MEDIAMTX_API_PORT}
+
+# Metrics for monitoring
+metrics: true
+metricsAddress: 0.0.0.0:${MEDIAMTX_METRICS_PORT}
+
+# External authentication - DISABLED
+# Security model: Tailscale VPN provides network-level isolation
+# Only devices on the Tailscale network can publish/read streams
+# No application-level authentication required
+
+# Internal authentication for API/Metrics access
+# Allows unauthenticated access from any IP (protected by Tailscale)
+authInternalUsers:
+  - user: any
+    pass:
+    ips: []
+    permissions:
+      - action: api
+      - action: metrics
+      - action: pprof
+      - action: publish
+      - action: read
+      - action: playback
+
+# Performance settings - optimized for 30fps streaming
+readTimeout: 10s
+writeTimeout: 10s
+readBufferCount: 2048
+udpMaxPayloadSize: 1472
+
+# RTSP Server Configuration
+rtspDisable: false
+protocols: [tcp]
+encryption: "no"
+rtspAddress: :${RTSP_PORT}
+rtspsAddress: :${RTSPS_PORT}
+rtpAddress: :${RTP_PORT}
+rtcpAddress: :${RTCP_PORT}
+
+# RTMP Server Configuration (for camera publishing)
+rtmpDisable: false
+rtmpAddress: :${RTMP_PORT}
+rtmpEncryption: "no"
+
+# HLS (for browser viewing)
+hlsDisable: false
+hlsAddress: :${HLS_PORT}
+hlsEncryption: false
+hlsAllowOrigin: '*'
+hlsVariant: lowLatency
+hlsSegmentCount: 7
+hlsSegmentDuration: 1s
+hlsPartDuration: 200ms
+
+# WebRTC (for low-latency browser viewing)
+webrtcDisable: false
+webrtcAddress: :${WEBRTC_PORT}
+webrtcICEServers: []
+webrtcAllowOrigin: '*'
+
+# Recording settings (disabled by default, can enable per-path)
+recordPath: ./data/recordings/%path/%Y-%m-%d_%H-%M-%S-%f
+
+# Path configurations (streams)
+paths:
+  # Catch-all regex pattern to match any stream name
+  ~^.*$:
+    source: publisher
+
+    # Run a command when a stream is ready (used to notify our orchestrator)
+    runOnReady: 'curl -X POST http://127.0.0.1:${ORCHESTRATOR_PORT}/stream/ready -H "Content-Type: application/json" -d "{\"stream\":\"$MTX_PATH\"}"'
+    runOnReadyRestart: false
+
+    # Run a command when a stream is not ready anymore
+    runOnNotReady: 'curl -X POST http://127.0.0.1:${ORCHESTRATOR_PORT}/stream/stopped -H "Content-Type: application/json" -d "{\"stream\":\"$MTX_PATH\"}"'
+
+    # Recording (disabled by default)
+    record: false

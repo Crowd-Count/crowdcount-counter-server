@@ -1,0 +1,94 @@
+# CrowdCount Counter Server - Docker Compose
+#
+# Runs two isolated server instances:
+# - Production: Uses code from code/prod/ (main branch)
+# - Development: Uses code from code/dev/ (dev branch)
+#
+# Usage:
+#   docker-compose up -d              # Start both servers
+#   docker-compose up -d production   # Start only production
+#   docker-compose up -d development  # Start only development
+#   docker-compose logs -f            # View logs
+#   docker-compose restart production # Restart production after code changes
+
+services:
+  # =============================================================================
+  # PRODUCTION SERVER
+  # =============================================================================
+  production:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: crowdcount-prod
+    restart: unless-stopped
+
+    # Mount production code (main branch worktree)
+    volumes:
+      - ./code/prod:/app:ro
+      - ./code/prod/data:/app/data
+      - /opt/mediamtx:/opt/mediamtx:ro
+
+    # Production ports
+    environment:
+      - RTSP_PORT=8554
+      - ORCHESTRATOR_PORT=5000
+      - HLS_PORT=8888
+      - WEBRTC_PORT=8889
+      - MEDIAMTX_API_PORT=9997
+      - MEDIAMTX_METRICS_PORT=9998
+      - RTSPS_PORT=8555
+      - RTP_PORT=8000
+      - RTCP_PORT=8001
+      - RTMP_PORT=1935
+      - ENV=production
+
+    ports:
+      - "5000:5000"     # Flask API
+      - "8554:8554"     # RTSP
+      - "8888:8888"     # HLS
+      - "8890:8889"     # WebRTC (mapped to 8890 on host)
+      - "9997:9997"     # MediaMTX API
+      - "9999:9998"     # MediaMTX Metrics (mapped to 9999 on host)
+
+    # Use host network for Tailscale compatibility
+    # Uncomment if you need direct Tailscale access:
+    # network_mode: host
+
+  # =============================================================================
+  # DEVELOPMENT SERVER
+  # =============================================================================
+  development:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: crowdcount-dev
+    restart: unless-stopped
+
+    # Mount development code (dev branch worktree)
+    volumes:
+      - ./code/dev:/app:ro
+      - ./code/dev/data:/app/data
+      - /opt/mediamtx:/opt/mediamtx:ro
+
+    # Development ports (offset from production)
+    environment:
+      - RTSP_PORT=8554
+      - ORCHESTRATOR_PORT=5000
+      - HLS_PORT=8888
+      - WEBRTC_PORT=8889
+      - MEDIAMTX_API_PORT=9997
+      - MEDIAMTX_METRICS_PORT=9998
+      - RTSPS_PORT=8555
+      - RTP_PORT=8000
+      - RTCP_PORT=8001
+      - RTMP_PORT=1935
+      - ENV=development
+
+    # Development ports (offset by 1 from production on host)
+    ports:
+      - "5001:5000"     # Flask API
+      - "8555:8554"     # RTSP
+      - "8889:8888"     # HLS
+      - "8891:8889"     # WebRTC
+      - "9998:9997"     # MediaMTX API
+      - "10000:9998"    # MediaMTX Metrics

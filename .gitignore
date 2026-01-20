@@ -6,6 +6,10 @@ bin/
 data/
 !data/.gitkeep
 
+# Git worktrees (code is in separate branches)
+code/prod/
+code/dev/
+
 # Database files
 *.db
 *.db-journal
