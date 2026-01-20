@@ -593,7 +593,7 @@ class PeopleCounterProcessor(BaseStreamProcessor):
 
         # YOLO model setup
         self.model = None
-        self.model_path = str(MODELS_DIR / "yolo11s.pt")  # Using YOLOv11 Small model for better accuracy
+        self.model_path = str(MODELS_DIR / "v2_1_0.pt")  # Using YOLOv11 Small model for better accuracy
         self.bytetrack_config = str(MODELS_DIR / "bytetrack.yaml")  # ByteTrack config for group tracking
         self.class_names = {0: 'person'}  # Default
 
@@ -616,13 +616,13 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             # METHOD 5: Occlusion + ReID Relink parameters (RECOMMENDED)
             'danger_zone_buffer': 0.10,         # Width of danger zone (10% of frame)
             'checkpoint_timeout': 5.0,          # Max seconds to search for lost track
-            'relink_similarity_threshold': 0.55,  # ReID match threshold for relinking (lower OK for occlusion)
+            'relink_similarity_threshold': 0.55,  # ReID match threshold for relinkinfg (lower OK for occlusion)
             'lingering_timeout': 10.0,          # Extended timeout for slow-moving people
             # METHOD 5.4: Velocity-gated crossing validation (reflection prevention)
             'velocity_validation_enabled': True,        # Enable velocity-based crossing validation
             'velocity_min_approach_speed': 15.0,        # Min pixels/sec toward crossing line to be valid
             'velocity_min_approach_frames': 5,          # Min frames with approach velocity before crossing
-            'velocity_approach_ratio_threshold': 0.5,   # Min ratio of frames moving toward line (0.0-1.0)
+            'velocity_approach_ratio_threshold': 0.5,   # Min ratifo of frames moving toward line (0.0-1.0)
             'velocity_min_transit_frames': 2,           # Min frames detected in danger zone (anti-teleport)
             'velocity_validation_window': 20,           # Frames to analyze for velocity validation
             # Night mode: CLAHE preprocessing for low-light enhancement
