@@ -4,6 +4,7 @@ Main orchestrator that manages MediaMTX and stream processors
 Automatically spawns a processor for each new stream
 """
 
+import os
 import sys
 import time
 import logging
@@ -198,6 +199,10 @@ class StreamOrchestrator:
         # Track streams pending reconnection (grace period before marking offline)
         # Format: {stream_name: {'stop_time': float, 'api_client': CrowdCountAPIClient}}
         self.pending_reconnect: Dict[str, dict] = {}
+
+        # Track FPS stats per stream for viewer display
+        # Format: {stream_name: {'frame_count': int, 'last_reset': float, 'fps': float}}
+        self.stream_stats: Dict[str, dict] = {}
 
         self.running = False
         self.monitor_thread = None
@@ -449,119 +454,207 @@ class StreamOrchestrator:
             """Serve HTML viewer for a stream"""
             html = """
             <!DOCTYPE html>
-            <html>
+            <html lang="en">
             <head>
-                <title>CrowdCount - Stream {{ stream_name }}</title>
+                <meta charset="UTF-8">
+                <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                <title>{{ stream_name }} - CrowdCount DEV</title>
                 <style>
-                    body {
-                        margin: 0;
-                        padding: 20px;
-                        background: #1a1a1a;
-                        font-family: Arial, sans-serif;
-                        color: #fff;
+                    :root {
+                        --bg-primary: #0a0a0a;
+                        --bg-secondary: #141414;
+                        --bg-card: #1a1a1a;
+                        --text-primary: #ffffff;
+                        --text-secondary: #888888;
+                        --accent: #3b82f6;
+                        --accent-hover: #2563eb;
+                        --success: #22c55e;
+                        --warning: #f59e0b;
+                        --border: #2a2a2a;
                     }
-                    .container {
+                    * { margin: 0; padding: 0; box-sizing: border-box; }
+                    body {
+                        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                        background: var(--bg-primary);
+                        color: var(--text-primary);
+                        min-height: 100vh;
+                    }
+                    .env-banner {
+                        position: fixed;
+                        top: 0;
+                        left: 0;
+                        right: 0;
+                        padding: 6px;
+                        text-align: center;
+                        font-size: 11px;
+                        font-weight: 700;
+                        letter-spacing: 2px;
+                        z-index: 1000;
+                        background: var(--warning);
+                        color: #000;
+                    }
+                    .app {
                         max-width: 1400px;
                         margin: 0 auto;
+                        padding: 50px 24px 24px;
                     }
-                    h1 {
+                    .header {
                         text-align: center;
-                        color: #00ff00;
+                        padding: 20px 0;
+                    }
+                    .header h1 {
+                        font-size: 1.5rem;
+                        font-weight: 600;
+                        margin-bottom: 4px;
+                    }
+                    .header .stream-id {
+                        color: var(--text-secondary);
+                        font-size: 14px;
                     }
                     .controls {
-                        text-align: center;
-                        margin: 15px 0;
+                        display: flex;
+                        justify-content: center;
+                        align-items: center;
+                        gap: 16px;
+                        padding: 16px;
+                        background: var(--bg-secondary);
+                        border-radius: 12px;
+                        margin-bottom: 20px;
+                        border: 1px solid var(--border);
+                        flex-wrap: wrap;
                     }
-                    .toggle-btn {
-                        background: #333;
-                        border: 2px solid #00ff00;
-                        color: #00ff00;
+                    .btn {
+                        display: inline-flex;
+                        align-items: center;
+                        gap: 8px;
                         padding: 10px 20px;
                         font-size: 14px;
-                        border-radius: 6px;
+                        font-weight: 500;
+                        border: none;
+                        border-radius: 8px;
                         cursor: pointer;
                         transition: all 0.2s ease;
-                        font-weight: bold;
                     }
-                    .toggle-btn:hover {
-                        background: #00ff00;
-                        color: #1a1a1a;
+                    .btn.active {
+                        background: var(--success);
+                        color: #000;
                     }
-                    .toggle-btn.active {
-                        background: #00ff00;
-                        color: #1a1a1a;
+                    .status-badge {
+                        display: inline-flex;
+                        align-items: center;
+                        gap: 6px;
+                        padding: 6px 12px;
+                        border-radius: 20px;
+                        font-size: 12px;
+                        font-weight: 600;
+                    }
+                    .status-badge.overlay {
+                        background: rgba(34, 197, 94, 0.15);
+                        color: var(--success);
+                    }
+                    .status-badge.clean {
+                        background: rgba(59, 130, 246, 0.15);
+                        color: var(--accent);
+                    }
+                    .status-badge.fps {
+                        background: rgba(255, 255, 255, 0.1);
+                        color: var(--text-primary);
+                        font-family: 'SF Mono', Monaco, monospace;
+                    }
+                    .status-dot {
+                        width: 8px;
+                        height: 8px;
+                        border-radius: 50%;
+                        background: currentColor;
                     }
                     .video-container {
+                        background: var(--bg-card);
+                        border: 1px solid var(--border);
+                        border-radius: 16px;
+                        overflow: hidden;
+                        position: relative;
+                    }
+                    .video-container img {
+                        width: 100%;
+                        display: block;
+                    }
+                    .footer {
                         text-align: center;
-                        margin: 20px 0;
-                    }
-                    img {
-                        max-width: 100%;
-                        border: 2px solid #00ff00;
-                        border-radius: 8px;
-                    }
-                    .info {
-                        text-align: center;
-                        margin: 10px 0;
-                        color: #aaa;
-                    }
-                    .status-indicator {
-                        display: inline-block;
-                        padding: 4px 12px;
-                        border-radius: 4px;
-                        font-size: 12px;
-                        margin-left: 10px;
-                    }
-                    .status-overlay {
-                        background: #00ff00;
-                        color: #1a1a1a;
-                    }
-                    .status-clean {
-                        background: #3498db;
-                        color: #fff;
+                        padding: 20px;
+                        color: var(--text-secondary);
+                        font-size: 13px;
                     }
                 </style>
             </head>
             <body>
-                <div class="container">
-                    <h1>CrowdCount Stream Viewer</h1>
-                    <div class="info">Stream: {{ stream_name }}</div>
+                <div class="env-banner">DEVELOPMENT</div>
+                <div class="app">
+                    <header class="header">
+                        <h1>Stream Viewer</h1>
+                        <p class="stream-id">{{ stream_name }}</p>
+                    </header>
                     <div class="controls">
-                        <button id="toggleBtn" class="toggle-btn active" onclick="toggleOverlay()">
-                            Show Overlay: ON
+                        <button id="toggleBtn" class="btn active" onclick="toggleOverlay()">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <rect x="3" y="3" width="18" height="18" rx="2"/>
+                                <circle cx="8.5" cy="8.5" r="1.5"/>
+                                <path d="M21 15l-5-5L5 21"/>
+                            </svg>
+                            Overlay: ON
                         </button>
-                        <span id="statusIndicator" class="status-indicator status-overlay">Tracking Enabled</span>
+                        <span id="statusBadge" class="status-badge overlay">
+                            <span class="status-dot"></span>
+                            Tracking Enabled
+                        </span>
+                        <span id="fpsBadge" class="status-badge fps">-- FPS</span>
                     </div>
                     <div class="video-container">
                         <img id="streamImg" src="/video_feed/{{ stream_name }}?overlay=true" alt="Live Stream">
                     </div>
-                    <div class="info" id="feedInfo">Live YOLO Detection Feed</div>
+                    <div class="footer">
+                        <p id="feedInfo">Live Detection Feed</p>
+                    </div>
                 </div>
                 <script>
                     let overlayEnabled = true;
                     const streamName = '{{ stream_name }}';
 
+                    // Update FPS display
+                    async function updateFps() {
+                        try {
+                            const response = await fetch('/api/stream/' + streamName + '/stats');
+                            const data = await response.json();
+                            const fpsText = data.fps.toFixed(1) + ' FPS';
+                            document.getElementById('fpsBadge').textContent = fpsText;
+                        } catch (e) {
+                            document.getElementById('fpsBadge').textContent = '-- FPS';
+                        }
+                    }
+
+                    // Start FPS polling
+                    setInterval(updateFps, 1000);
+                    updateFps();
+
                     function toggleOverlay() {
                         overlayEnabled = !overlayEnabled;
                         const img = document.getElementById('streamImg');
                         const btn = document.getElementById('toggleBtn');
-                        const status = document.getElementById('statusIndicator');
+                        const badge = document.getElementById('statusBadge');
                         const feedInfo = document.getElementById('feedInfo');
-
                         if (overlayEnabled) {
                             img.src = '/video_feed/' + streamName + '?overlay=true';
-                            btn.textContent = 'Show Overlay: ON';
+                            btn.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg> Overlay: ON';
                             btn.classList.add('active');
-                            status.textContent = 'Tracking Enabled';
-                            status.className = 'status-indicator status-overlay';
-                            feedInfo.textContent = 'Live YOLO Detection Feed';
+                            badge.innerHTML = '<span class="status-dot"></span> Tracking Enabled';
+                            badge.className = 'status-badge overlay';
+                            feedInfo.textContent = 'Live Detection Feed';
                         } else {
                             img.src = '/video_feed/' + streamName + '?overlay=false';
-                            btn.textContent = 'Show Overlay: OFF';
+                            btn.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg> Overlay: OFF';
                             btn.classList.remove('active');
-                            status.textContent = 'Clean Stream';
-                            status.className = 'status-indicator status-clean';
-                            feedInfo.textContent = 'Clean Video Feed (No Annotations)';
+                            badge.innerHTML = '<span class="status-dot"></span> Clean Stream';
+                            badge.className = 'status-badge clean';
+                            feedInfo.textContent = 'Clean Video Feed';
                         }
                     }
                 </script>
@@ -586,6 +679,14 @@ class StreamOrchestrator:
 
                 frame_queue = self.frame_queues[stream_name]
 
+                # Initialize FPS tracking for this stream
+                if stream_name not in self.stream_stats:
+                    self.stream_stats[stream_name] = {
+                        'frame_count': 0,
+                        'last_reset': time.time(),
+                        'fps': 0.0
+                    }
+
                 while True:
                     try:
                         # Get frame data from queue with timeout
@@ -605,6 +706,15 @@ class StreamOrchestrator:
                             # Backwards compatibility: single frame
                             frame = frame_data
 
+                        # Update FPS stats
+                        stats = self.stream_stats[stream_name]
+                        stats['frame_count'] += 1
+                        elapsed = time.time() - stats['last_reset']
+                        if elapsed >= 1.0:
+                            stats['fps'] = stats['frame_count'] / elapsed
+                            stats['frame_count'] = 0
+                            stats['last_reset'] = time.time()
+
                         # Encode frame as JPEG
                         ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
                         if not ret:
@@ -623,6 +733,22 @@ class StreamOrchestrator:
 
             return Response(generate(),
                           mimetype='multipart/x-mixed-replace; boundary=frame')
+
+        @self.app.route('/api/stream/<stream_name>/stats')
+        def stream_stats(stream_name):
+            """Get stream statistics including FPS"""
+            if stream_name in self.stream_stats:
+                stats = self.stream_stats[stream_name]
+                return jsonify({
+                    'stream_name': stream_name,
+                    'fps': round(stats['fps'], 1),
+                    'active': stream_name in self.processors
+                })
+            return jsonify({
+                'stream_name': stream_name,
+                'fps': 0,
+                'active': stream_name in self.processors
+            })
 
         # Web Dashboard Routes
         @self.app.route('/')
@@ -982,9 +1108,15 @@ class StreamOrchestrator:
         def server_info():
             """Get server information"""
             try:
-                # Get Tailscale IP
-                result = subprocess.run(['tailscale', 'ip', '-4'], capture_output=True, text=True, timeout=5)
-                tailscale_ip = result.stdout.strip() if result.returncode == 0 else 'Unknown'
+                # Get Tailscale IP from environment variable (set in docker-compose)
+                # Fall back to running tailscale command if not set
+                tailscale_ip = os.environ.get('TAILSCALE_IP')
+                if not tailscale_ip:
+                    try:
+                        result = subprocess.run(['tailscale', 'ip', '-4'], capture_output=True, text=True, timeout=5)
+                        tailscale_ip = result.stdout.strip() if result.returncode == 0 else 'Unknown'
+                    except FileNotFoundError:
+                        tailscale_ip = 'Unknown'
 
                 return jsonify({
                     'tailscale_ip': tailscale_ip,

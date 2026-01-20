@@ -1,4 +1,7 @@
-# MediaMTX Configuration for CrowdCount Counter Server
+# MediaMTX Configuration Template for CrowdCount Counter Server
+# This template uses environment variable placeholders for Docker deployment.
+# The docker-entrypoint.sh script substitutes these with actual values.
+#
 # Documentation: https://github.com/bluenviron/mediamtx
 
 # General settings
@@ -8,11 +11,11 @@ logFile: data/mediamtx.log
 
 # API server for monitoring and management
 api: true
-apiAddress: 0.0.0.0:9997  # Listen on all interfaces (accessible over Tailscale)
+apiAddress: 0.0.0.0:9997
 
 # Metrics for monitoring
 metrics: true
-metricsAddress: 0.0.0.0:9998  # Listen on all interfaces
+metricsAddress: 0.0.0.0:9998
 
 # External authentication - DISABLED
 # Security model: Tailscale VPN provides network-level isolation
@@ -36,12 +39,12 @@ authInternalUsers:
 # Performance settings - optimized for 30fps streaming
 readTimeout: 10s
 writeTimeout: 10s
-readBufferCount: 2048  # Increased from 512 for better buffering at 30fps
+readBufferCount: 2048
 udpMaxPayloadSize: 1472
 
 # RTSP Server Configuration
 rtspDisable: false
-protocols: [tcp]  # TCP only for reliability over Tailscale
+protocols: [tcp]
 encryption: "no"
 rtspAddress: :8554
 rtspsAddress: :8555
@@ -79,17 +82,11 @@ paths:
     source: publisher
 
     # Run a command when a stream is ready (used to notify our orchestrator)
-    runOnReady: 'curl -X POST http://127.0.0.1:5000/stream/ready -H "Content-Type: application/json" -d "{\"stream\":\"$MTX_PATH\"}"'
+    runOnReady: 'curl -X POST http://127.0.0.1:5000/stream/ready -H "Content-Type: application/json" -d "{\"stream\":\"\"}"'
     runOnReadyRestart: false
 
     # Run a command when a stream is not ready anymore
-    runOnNotReady: 'curl -X POST http://127.0.0.1:5000/stream/stopped -H "Content-Type: application/json" -d "{\"stream\":\"$MTX_PATH\"}"'
+    runOnNotReady: 'curl -X POST http://127.0.0.1:5000/stream/stopped -H "Content-Type: application/json" -d "{\"stream\":\"\"}"'
 
     # Recording (disabled by default)
     record: false
-
-  # Example: Specific path configurations can be added here
-  # camera1:
-  #   source: publisher
-  #   record: yes
-  #   recordFormat: mp4
