@@ -26,7 +26,10 @@ services:
     volumes:
       - ./prod:/app:ro
       - ./prod/data:/app/data
+      - ./prod/src/config:/app/src/config      # Writable for generated mediamtx.yml
       - /opt/mediamtx:/opt/mediamtx:ro
+    tmpfs:
+      - /app/bin                               # Writable for mediamtx symlink
 
     # Production ports
     environment:
@@ -68,7 +71,10 @@ services:
     volumes:
       - ./dev:/app:ro
       - ./dev/data:/app/data
+      - ./dev/src/config:/app/src/config        # Writable for generated mediamtx.yml
       - /opt/mediamtx:/opt/mediamtx:ro
+    tmpfs:
+      - /app/bin                                # Writable for mediamtx symlink
 
     # Development ports (offset from production)
     environment:

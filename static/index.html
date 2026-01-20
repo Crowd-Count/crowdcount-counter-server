@@ -3,376 +3,156 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>CrowdCount Device Manager</title>
-
-    <!-- Global site styles -->
+    <title>CrowdCount Streams - PROD</title>
     <link rel="stylesheet" href="styles.css">
 </head>
-<body id="secondarypage">
-    <header>
-        <h1 id="primaryTitleBold">CrowdCount Device Manager</h1>
-        <p id="secondary">Manage your Raspberry Pi camera devices remotely</p>
-    </header>
+<body>
+    <div class="env-banner prod">PRODUCTION</div>
 
-    <main>
-        <div class="container">
+    <div class="app">
+        <header class="header">
+            <h1>CrowdCount</h1>
+            <p class="subtitle">Stream Viewer</p>
+        </header>
 
-            <div class="top-row">
-
-                <!-- Server info + controls -->
-                <section class="text-box">
-                    <div class="controls-row">
-                        <button class="btn btn-primary" onclick="refreshDevices()">Refresh devices</button>
-                        <div class="controls-row-right">
-                            Auto refresh in <span id="countdown">10</span>s
-                        </div>
-                    </div>
-
-                    <div class="server-info" id="serverInfo">
-                        <span>Loading server information...</span>
-                    </div>
-                </section>
-
-                <!-- Devices -->
-                <section class="text-box">
-                    <div id="devicesContainer">
-                        <div class="loading">Loading devices...</div>
-                    </div>
-                </section>
-
-            </div>
-        </div>
-    </main>
-
-    <!-- Config Modal -->
-    <div class="modal" id="configModal">
-        <div class="modal-content">
-            <div class="modal-header">
-                <h2>Update device configuration</h2>
-            </div>
-            <div class="modal-body">
-                <form id="configForm">
-                    <input type="hidden" id="configDeviceId">
-                    <div class="form-group">
-                        <label for="configWidth">Width (pixels)</label>
-                        <input type="number" id="configWidth" min="320" max="1920" step="1">
-                    </div>
-                    <div class="form-group">
-                        <label for="configHeight">Height (pixels)</label>
-                        <input type="number" id="configHeight" min="240" max="1080" step="1">
-                    </div>
-                    <div class="form-group">
-                        <label for="configFps">FPS (frames per second)</label>
-                        <input type="number" id="configFps" min="1" max="60" step="1">
-                    </div>
-                </form>
-            </div>
-            <div class="modal-footer">
-                <button class="btn btn-secondary" onclick="closeConfigModal()">Cancel</button>
-                <button class="btn btn-primary" onclick="saveConfig()">Save and restart</button>
-            </div>
-        </div>
-    </div>
-
-    <!-- Logs Modal -->
-    <div class="modal" id="logsModal">
-        <div class="modal-content">
-            <div class="modal-header">
-                <h2>Device logs - <span id="logsDeviceId"></span></h2>
-            </div>
-            <div class="modal-body">
-                <div class="logs-container" id="logsContent">
-                    Loading logs...
+        <main class="main">
+            <div class="status-bar">
+                <div class="server-info" id="serverInfo">
+                    <span class="loading-dot"></span> Connecting...
+                </div>
+                <div class="refresh-info">
+                    <button class="btn-icon" onclick="refreshStreams()" title="Refresh">
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M23 4v6h-6M1 20v-6h6M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15"/>
+                        </svg>
+                    </button>
+                    <span class="countdown-text">Auto refresh: <span id="countdown">10</span>s</span>
                 </div>
             </div>
-            <div class="modal-footer">
-                <button class="btn btn-primary" onclick="refreshLogs()">Refresh</button>
-                <button class="btn btn-secondary" onclick="closeLogsModal()">Close</button>
-            </div>
-        </div>
-    </div>
 
-    <!-- Password Modal -->
-    <div class="modal" id="passwordModal">
-        <div class="modal-content">
-            <div class="modal-header">
-                <h2>SSH Password Required</h2>
+            <div class="streams-container" id="streamsContainer">
+                <div class="loading-state">
+                    <div class="spinner"></div>
+                    <p>Loading streams...</p>
+                </div>
             </div>
-            <div class="modal-body">
-                <p>This device requires SSH password authentication.</p>
-                <p><strong>Device:</strong> <span id="passwordDeviceId"></span></p>
-                <form id="passwordForm" onsubmit="submitPassword(event)">
-                    <div class="form-group">
-                        <label for="sshPassword">SSH Password</label>
-                        <input type="password" id="sshPassword" required autocomplete="off">
-                    </div>
-                </form>
-            </div>
-            <div class="modal-footer">
-                <button class="btn btn-secondary" onclick="closePasswordModal()">Cancel</button>
-                <button class="btn btn-primary" onclick="submitPassword(event)">Submit</button>
-            </div>
-        </div>
+        </main>
+
+        <footer class="footer">
+            <p>CrowdCount Counter Server</p>
+        </footer>
     </div>
 
     <script>
-        let devices = [];
+        let streams = [];
         let refreshInterval;
         let countdownInterval;
         let countdown = 10;
-        let currentLogsDevice = null;
-        let pendingPasswordAction = null; // Stores the action to retry after password is provided
 
         document.addEventListener('DOMContentLoaded', () => {
             loadServerInfo();
-            loadDevices();
+            loadStreams();
             startAutoRefresh();
-
-            // Close modals when clicking background
-            document.querySelectorAll('.modal').forEach(modal => {
-                modal.addEventListener('click', (e) => {
-                    if (e.target === modal) {
-                        modal.classList.remove('active');
-                    }
-                });
-            });
         });
 
-        // Server info
         async function loadServerInfo() {
             try {
                 const response = await fetch('/api/server/info');
                 const data = await response.json();
                 document.getElementById('serverInfo').innerHTML = `
-                    <span><strong>Server IP:</strong> ${data.tailscale_ip}</span>
-                    <span><strong>RTSP port:</strong> ${data.rtsp_port}</span>
-                    <span><strong>Orchestrator:</strong> ${data.orchestrator_port}</span>
+                    <span class="info-item"><strong>IP:</strong> ${data.tailscale_ip}</span>
+                    <span class="info-item"><strong>RTSP:</strong> ${data.rtsp_port}</span>
+                    <span class="info-item"><strong>API:</strong> ${data.orchestrator_port}</span>
                 `;
             } catch (error) {
-                console.error('Error loading server info:', error);
-                document.getElementById('serverInfo').innerHTML =
-                    '<span>Failed to load server info</span>';
+                document.getElementById('serverInfo').innerHTML = '<span class="error">Failed to connect</span>';
             }
         }
 
-        // Devices
-        async function loadDevices() {
+        async function loadStreams() {
             try {
-                const response = await fetch('/api/devices');
-                devices = await response.json();
-                renderDevices();
+                const response = await fetch('/status');
+                const data = await response.json();
+                streams = data.active_streams || [];
+                renderStreams(data);
             } catch (error) {
-                console.error('Error loading devices:', error);
-                showNotification('Failed to load devices', 'error');
-                document.getElementById('devicesContainer').innerHTML =
-                    '<div class="loading">Could not load devices</div>';
+                document.getElementById('streamsContainer').innerHTML = `
+                    <div class="error-state">
+                        <p>Failed to load streams</p>
+                        <button class="btn btn-primary" onclick="loadStreams()">Retry</button>
+                    </div>
+                `;
             }
         }
 
-        function renderDevices() {
-            const container = document.getElementById('devicesContainer');
+        function renderStreams(statusData) {
+            const container = document.getElementById('streamsContainer');
 
-            if (!devices || devices.length === 0) {
+            if (!streams || streams.length === 0) {
                 container.innerHTML = `
                     <div class="empty-state">
-                        <h2>No devices registered yet</h2>
-                        <p>Devices will appear here once they start streaming</p>
+                        <svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                            <rect x="2" y="3" width="20" height="14" rx="2"/>
+                            <path d="M8 21h8M12 17v4"/>
+                        </svg>
+                        <h2>No Active Streams</h2>
+                        <p>Streams will appear here when cameras connect</p>
                     </div>
                 `;
                 return;
             }
 
             container.innerHTML = `
-                <div class="devices-grid">
-                    ${devices.map(device => renderDeviceCard(device)).join('')}
+                <div class="streams-grid">
+                    ${streams.map(streamName => renderStreamCard(streamName, statusData)).join('')}
                 </div>
             `;
         }
 
-        function renderDeviceCard(device) {
-            const isOnline = device.status === 'online';
-            const lastSeen = device.last_seen ? new Date(device.last_seen).toLocaleString() : 'Never';
-            const streamUrl = `rtsp://${device.tailscale_ip || 'unknown'}:8554/${device.stream_name}`;
+        function renderStreamCard(streamName, statusData) {
+            const deviceInfo = statusData.device_info?.[streamName] || {};
+            const deviceId = deviceInfo.device_id || streamName;
 
             return `
-                <div class="device-card">
-                    <div class="device-header">
-                        <div>
-                            <div class="device-name">${device.device_id}</div>
-                            <div class="device-stream">${device.stream_name}</div>
+                <div class="stream-card">
+                    <div class="stream-header">
+                        <div class="stream-icon">
+                            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M23 7l-7 5 7 5V7z"/>
+                                <rect x="1" y="5" width="15" height="14" rx="2"/>
+                            </svg>
                         </div>
-                        <span class="status-badge status-${isOnline ? 'online' : 'offline'}">
-                            ${isOnline ? 'Online' : 'Offline'}
-                        </span>
+                        <div class="stream-info">
+                            <h3 class="stream-name">${deviceId}</h3>
+                            <span class="stream-id">${streamName}</span>
+                        </div>
+                        <span class="status-dot active"></span>
                     </div>
-
-                    <div class="device-info">
-                        <div class="info-row">
-                            <span class="info-label">IP address</span>
-                            <span class="info-value">${device.tailscale_ip || 'Unknown'}</span>
-                        </div>
-                        <div class="info-row">
-                            <span class="info-label">Resolution</span>
-                            <span class="info-value">${device.width}x${device.height}</span>
-                        </div>
-                        <div class="info-row">
-                            <span class="info-label">FPS</span>
-                            <span class="info-value">${device.fps}</span>
-                        </div>
-                        <div class="info-row">
-                            <span class="info-label">Last seen</span>
-                            <span class="info-value">${lastSeen}</span>
-                        </div>
-                    </div>
-
-                    <div class="device-actions">
-                        <button class="btn btn-success" onclick="startDevice('${device.device_id}')">Start</button>
-                        <button class="btn btn-warning" onclick="restartDevice('${device.device_id}')">Restart</button>
-                        <button class="btn btn-danger" onclick="stopDevice('${device.device_id}')">Stop</button>
-                        <button class="btn btn-primary" onclick="openConfigModal('${device.device_id}', ${device.width}, ${device.height}, ${device.fps})">Config</button>
-                        <button class="btn btn-secondary" onclick="viewLogs('${device.device_id}')">Logs</button>
-                        <button class="btn btn-secondary" onclick="viewStream('${streamUrl}')">View stream</button>
-                    </div>
+                    <button class="btn btn-primary btn-block" onclick="viewStream('${streamName}')">
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <circle cx="12" cy="12" r="10"/>
+                            <polygon points="10,8 16,12 10,16" fill="currentColor"/>
+                        </svg>
+                        View Stream
+                    </button>
                 </div>
             `;
         }
 
-        // Device actions
-        async function startDevice(deviceId) {
-            showNotification(`Starting ${deviceId}...`, 'info');
-            const encoded = encodeURIComponent(deviceId);
-            await executeDeviceAction(
-                deviceId,
-                () => fetch(`/api/device/${encoded}/start`, { method: 'POST' }),
-                'started'
-            );
+        function viewStream(streamName) {
+            window.open(`/view/${streamName}`, '_blank', 'width=1280,height=800');
         }
 
-        async function restartDevice(deviceId) {
-            showNotification(`Restarting ${deviceId}...`, 'info');
-            const encoded = encodeURIComponent(deviceId);
-            await executeDeviceAction(
-                deviceId,
-                () => fetch(`/api/device/${encoded}/restart`, { method: 'POST' }),
-                'restarted'
-            );
-        }
-
-        async function stopDevice(deviceId) {
-            showNotification(`Stopping ${deviceId}...`, 'info');
-            const encoded = encodeURIComponent(deviceId);
-            await executeDeviceAction(
-                deviceId,
-                () => fetch(`/api/device/${encoded}/stop`, { method: 'POST' }),
-                'stopped'
-            );
-        }
-
-        // Config modal
-        function openConfigModal(deviceId, width, height, fps) {
-            document.getElementById('configDeviceId').value = deviceId;
-            document.getElementById('configWidth').value = width;
-            document.getElementById('configHeight').value = height;
-            document.getElementById('configFps').value = fps;
-            document.getElementById('configModal').classList.add('active');
-        }
-
-        function closeConfigModal() {
-            document.getElementById('configModal').classList.remove('active');
-        }
-
-        async function saveConfig() {
-            const deviceId = document.getElementById('configDeviceId').value;
-            const width = parseInt(document.getElementById('configWidth').value);
-            const height = parseInt(document.getElementById('configHeight').value);
-            const fps = parseInt(document.getElementById('configFps').value);
-
-            showNotification('Updating configuration...', 'info');
-
-            try {
-                const encoded = encodeURIComponent(deviceId);
-                const response = await fetch(`/api/device/${encoded}/config`, {
-                    method: 'PUT',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ width, height, fps })
-                });
-
-                const data = await response.json();
-
-                if (response.status === 401 && data.requires_password) {
-                    // Password required - prompt user and retry
-                    promptForPassword(deviceId, saveConfig);
-                } else if (response.ok) {
-                    showNotification('Configuration updated and device restarted', 'success');
-                    closeConfigModal();
-                    setTimeout(loadDevices, 2000);
-                } else {
-                    showNotification(`Failed to update config: ${data.error}`, 'error');
-                }
-            } catch (error) {
-                showNotification(`Error: ${error.message}`, 'error');
-            }
-        }
-
-        // Logs modal
-        async function viewLogs(deviceId) {
-            currentLogsDevice = deviceId;
-            document.getElementById('logsDeviceId').textContent = deviceId;
-            document.getElementById('logsModal').classList.add('active');
-            await refreshLogs();
-        }
-
-        async function refreshLogs() {
-            if (!currentLogsDevice) return;
-
-            try {
-                document.getElementById('logsContent').textContent = 'Loading logs...';
-                const encoded = encodeURIComponent(currentLogsDevice);
-                const response = await fetch(`/api/device/${encoded}/logs?lines=100`);
-                const data = await response.json();
-
-                if (response.status === 401 && data.requires_password) {
-                    // Password required - prompt user and retry
-                    closeLogsModal();
-                    promptForPassword(currentLogsDevice, () => viewLogs(currentLogsDevice));
-                } else if (response.ok) {
-                    document.getElementById('logsContent').textContent =
-                        data.logs || 'No logs available';
-                } else {
-                    document.getElementById('logsContent').textContent =
-                        `Error: ${data.error}`;
-                }
-            } catch (error) {
-                document.getElementById('logsContent').textContent =
-                    `Error: ${error.message}`;
-            }
-        }
-
-        function closeLogsModal() {
-            document.getElementById('logsModal').classList.remove('active');
-            currentLogsDevice = null;
-        }
-
-        // Stream
-        function viewStream(streamUrl) {
-            const streamName = streamUrl.split('/').pop();
-            window.open(`/view/${streamName}`, '_blank', 'width=1200,height=800');
-            showNotification(`Opening stream in new window...`, 'info');
-        }
-
-        // Refresh helpers
-        function refreshDevices() {
-            loadDevices();
+        function refreshStreams() {
+            loadStreams();
             resetCountdown();
         }
 
         function startAutoRefresh() {
-            refreshInterval = setInterval(loadDevices, 10000);
+            refreshInterval = setInterval(loadStreams, 10000);
             countdownInterval = setInterval(() => {
                 countdown -= 1;
-                if (countdown <= 0) {
-                    countdown = 10;
-                }
+                if (countdown <= 0) countdown = 10;
                 const el = document.getElementById('countdown');
                 if (el) el.textContent = countdown;
             }, 1000);
@@ -382,116 +162,6 @@
             countdown = 10;
             const el = document.getElementById('countdown');
             if (el) el.textContent = countdown;
-        }
-
-        // Notifications
-        function showNotification(message, type = 'info') {
-            const notification = document.createElement('div');
-            notification.className = `notification ${type}`;
-            notification.textContent = message;
-            document.body.appendChild(notification);
-
-            setTimeout(() => {
-                notification.remove();
-            }, 4000);
-        }
-
-        // Password Modal
-        function promptForPassword(deviceId, retryAction) {
-            pendingPasswordAction = retryAction;
-            document.getElementById('passwordDeviceId').textContent = deviceId;
-            document.getElementById('sshPassword').value = '';
-            document.getElementById('passwordModal').classList.add('active');
-            // Focus password input after modal opens
-            setTimeout(() => {
-                document.getElementById('sshPassword').focus();
-            }, 100);
-        }
-
-        function closePasswordModal() {
-            document.getElementById('passwordModal').classList.remove('active');
-            document.getElementById('sshPassword').value = '';
-            pendingPasswordAction = null;
-        }
-
-        async function submitPassword(event) {
-            if (event) event.preventDefault();
-
-            const deviceId = document.getElementById('passwordDeviceId').textContent;
-            const password = document.getElementById('sshPassword').value;
-
-            if (!password) {
-                showNotification('Password cannot be empty', 'error');
-                return;
-            }
-
-            try {
-                // Store password on server - URL encode the device_id
-                const encodedDeviceId = encodeURIComponent(deviceId);
-                const response = await fetch(`/api/device/${encodedDeviceId}/ssh/password`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ password })
-                });
-
-                console.log('Password submission response:', response.status, response.statusText);
-
-                if (response.ok) {
-                    showNotification('Password stored successfully', 'success');
-                    closePasswordModal();
-
-                    // Retry the pending action
-                    if (pendingPasswordAction) {
-                        pendingPasswordAction();
-                        pendingPasswordAction = null;
-                    }
-                } else {
-                    // Try to parse JSON, but handle non-JSON responses
-                    const text = await response.text();
-                    console.log('Error response body:', text);
-                    try {
-                        const data = JSON.parse(text);
-                        showNotification(`Failed to store password: ${data.error}`, 'error');
-                    } catch (e) {
-                        showNotification(`Failed to store password: ${response.status} ${response.statusText}`, 'error');
-                    }
-                }
-            } catch (error) {
-                console.error('Password submission error:', error);
-                showNotification(`Error: ${error.message}`, 'error');
-            }
-        }
-
-        // Helper function to handle API calls with automatic password prompting
-        async function executeDeviceAction(deviceId, actionFn, actionName) {
-            try {
-                const response = await actionFn();
-                const data = await response.json();
-
-                // Debug logging
-                console.log('Device action response:', {
-                    deviceId,
-                    actionName,
-                    status: response.status,
-                    data
-                });
-
-                if (response.status === 401 && data.requires_password) {
-                    console.log('→ Password required, showing prompt');
-                    // Password required - prompt user
-                    promptForPassword(deviceId, () => executeDeviceAction(deviceId, actionFn, actionName));
-                } else if (response.ok) {
-                    console.log('→ Action successful');
-                    showNotification(`${deviceId} ${actionName}`, 'success');
-                    setTimeout(loadDevices, 2000);
-                } else {
-                    console.log('→ Action failed:', data.error);
-                    showNotification(`Failed to ${actionName} ${deviceId}: ${data.error}`, 'error');
-                }
-            } catch (error) {
-                console.error('→ Exception:', error);
-                showNotification(`Error: ${error.message}`, 'error');
-            }
         }
     </script>
 </body>
