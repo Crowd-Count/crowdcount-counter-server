@@ -1,0 +1,17 @@
+# Git worktrees (code is in separate branches)
+prod/
+dev/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
