@@ -22,6 +22,15 @@ services:
     container_name: crowdcount-prod
     restart: unless-stopped
 
+    # GPU Configuration - NVIDIA CUDA support
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['1']
+              capabilities: [gpu]
+
     # Mount production code (prod branch worktree)
     volumes:
       - ./prod:/app:ro
@@ -66,6 +75,15 @@ services:
       dockerfile: Dockerfile
     container_name: crowdcount-dev
     restart: unless-stopped
+
+    # GPU Configuration - NVIDIA CUDA support
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['0']
+              capabilities: [gpu]
 
     # Mount development code (dev branch worktree)
     volumes:
