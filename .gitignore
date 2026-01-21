@@ -1,20 +1,6 @@
-# Binary files
-bin/
-!bin/.gitkeep
-
-# Runtime data
-data/
-!data/.gitkeep
-
 # Git worktrees (code is in separate branches)
 prod/
 dev/
-
-# Database files
-*.db
-*.db-journal
-*.db-wal
-*.db-shm
 
 # Python
 __pycache__/
@@ -22,10 +8,25 @@ __pycache__/
 *$py.class
 *.so
 .Python
-env/
+*.egg-info/
+.eggs/
+*.egg
+
+# Virtual environments
 venv/
-ENV/
-.venv
+.venv/
+env/
+
+# Runtime directories (keep structure via .gitkeep)
+bin/*
+!bin/.gitkeep
+data/*
+!data/.gitkeep
+src/
+
+# OS
+.DS_Store
+Thumbs.db
 
 # IDE
 .vscode/
@@ -34,13 +35,5 @@ ENV/
 *.swo
 *~
 
-# OS
-.DS_Store
-Thumbs.db
-
 # Logs
 *.log
-
-# Temporary files
-*.tmp
-temp/

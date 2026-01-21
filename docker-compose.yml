@@ -1,32 +1,42 @@
 # CrowdCount Counter Server - Docker Compose
 #
 # Runs two isolated server instances:
-# - Production: Uses code from prod/ (prod branch worktree)
-# - Development: Uses code from dev/ (dev branch worktree)
+# - Production: Uses code from code/prod/ (main branch)
+# - Development: Uses code from code/dev/ (dev branch)
 #
 # Usage:
-#   docker-compose up -d              # Start both servers
-#   docker-compose up -d production   # Start only production
-#   docker-compose up -d development  # Start only development
-#   docker-compose logs -f            # View logs
-#   docker-compose restart production # Restart production after code changes
+#   docker-compose up -d        # Start both servers
+#   docker-compose up -d prod   # Start only production
+#   docker-compose up -d dev    # Start only development
+#   docker-compose logs -f      # View logs
+#   docker-compose restart prod # Restart production after code changes
 
 services:
   # =============================================================================
   # PRODUCTION SERVER
   # =============================================================================
-  production:
+  prod:
     build:
       context: .
       dockerfile: Dockerfile
     container_name: crowdcount-prod
     restart: unless-stopped
 
+    # GPU access (uses GPU 1)
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['1']
+              capabilities: [gpu]
+
     # Mount production code (prod branch worktree)
     volumes:
       - ./prod:/app:ro
       - ./prod/data:/app/data
-      - /opt/mediamtx:/opt/mediamtx:ro
+      - ./prod/src/config:/app/src/config      # Writable for generated mediamtx.yml
+      - ./prod/bin:/app/bin                    # Writable for mediamtx symlink
 
     # Production ports
     environment:
@@ -41,6 +51,7 @@ services:
       - RTCP_PORT=8001
       - RTMP_PORT=1935
       - ENV=production
+      - TAILSCALE_IP=100.72.64.80
 
     ports:
       - "5000:5000"     # Flask API
@@ -57,18 +68,28 @@ services:
   # =============================================================================
   # DEVELOPMENT SERVER
   # =============================================================================
-  development:
+  dev:
     build:
       context: .
       dockerfile: Dockerfile
     container_name: crowdcount-dev
     restart: unless-stopped
 
+    # GPU access (uses GPU 0)
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['0']
+              capabilities: [gpu]
+
     # Mount development code (dev branch worktree)
     volumes:
       - ./dev:/app:ro
       - ./dev/data:/app/data
-      - /opt/mediamtx:/opt/mediamtx:ro
+      - ./dev/src/config:/app/src/config        # Writable for generated mediamtx.yml
+      - ./dev/bin:/app/bin                      # Writable for mediamtx symlink
 
     # Development ports (offset from production)
     environment:
@@ -83,6 +104,7 @@ services:
       - RTCP_PORT=8001
       - RTMP_PORT=1935
       - ENV=development
+      - TAILSCALE_IP=100.72.64.80
 
     # Development ports (offset by 1 from production on host)
     ports:
