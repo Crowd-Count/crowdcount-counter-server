@@ -6,6 +6,8 @@ ultralytics>=8.0.0  # YOLO for people counter processor
 lap>=0.5.12  # ByteTrack tracking dependency
 
 # Deep ReID for person re-identification
+gdown>=4.7.0  # Required by torchreid for model downloads
+tensorboard>=2.0.0  # Required by torchreid
 torchreid>=0.2.5  # OSNet for robust appearance matching during occlusion
 
 # Web Framework
