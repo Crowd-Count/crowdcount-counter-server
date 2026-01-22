@@ -39,12 +39,12 @@ ORCHESTRATOR_HOST = "0.0.0.0"
 
 # Stream processor settings
 PROCESSOR_TYPE = "subprocess"  # Options: "subprocess", "docker" (docker not implemented yet)
-MAX_PROCESSORS = 10  # Maximum number of concurrent stream processors
+MAX_PROCESSORS = 20  # Maximum number of concurrent stream processors
 PROCESSOR_RESTART_DELAY = 5  # Seconds to wait before restarting a failed processor
 
 # Stream settings
-STREAM_RECONNECT_TIMEOUT = 30  # Seconds to wait for stream reconnection before stopping processor
-STREAM_HEALTH_CHECK_INTERVAL = 10  # Seconds between stream health checks
+STREAM_RECONNECT_TIMEOUT = 45  # Seconds to wait for stream reconnection before stopping processor (increased for stability)
+STREAM_HEALTH_CHECK_INTERVAL = 15  # Seconds between stream health checks (increased to reduce overhead)
 
 # Logging
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
@@ -71,6 +71,15 @@ VIDEO_HEIGHT = 480          # Video height in pixels
 # At 15fps: 45 frames = 3 seconds | At 30fps: 90 frames = 3 seconds
 TRACK_BUFFER_SECONDS = 3    # How many seconds to keep lost tracks
 TRACK_BUFFER_FRAMES = VIDEO_FPS * TRACK_BUFFER_SECONDS
+
+# =============================================================================
+# FRAME BUFFER SETTINGS (Jitter smoothing for network streams)
+# =============================================================================
+# Enable frame buffering to smooth out network jitter from remote devices
+# When enabled, frames are buffered for 2-3 seconds before processing to ensure
+# steady FPS output regardless of network timing variations
+FRAME_BUFFER_ENABLED = os.getenv("FRAME_BUFFER_ENABLED", "false").lower() == "true"
+FRAME_BUFFER_SECONDS = float(os.getenv("FRAME_BUFFER_SECONDS", "2.5"))  # Buffer duration
 
 # =============================================================================
 
