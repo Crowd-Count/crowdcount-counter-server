@@ -12,9 +12,11 @@ import numpy as np
 
 # Import video settings from central config
 try:
-    from config.server_config import VIDEO_FPS
+    from config.server_config import VIDEO_FPS, FRAME_BUFFER_ENABLED, FRAME_BUFFER_SECONDS
 except ImportError:
     VIDEO_FPS = 15  # Fallback default
+    FRAME_BUFFER_ENABLED = False
+    FRAME_BUFFER_SECONDS = 1.0
 
 
 class BaseStreamProcessor(ABC):
@@ -67,7 +69,12 @@ class BaseStreamProcessor(ABC):
         self.corrupted_frame_count = 0
         self.max_corrupted_before_warn = 10
 
-    def connect_stream(self, max_retries: int = 10, initial_delay: float = 0.5) -> bool:
+        # Frame buffer settings (jitter smoothing for network streams)
+        self.use_frame_buffer = FRAME_BUFFER_ENABLED
+        self.frame_buffer_seconds = FRAME_BUFFER_SECONDS
+        self._jitter_buffer = None  # FrameJitterBuffer instance when enabled
+
+    def connect_stream(self, max_retries: int = 15, initial_delay: float = 1.0) -> bool:
         """
         Connect to the RTSP stream with retry logic
 
@@ -75,8 +82,8 @@ class BaseStreamProcessor(ABC):
         so we retry with exponential backoff.
 
         Args:
-            max_retries: Maximum number of connection attempts
-            initial_delay: Initial delay between retries in seconds
+            max_retries: Maximum number of connection attempts (increased from 10 to 15)
+            initial_delay: Initial delay between retries in seconds (increased from 0.5 to 1.0)
 
         Returns:
             True if connection successful, False otherwise
@@ -88,16 +95,16 @@ class BaseStreamProcessor(ABC):
                 self.logger.info(f"Connecting to stream (attempt {attempt}/{max_retries}): {self.rtsp_url}")
 
                 # Set FFmpeg options for robust RTSP streaming before creating VideoCapture
-                # These options help prevent decode errors especially in low-light conditions
+                # These options balance low latency with frame stability
                 import os
                 os.environ['OPENCV_FFMPEG_CAPTURE_OPTIONS'] = '|'.join([
                     'rtsp_transport;tcp',         # Use TCP instead of UDP (more reliable)
                     'stimeout;5000000',           # Socket timeout 5 seconds (in microseconds)
                     'max_delay;500000',           # Max demux delay 500ms
-                    'reorder_queue_size;0',       # Disable packet reordering (lower latency)
-                    'fflags;nobuffer+discardcorrupt+igndts',  # No buffering + discard corrupt + ignore DTS
+                    # Removed: reorder_queue_size;0 - was causing frame drops from out-of-order packets
+                    'fflags;+genpts',             # Generate PTS (removed nobuffer/discardcorrupt - were causing frame drops)
                     'flags;low_delay',            # Enable low delay mode
-                    'err_detect;ignore_err',      # Ignore decoding errors (macroblock errors)
+                    'err_detect;ignore_err',      # Ignore minor decoding errors (macroblock errors)
                     'analyzeduration;1000000',    # Reduce stream analysis time to 1s
                     'probesize;1000000',          # Reduce probe size to 1MB
                 ])
@@ -105,9 +112,10 @@ class BaseStreamProcessor(ABC):
                 # Create VideoCapture with FFmpeg backend
                 self.cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_FFMPEG)
 
-                # Set buffer size to 1 for lowest latency - always get latest frame
-                # Track interpolation compensates for any dropped frames
-                self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                # Set small buffer for jitter compensation (was 1, too aggressive)
+                # 3 frames = 200ms at 15fps - enough to handle network jitter without
+                # causing significant latency or frame drops during processing spikes
+                self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 3)
 
                 # Request specific FPS (helps OpenCV's frame timing)
                 self.cap.set(cv2.CAP_PROP_FPS, VIDEO_FPS)
@@ -143,6 +151,25 @@ class BaseStreamProcessor(ABC):
                 self.logger.info(f"  Resolution: {frame.shape[1]}x{frame.shape[0]}")
                 self.logger.info(f"  Reported FPS: {actual_fps:.1f}")
                 self.logger.info(f"  Buffer size: {self.cap.get(cv2.CAP_PROP_BUFFERSIZE)}")
+
+                # Initialize jitter buffer if enabled (smooths network timing variations)
+                if self.use_frame_buffer:
+                    from .frame_buffer import FrameJitterBuffer
+
+                    self._jitter_buffer = FrameJitterBuffer(
+                        cap=self.cap,
+                        target_fps=VIDEO_FPS,
+                        buffer_seconds=self.frame_buffer_seconds,
+                        logger=self.logger
+                    )
+
+                    if not self._jitter_buffer.start(prefill_timeout=15.0):
+                        self.logger.error("Failed to prefill jitter buffer")
+                        self._jitter_buffer = None
+                        return False
+
+                    self.logger.info(f"  Jitter buffer enabled: {self.frame_buffer_seconds}s buffer")
+
                 return True
 
             except Exception as e:
@@ -164,6 +191,11 @@ class BaseStreamProcessor(ABC):
 
     def disconnect_stream(self):
         """Disconnect from the RTSP stream"""
+        # Stop jitter buffer first if enabled
+        if self._jitter_buffer is not None:
+            self._jitter_buffer.stop()
+            self._jitter_buffer = None
+
         if self.cap:
             self.cap.release()
             self.cap = None
@@ -327,17 +359,30 @@ class BaseStreamProcessor(ABC):
             print(f"[{self.stream_name}] ERROR in on_start: {e}", flush=True)
             self.logger.error(f"Error in on_start: {e}")
 
+        # Log frame buffer status
+        if self._jitter_buffer is not None:
+            print(f"[{self.stream_name}] FRAME BUFFER ACTIVE: {self.frame_buffer_seconds}s buffer, targeting {VIDEO_FPS} FPS", flush=True)
+        else:
+            print(f"[{self.stream_name}] Frame buffer DISABLED (direct stream mode)", flush=True)
+
         print(f"[{self.stream_name}] Processor ready! Starting frame processing loop...", flush=True)
         # Main processing loop
         frame_number = 0
         consecutive_failures = 0
-        max_consecutive_failures = 30
+        # Increased from 30 to 90 - at 15fps, 90 = 6 seconds tolerance
+        # This allows for network hiccups and stream initialization delays
+        max_consecutive_failures = 90
 
         try:
             while self.running:
-                # Wrap cap.read() to catch any FFmpeg decode exceptions
+                # Read frame from jitter buffer or directly from capture
                 try:
-                    ret, frame = self.cap.read()
+                    if self._jitter_buffer is not None:
+                        # Use jitter buffer for steady FPS emission
+                        ret, frame = self._jitter_buffer.read()
+                    else:
+                        # Direct read from VideoCapture
+                        ret, frame = self.cap.read()
                 except Exception as e:
                     # FFmpeg decode error (e.g., macroblock corruption)
                     consecutive_failures += 1
@@ -412,9 +457,18 @@ class BaseStreamProcessor(ABC):
                     interval_time = timestamp - self.last_log_time
                     interval_fps = self.frames_since_log / interval_time if interval_time > 0 else 0
 
-                    self.logger.info(f"Processed {self.frames_processed} frames | "
-                                   f"Overall: {overall_fps:.1f} fps | "
-                                   f"Last 5s: {interval_fps:.1f} fps")
+                    log_msg = (f"Processed {self.frames_processed} frames | "
+                               f"Overall: {overall_fps:.1f} fps | "
+                               f"Last 5s: {interval_fps:.1f} fps")
+
+                    # Add jitter buffer stats if enabled
+                    if self._jitter_buffer is not None:
+                        level, max_level = self._jitter_buffer.get_buffer_level()
+                        buf_stats = self._jitter_buffer.stats
+                        log_msg += (f" | Buffer: {level}/{max_level} "
+                                   f"(under:{buf_stats['underruns']} over:{buf_stats['overflows']})")
+
+                    self.logger.info(log_msg)
 
                     self.last_log_time = timestamp
                     self.frames_since_log = 0

@@ -73,6 +73,15 @@ TRACK_BUFFER_SECONDS = 3    # How many seconds to keep lost tracks
 TRACK_BUFFER_FRAMES = VIDEO_FPS * TRACK_BUFFER_SECONDS
 
 # =============================================================================
+# FRAME BUFFER SETTINGS (Jitter smoothing for network streams)
+# =============================================================================
+# Enable frame buffering to smooth out network jitter from remote devices
+# When enabled, frames are buffered before processing to ensure steady FPS
+# output regardless of network timing variations
+FRAME_BUFFER_ENABLED = os.getenv("FRAME_BUFFER_ENABLED", "false").lower() == "true"
+FRAME_BUFFER_SECONDS = float(os.getenv("FRAME_BUFFER_SECONDS", "1.0"))  # Buffer duration (reduced from 2.5)
+
+# =============================================================================
 
 # Create directories if they don't exist
 DATA_DIR.mkdir(exist_ok=True)
