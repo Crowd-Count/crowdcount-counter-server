@@ -39,12 +39,12 @@ ORCHESTRATOR_HOST = "0.0.0.0"
 
 # Stream processor settings
 PROCESSOR_TYPE = "subprocess"  # Options: "subprocess", "docker" (docker not implemented yet)
-MAX_PROCESSORS = 10  # Maximum number of concurrent stream processors
+MAX_PROCESSORS = 20  # Maximum number of concurrent stream processors
 PROCESSOR_RESTART_DELAY = 5  # Seconds to wait before restarting a failed processor
 
 # Stream settings
-STREAM_RECONNECT_TIMEOUT = 30  # Seconds to wait for stream reconnection before stopping processor
-STREAM_HEALTH_CHECK_INTERVAL = 10  # Seconds between stream health checks
+STREAM_RECONNECT_TIMEOUT = 45  # Seconds to wait for stream reconnection before stopping processor (increased for stability)
+STREAM_HEALTH_CHECK_INTERVAL = 15  # Seconds between stream health checks (increased to reduce overhead)
 
 # Logging
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
