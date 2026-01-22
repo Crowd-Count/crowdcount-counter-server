@@ -140,7 +140,7 @@ class MediaMTXManager:
                 # Process is running, try to connect to API port (even if API doesn't respond correctly)
                 try:
                     # Just try to connect to the port, don't care about the response
-                    response = requests.get(f"{MEDIAMTX_API_URL}/", timeout=1)
+                    response = requests.get(f"{MEDIAMTX_API_URL}/", timeout=3)
                     # If we get any response (even 404), the server is up
                     return True
                 except requests.exceptions.ConnectionError:
@@ -172,7 +172,7 @@ class MediaMTXManager:
 
         # Check if API port is responding (accept any response, even 404)
         try:
-            response = requests.get(f"{MEDIAMTX_API_URL}/", timeout=2)
+            response = requests.get(f"{MEDIAMTX_API_URL}/", timeout=5)
             # If we get any response (even 404), the server is up
             return True
         except requests.exceptions.ConnectionError:
@@ -190,13 +190,13 @@ class MediaMTXManager:
             List of path dictionaries
         """
         try:
-            response = requests.get(f"{MEDIAMTX_API_URL}/v3/paths/list", timeout=2)
+            response = requests.get(f"{MEDIAMTX_API_URL}/v3/paths/list", timeout=5)
             if response.status_code == 200:
                 data = response.json()
                 return data.get('items', [])
             return []
         except requests.exceptions.RequestException as e:
-            self.logger.error(f"Error getting paths: {e}")
+            self.logger.warning(f"Error getting paths: {e}")
             return []
 
     def get_active_streams(self) -> List[str]:
@@ -227,12 +227,12 @@ class MediaMTXManager:
             Dictionary with stream info, or None if not found
         """
         try:
-            response = requests.get(f"{MEDIAMTX_API_URL}/v3/paths/get/{stream_name}", timeout=2)
+            response = requests.get(f"{MEDIAMTX_API_URL}/v3/paths/get/{stream_name}", timeout=5)
             if response.status_code == 200:
                 return response.json()
             return None
         except requests.exceptions.RequestException as e:
-            self.logger.error(f"Error getting stream info for {stream_name}: {e}")
+            self.logger.warning(f"Error getting stream info for {stream_name}: {e}")
             return None
 
 

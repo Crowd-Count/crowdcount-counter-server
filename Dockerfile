@@ -22,6 +22,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
     python3-venv \
     python3-pip \
+    python3-dev \
     # OpenCV dependencies
     libgl1 \
     libglib2.0-0 \
@@ -54,9 +55,10 @@ RUN mkdir -p /opt/mediamtx && \
 COPY requirements.txt /tmp/requirements.txt
 
 # Install PyTorch nightly with CUDA 12.8 support (for RTX 50 series Blackwell sm_120)
-# Install Cython first so lap package compiles with fast Cython evaluation
+# Install Cython and numpy first, then torchreid from source for fast Cython evaluation
 RUN pip install --no-cache-dir --break-system-packages --pre torch torchvision --index-url https://download.pytorch.org/whl/nightly/cu128 \
-    && pip install --no-cache-dir --break-system-packages cython \
+    && pip install --no-cache-dir --break-system-packages cython numpy \
+    && pip install --no-cache-dir --break-system-packages --no-binary torchreid torchreid \
     && pip install --no-cache-dir --break-system-packages -r /tmp/requirements.txt
 
 # Copy entrypoint script
