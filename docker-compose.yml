@@ -54,7 +54,7 @@ services:
       - TAILSCALE_IP=100.72.64.80
       # Frame buffer for jitter smoothing (stabilizes network streams to steady 15 FPS)
       - FRAME_BUFFER_ENABLED=true
-      - FRAME_BUFFER_SECONDS=2.5
+      - FRAME_BUFFER_SECONDS=1.0
 
     ports:
       - "5000:5000"     # Flask API
@@ -110,7 +110,7 @@ services:
       - TAILSCALE_IP=100.72.64.80
       # Frame buffer for jitter smoothing (stabilizes network streams to steady 15 FPS)
       - FRAME_BUFFER_ENABLED=true
-      - FRAME_BUFFER_SECONDS=2.5
+      - FRAME_BUFFER_SECONDS=1.0
 
     # Development ports (offset by 1 from production on host)
     ports:
