@@ -5,11 +5,11 @@ tracker_type: bytetrack
 
 # Detection thresholds
 track_high_thresh: 0.25    # High confidence threshold for first association (lowered for groups)
-track_low_thresh: 0.1      # Low confidence threshold for second association (catch occluded people)
-new_track_thresh: 0.3      # Threshold for creating new tracks
+track_low_thresh: 0.15     # Low confidence threshold for second association (raised from 0.1 to reduce night noise)
+new_track_thresh: 0.4      # Threshold for creating new tracks (raised from 0.3 to filter night false detections)
 
 # Track buffer and matching
-track_buffer: 45           # Frames to keep lost tracks (~3 sec at 15fps). Formula: FPS * 3 seconds
+track_buffer: 22           # Frames to keep lost tracks (~1.5 sec at 15fps). Reduced from 45 to let false tracks die faster
 match_thresh: 0.75         # IoU threshold for matching (relaxed for reacquisition through doorway)
 
 # Motion model (Kalman filter)

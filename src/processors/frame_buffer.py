@@ -46,7 +46,7 @@ class FrameJitterBuffer:
 
     Usage:
         cap = cv2.VideoCapture(rtsp_url)
-        buffer = FrameJitterBuffer(cap, target_fps=15, buffer_seconds=1.0)
+        buffer = FrameJitterBuffer(cap, target_fps=15, buffer_seconds=2.5)
         buffer.start()
 
         while running:
@@ -57,7 +57,7 @@ class FrameJitterBuffer:
         buffer.stop()
     """
 
-    DEFAULT_BUFFER_SECONDS = 1.0  # Reduced from 2.5 for lower latency
+    DEFAULT_BUFFER_SECONDS = 2.5
     DEFAULT_TARGET_FPS = VIDEO_FPS
     MIN_PREFILL_RATIO = 0.5  # Wait for 50% buffer fill before starting emission
 
@@ -74,7 +74,7 @@ class FrameJitterBuffer:
         Args:
             cap: OpenCV VideoCapture object connected to the stream
             target_fps: Target output frame rate (default: VIDEO_FPS from config)
-            buffer_seconds: How many seconds of frames to buffer (default: 1.0)
+            buffer_seconds: How many seconds of frames to buffer (default: 2.5)
             logger: Optional logger instance
         """
         self.cap = cap

@@ -469,6 +469,7 @@ class StreamOrchestrator:
                         --accent: #3b82f6;
                         --accent-hover: #2563eb;
                         --success: #22c55e;
+                        --warning: #f59e0b;
                         --border: #2a2a2a;
                     }
                     * { margin: 0; padding: 0; box-sizing: border-box; }
