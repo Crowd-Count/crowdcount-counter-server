@@ -82,11 +82,12 @@ paths:
     source: publisher
 
     # Run a command when a stream is ready (used to notify our orchestrator)
-    runOnReady: 'curl -X POST http://127.0.0.1:5000/stream/ready -H "Content-Type: application/json" -d "{\"stream\":\"\"}"'
+    # $MTX_PATH is substituted by MediaMTX with the actual stream name
+    runOnReady: 'curl -X POST http://127.0.0.1:5000/stream/ready -H "Content-Type: application/json" -d "{\"stream\":\"$MTX_PATH\"}"'
     runOnReadyRestart: false
 
     # Run a command when a stream is not ready anymore
-    runOnNotReady: 'curl -X POST http://127.0.0.1:5000/stream/stopped -H "Content-Type: application/json" -d "{\"stream\":\"\"}"'
+    runOnNotReady: 'curl -X POST http://127.0.0.1:5000/stream/stopped -H "Content-Type: application/json" -d "{\"stream\":\"$MTX_PATH\"}"'
 
     # Recording (disabled by default)
     record: false
