@@ -67,10 +67,10 @@ VIDEO_FPS = 15              # Frames per second (was 30)
 VIDEO_WIDTH = 640           # Video width in pixels
 VIDEO_HEIGHT = 480          # Video height in pixels
 
-# ByteTrack timing (track_buffer should be ~3 seconds worth of frames)
-# At 15fps: 45 frames = 3 seconds | At 30fps: 90 frames = 3 seconds
-TRACK_BUFFER_SECONDS = 3    # How many seconds to keep lost tracks
-TRACK_BUFFER_FRAMES = VIDEO_FPS * TRACK_BUFFER_SECONDS
+# ByteTrack timing (track_buffer should be ~1.5 seconds worth of frames)
+# At 15fps: 22 frames = 1.5 seconds | At 30fps: 45 frames = 1.5 seconds
+TRACK_BUFFER_SECONDS = 1.5    # How many seconds to keep lost tracks
+TRACK_BUFFER_FRAMES = int(VIDEO_FPS * TRACK_BUFFER_SECONDS)
 
 # =============================================================================
 # FRAME BUFFER SETTINGS (Jitter smoothing for network streams)
