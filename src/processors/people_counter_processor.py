@@ -604,7 +604,7 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             'approach_zone': 0.15,      # 15% approach zone on each side
             'min_path_length': 50,      # Minimum pixels traveled
             'max_tracking_distance': 100,  # TUNED: Reduced from 120 for tighter matching
-            'tracker_timeout': 3.0,     # TUNED: Increased from 2.0 for slow-moving groups
+            'tracker_timeout': 1.5,     # TUNED: Reduced from 3.0 to let false tracks expire faster
             'yolo_conf_threshold': 0.25,  # TUNED: Balanced - catches people but filters noise
             'yolo_iou_threshold': 0.3,   # TUNED: Lowered from 0.45 to separate overlapping people
             'min_crossing_interval': 0.5,  # TUNED: Increased from 0.3 to prevent double counts
