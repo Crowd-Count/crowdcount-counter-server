@@ -38,6 +38,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     # Build tools (for some Python packages)
     gcc \
     g++ \
+    git \
     # envsubst for template substitution
     gettext-base \
     && rm -rf /var/lib/apt/lists/* \
@@ -55,10 +56,14 @@ RUN mkdir -p /opt/mediamtx && \
 COPY requirements.txt /tmp/requirements.txt
 
 # Install PyTorch nightly with CUDA 12.8 support (for RTX 50 series Blackwell sm_120)
-# Install Cython and numpy first, then torchreid from source for fast Cython evaluation
+# Then install ALL torchreid dependencies before torchreid itself
+# (torchreid's setup.py imports these modules during installation)
 RUN pip install --no-cache-dir --break-system-packages --pre torch torchvision --index-url https://download.pytorch.org/whl/nightly/cu128 \
-    && pip install --no-cache-dir --break-system-packages cython numpy \
-    && pip install --no-cache-dir --break-system-packages --no-binary torchreid torchreid \
+    && pip install --no-cache-dir --break-system-packages \
+        Cython numpy scipy \
+        opencv-python-headless Pillow \
+        h5py six yacs gdown imageio chardet matplotlib tensorboard future \
+    && pip install --no-cache-dir --break-system-packages git+https://github.com/KaiyangZhou/deep-person-reid.git \
     && pip install --no-cache-dir --break-system-packages -r /tmp/requirements.txt
 
 # Copy entrypoint script
