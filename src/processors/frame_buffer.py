@@ -60,6 +60,7 @@ class FrameJitterBuffer:
     DEFAULT_BUFFER_SECONDS = 2.5
     DEFAULT_TARGET_FPS = VIDEO_FPS
     MIN_PREFILL_RATIO = 0.5  # Wait for 50% buffer fill before starting emission
+    MAX_DUPLICATE_SECONDS = 5.0  # Signal stream failure after 5s of frame duplication
 
     def __init__(
         self,
@@ -97,6 +98,9 @@ class FrameJitterBuffer:
 
         # Last valid frame for underrun handling
         self._last_valid_frame: Optional[np.ndarray] = None
+
+        # Track when duplication started (for stale stream detection)
+        self._duplicate_start_time: Optional[float] = None
 
         # Reader thread state
         self._reader_thread: Optional[threading.Thread] = None
@@ -221,11 +225,26 @@ class FrameJitterBuffer:
             if len(self._buffer) > 0:
                 buffered = self._buffer.popleft()
                 self.stats['frames_emitted'] += 1
+                self._duplicate_start_time = None  # Reset duplication timer on real frame
                 return True, buffered.frame
             else:
-                # Underrun - duplicate last valid frame
+                # Underrun - buffer empty, must duplicate last frame
                 self.stats['underruns'] += 1
                 self.stats['duplicates_emitted'] += 1
+
+                # Track how long we've been duplicating
+                now = time.time()
+                if self._duplicate_start_time is None:
+                    self._duplicate_start_time = now
+
+                duplicate_duration = now - self._duplicate_start_time
+
+                # Signal stream failure after prolonged duplication
+                if duplicate_duration >= self.MAX_DUPLICATE_SECONDS:
+                    self.logger.error(
+                        f"Stream stale - duplicating frames for {duplicate_duration:.1f}s"
+                    )
+                    return False, None  # Signal failure to processor
 
                 # Warn if underruns are frequent (source FPS may be lower than target)
                 if self.stats['underruns'] == 50:
@@ -309,6 +328,23 @@ class FrameJitterBuffer:
             f"overflows={self.stats['overflows']}, "
             f"duplicates={self.stats['duplicates_emitted']}"
         )
+
+    def reset(self):
+        """Reset buffer state for reconnection attempt."""
+        with self._buffer_lock:
+            self._buffer.clear()
+        self._duplicate_start_time = None
+        self._last_valid_frame = None
+        self._prefill_complete.clear()
+        self._next_emit_time = None
+        self.stats = {
+            'frames_read': 0,
+            'frames_emitted': 0,
+            'underruns': 0,
+            'overflows': 0,
+            'duplicates_emitted': 0,
+        }
+        self.logger.info("Buffer state reset for reconnection")
 
     def get_buffer_level(self) -> Tuple[int, int]:
         """

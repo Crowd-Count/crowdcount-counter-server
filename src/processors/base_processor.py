@@ -18,6 +18,8 @@ except ImportError:
     FRAME_BUFFER_ENABLED = False
     FRAME_BUFFER_SECONDS = 2.5
 
+MAX_RECONNECT_ATTEMPTS = 3  # Auto-reconnect attempts before terminating
+
 
 class BaseStreamProcessor(ABC):
     """
@@ -73,6 +75,9 @@ class BaseStreamProcessor(ABC):
         self.use_frame_buffer = FRAME_BUFFER_ENABLED
         self.frame_buffer_seconds = FRAME_BUFFER_SECONDS
         self._jitter_buffer = None  # FrameJitterBuffer instance when enabled
+
+        # Reconnection tracking
+        self._reconnect_attempts = 0
 
     def connect_stream(self, max_retries: int = 10, initial_delay: float = 0.5) -> bool:
         """
@@ -214,6 +219,39 @@ class BaseStreamProcessor(ABC):
             self.cap.release()
             self.cap = None
             self.logger.info("Disconnected from stream")
+
+    def _attempt_reconnect(self) -> bool:
+        """
+        Attempt to reconnect to the stream.
+
+        Returns:
+            True if reconnection successful, False otherwise
+        """
+        self._reconnect_attempts += 1
+        self.logger.warning(
+            f"Attempting reconnection ({self._reconnect_attempts}/{MAX_RECONNECT_ATTEMPTS})..."
+        )
+
+        # Stop and release current connection
+        if self._jitter_buffer is not None:
+            self._jitter_buffer.stop()
+            self._jitter_buffer = None
+
+        if self.cap:
+            self.cap.release()
+            self.cap = None
+
+        # Brief pause before reconnecting
+        time.sleep(1.0)
+
+        # Try to reconnect with fewer retries (faster failure)
+        if self.connect_stream(max_retries=5, initial_delay=0.5):
+            self.logger.info("Reconnection successful!")
+            self._reconnect_attempts = 0  # Reset on success
+            return True
+
+        self.logger.warning("Reconnection failed")
+        return False
 
     def _validate_frame_fast(self, frame: np.ndarray) -> tuple[bool, str]:
         """
@@ -410,7 +448,15 @@ class BaseStreamProcessor(ABC):
                     self.logger.warning(f"Failed to read frame ({consecutive_failures}/{max_consecutive_failures})")
 
                     if consecutive_failures >= max_consecutive_failures:
-                        self.logger.error("Too many consecutive frame read failures, stopping")
+                        # Try to reconnect before giving up
+                        if self._reconnect_attempts < MAX_RECONNECT_ATTEMPTS:
+                            if self._attempt_reconnect():
+                                consecutive_failures = 0  # Reset and continue
+                                continue
+
+                        self.logger.error(
+                            f"Stream failed after {self._reconnect_attempts} reconnection attempts, stopping"
+                        )
                         break
 
                     time.sleep(0.1)
