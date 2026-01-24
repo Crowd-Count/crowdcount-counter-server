@@ -629,7 +629,8 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             'use_clahe': True,                  # Enable CLAHE preprocessing for night/low-light
             'clahe_clip_limit': 2.0,            # Contrast limit (1.5-3.0, higher = more contrast but more noise)
             'clahe_tile_size': 8,               # Tile grid size (8 is standard)
-            'clahe_brightness_threshold': 80,   # Only apply CLAHE when mean brightness < this value (0-255)
+            'clahe_engage_threshold': 60,       # Engage CLAHE when brightness drops below this (0-255)
+            'clahe_disengage_threshold': 80,    # Disengage CLAHE when brightness rises above this (0-255)
         }
 
         # METHOD 5: Active checkpoints for lost track recovery
@@ -640,6 +641,7 @@ class PeopleCounterProcessor(BaseStreamProcessor):
 
         # CLAHE preprocessor for night mode (initialized in on_start)
         self.clahe = None
+        self.clahe_engaged = False  # Hysteresis state: whether CLAHE is currently active
 
         # Tracking
         self.trackers: Dict[int, PersonTracker] = {}
@@ -737,13 +739,14 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             if self.doorway_config['use_clahe']:
                 clip_limit = self.doorway_config['clahe_clip_limit']
                 tile_size = self.doorway_config['clahe_tile_size']
-                brightness_threshold = self.doorway_config['clahe_brightness_threshold']
+                engage_threshold = self.doorway_config['clahe_engage_threshold']
+                disengage_threshold = self.doorway_config['clahe_disengage_threshold']
                 self.clahe = cv2.createCLAHE(
                     clipLimit=clip_limit,
                     tileGridSize=(tile_size, tile_size)
                 )
-                print(f"✓ CLAHE night mode enabled (clipLimit={clip_limit}, tileSize={tile_size}x{tile_size}, brightness<{brightness_threshold})", flush=True)
-                self.logger.info(f"CLAHE initialized: clipLimit={clip_limit}, tileGridSize={tile_size}, brightnessThreshold={brightness_threshold}")
+                print(f"✓ CLAHE night mode enabled (clipLimit={clip_limit}, tileSize={tile_size}x{tile_size}, engage<{engage_threshold}, disengage>{disengage_threshold})", flush=True)
+                self.logger.info(f"CLAHE initialized: clipLimit={clip_limit}, tileGridSize={tile_size}, engageThreshold={engage_threshold}, disengageThreshold={disengage_threshold}")
 
             # Log METHOD 5.4 velocity validation settings
             if self.doorway_config.get('velocity_validation_enabled', False):
@@ -842,8 +845,9 @@ class PeopleCounterProcessor(BaseStreamProcessor):
     def _apply_clahe(self, frame: np.ndarray) -> np.ndarray:
         """Apply CLAHE preprocessing to enhance visibility in low-light conditions.
 
-        Only applies when frame brightness is below threshold to avoid
-        unnecessary processing during daytime and prevent buffer overflows.
+        Uses hysteresis to avoid flickering:
+        - Engages when brightness drops below engage_threshold (default 60)
+        - Stays engaged until brightness rises above disengage_threshold (default 80)
 
         Applies contrast enhancement to the luminance channel only,
         preserving color information while improving feature visibility.
@@ -860,15 +864,26 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             if len(frame.shape) != 3 or frame.shape[2] != 3:
                 return frame
 
-            # Check frame brightness - only apply CLAHE if dark enough
-            # This saves processing time during daytime and prevents decode errors
+            # Check frame brightness with hysteresis logic
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             mean_brightness = np.mean(gray)
 
-            brightness_threshold = self.doorway_config.get('clahe_brightness_threshold', 80)
-            if mean_brightness >= brightness_threshold:
-                # Frame is bright enough, skip CLAHE
-                return frame
+            engage_threshold = self.doorway_config.get('clahe_engage_threshold', 60)
+            disengage_threshold = self.doorway_config.get('clahe_disengage_threshold', 80)
+
+            # Hysteresis: engage below 60, disengage above 80
+            if not self.clahe_engaged:
+                # Not currently engaged - only engage if brightness drops below engage threshold
+                if mean_brightness >= engage_threshold:
+                    return frame
+                # Brightness is below engage threshold - engage CLAHE
+                self.clahe_engaged = True
+            else:
+                # Currently engaged - only disengage if brightness rises above disengage threshold
+                if mean_brightness > disengage_threshold:
+                    self.clahe_engaged = False
+                    return frame
+                # Still below disengage threshold - keep CLAHE engaged
 
             # Convert BGR to LAB color space
             lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
