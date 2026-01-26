@@ -67,9 +67,9 @@ VIDEO_FPS = 15              # Frames per second (was 30)
 VIDEO_WIDTH = 640           # Video width in pixels
 VIDEO_HEIGHT = 480          # Video height in pixels
 
-# ByteTrack timing (track_buffer should be ~1.5 seconds worth of frames)
-# At 15fps: 22 frames = 1.5 seconds | At 30fps: 45 frames = 1.5 seconds
-TRACK_BUFFER_SECONDS = 1.5    # How many seconds to keep lost tracks
+# ByteTrack timing (track_buffer should be ~2 seconds worth of frames)
+# At 15fps: 30 frames = 2 seconds | At 30fps: 60 frames = 2 seconds
+TRACK_BUFFER_SECONDS = 2.0    # How many seconds to keep lost tracks
 TRACK_BUFFER_FRAMES = int(VIDEO_FPS * TRACK_BUFFER_SECONDS)
 
 # =============================================================================
