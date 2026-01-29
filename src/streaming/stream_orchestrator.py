@@ -200,6 +200,11 @@ class StreamOrchestrator:
         # Format: {stream_name: {'stop_time': float, 'api_client': CrowdCountAPIClient}}
         self.pending_reconnect: Dict[str, dict] = {}
 
+        # Track consecutive processor restart failures per stream
+        # Prevents infinite restart loops when stream is registered but not actually sending data
+        # Format: {stream_name: {'count': int, 'last_failure': float}}
+        self._restart_failures: Dict[str, dict] = {}
+
         # Track FPS stats per stream for viewer display
         # Format: {stream_name: {'frame_count': int, 'last_reset': float, 'fps': float}}
         self.stream_stats: Dict[str, dict] = {}
@@ -442,6 +447,10 @@ class StreamOrchestrator:
                 conn.close()
 
                 self.logger.info(f"Registered device: {device_id} (stream: {stream_name}, IP: {client_ip})")
+
+                # Reset restart failure tracking - device has re-registered fresh
+                self._restart_failures.pop(stream_name, None)
+
                 return jsonify({'status': 'ok', 'stream_name': stream_name, 'device_id': device_id}), 200
 
             except Exception as e:
@@ -1226,7 +1235,7 @@ class StreamOrchestrator:
             threading.Thread(target=api_client.update_status, args=('online',), daemon=True).start()
 
             # Create frame queue for live viewing
-            frame_queue = multiprocessing.Queue(maxsize=2)  # Small queue to avoid memory issues
+            frame_queue = multiprocessing.Queue(maxsize=15)  # 1 second buffer added
             self.frame_queues[stream_name] = frame_queue
 
             # Create processor instance with device info and frame queue
@@ -1370,9 +1379,20 @@ class StreamOrchestrator:
         while self.running:
             try:
                 # Check MediaMTX health
-                if not self.mediamtx.is_healthy():
+                mediamtx_healthy = self.mediamtx.is_healthy()
+                if not mediamtx_healthy:
                     self.logger.error("MediaMTX is not healthy!")
-                    # Could implement restart logic here
+
+                # Check if MediaMTX needs restart due to consecutive API failures
+                if self.mediamtx.needs_restart():
+                    self.logger.warning("MediaMTX API unresponsive - attempting restart")
+                    if self.mediamtx.restart():
+                        self.logger.info("MediaMTX restarted successfully")
+                    else:
+                        self.logger.error("Failed to restart MediaMTX")
+                    # Skip the rest of this iteration to let MediaMTX stabilize
+                    time.sleep(STREAM_HEALTH_CHECK_INTERVAL)
+                    continue
 
                 # Check processor health
                 dead_processors = []
@@ -1385,21 +1405,70 @@ class StreamOrchestrator:
                 for stream_name in dead_processors:
                     self.stop_processor(stream_name)
 
-                    # Check if stream is still active, restart processor
+                    # Check if stream is still active, restart processor (with limit)
                     active_streams = self.mediamtx.get_active_streams()
                     if stream_name in active_streams:
-                        self.logger.info(f"Stream {stream_name} is still active, restarting processor")
-                        self.start_processor(stream_name)
+                        # Track restart failures to prevent infinite loops
+                        if stream_name not in self._restart_failures:
+                            self._restart_failures[stream_name] = {'count': 0, 'last_failure': 0}
+
+                        failures = self._restart_failures[stream_name]
+                        max_restarts = 3
+
+                        # Reset failure count if last failure was more than 10 minutes ago
+                        if time.time() - failures['last_failure'] > 300:
+                            failures['count'] = 0
+
+                        if failures['count'] < max_restarts:
+                            failures['count'] += 1
+                            failures['last_failure'] = time.time()
+                            self.logger.info(
+                                f"Stream {stream_name} is still active, restarting processor "
+                                f"(attempt {failures['count']}/{max_restarts})"
+                            )
+                            self.start_processor(stream_name)
+                        else:
+                            self.logger.warning(
+                                f"Stream {stream_name} has failed {max_restarts} consecutive restarts - "
+                                f"giving up until stream reconnects. Device may be sending no video data."
+                            )
+                            # Mark device offline since we can't process its stream
+                            if stream_name in self.api_clients:
+                                threading.Thread(
+                                    target=self.api_clients[stream_name].update_status,
+                                    args=('offline',), daemon=True
+                                ).start()
 
                 # Get active streams and ensure processors exist
+                # Note: If MediaMTX API is having issues, get_active_streams() returns empty list
+                # We should NOT treat this as "all streams stopped" - only trust webhook notifications
                 active_streams = self.mediamtx.get_active_streams()
-                for stream_name in active_streams:
-                    if stream_name not in self.processors and stream_name not in self.pending_reconnect:
-                        self.logger.info(f"Found active stream without processor: {stream_name}")
-                        self.start_processor(stream_name)
+
+                # Only process new streams if API call was successful (consecutive failures = 0)
+                if self.mediamtx.get_consecutive_failures() == 0:
+                    for stream_name in active_streams:
+                        if stream_name not in self.processors and stream_name not in self.pending_reconnect:
+                            # Check if this stream has hit its restart limit
+                            failures = self._restart_failures.get(stream_name, {})
+                            if failures.get('count', 0) >= 3 and time.time() - failures.get('last_failure', 0) < 300:
+                                # Still in cooldown - don't restart
+                                continue
+                            elif failures.get('count', 0) >= 3:
+                                # Cooldown expired - reset and try again
+                                self._restart_failures.pop(stream_name, None)
+                            self.logger.info(f"Found active stream without processor: {stream_name}")
+                            self.start_processor(stream_name)
+                else:
+                    # API having issues - log but don't make assumptions about stream state
+                    self.logger.debug(
+                        f"MediaMTX API has {self.mediamtx.get_consecutive_failures()} consecutive failures - "
+                        "skipping stream discovery this cycle"
+                    )
 
                 # Check streams pending reconnection
-                self._check_pending_reconnects()
+                # Only check if API is responding, otherwise we can't reliably determine stream state
+                if self.mediamtx.get_consecutive_failures() == 0:
+                    self._check_pending_reconnects()
 
             except Exception as e:
                 self.logger.error(f"Error in monitor loop: {e}")

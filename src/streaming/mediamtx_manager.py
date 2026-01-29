@@ -7,14 +7,22 @@ import subprocess
 import time
 import logging
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from pathlib import Path
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Tuple
 import signal
 import sys
 
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from config.server_config import MEDIAMTX_BINARY, MEDIAMTX_CONFIG, MEDIAMTX_API_URL
+
+# Configuration constants
+DEFAULT_TIMEOUT = 10  # Increased from 5s to 10s
+MAX_RETRIES = 3
+BACKOFF_FACTOR = 0.5  # Exponential backoff: 0.5s, 1s, 2s
+CONSECUTIVE_FAILURES_THRESHOLD = 5  # Restart MediaMTX after this many consecutive failures
 
 
 class MediaMTXManager:
@@ -23,6 +31,24 @@ class MediaMTXManager:
     def __init__(self):
         self.process: Optional[subprocess.Popen] = None
         self.running = False
+
+        # Connection pooling with requests.Session
+        self._session = requests.Session()
+
+        # Configure retry strategy for the session
+        retry_strategy = Retry(
+            total=MAX_RETRIES,
+            backoff_factor=BACKOFF_FACTOR,
+            status_forcelist=[500, 502, 503, 504],
+            allowed_methods=["GET", "POST"]
+        )
+        adapter = HTTPAdapter(max_retries=retry_strategy, pool_connections=5, pool_maxsize=10)
+        self._session.mount("http://", adapter)
+        self._session.mount("https://", adapter)
+
+        # Track consecutive API failures for health monitoring
+        self._consecutive_failures = 0
+        self._last_successful_api_call = time.time()
 
         # Setup logging
         self.logger = logging.getLogger("MediaMTX")
@@ -140,23 +166,83 @@ class MediaMTXManager:
                 # Process is running, try to connect to API port (even if API doesn't respond correctly)
                 try:
                     # Just try to connect to the port, don't care about the response
-                    response = requests.get(f"{MEDIAMTX_API_URL}/", timeout=3)
+                    response = self._session.get(f"{MEDIAMTX_API_URL}/", timeout=3)
                     # If we get any response (even 404), the server is up
+                    self._reset_failure_count()
                     return True
                 except requests.exceptions.ConnectionError:
                     # Port not open yet, keep waiting
                     pass
                 except requests.exceptions.RequestException:
                     # Got some response, server is up
+                    self._reset_failure_count()
                     return True
 
             time.sleep(0.5)
 
         return False
 
+    def _reset_failure_count(self):
+        """Reset consecutive failure counter on successful API call"""
+        self._consecutive_failures = 0
+        self._last_successful_api_call = time.time()
+
+    def _record_failure(self):
+        """Record an API failure and check if restart is needed"""
+        self._consecutive_failures += 1
+        if self._consecutive_failures >= CONSECUTIVE_FAILURES_THRESHOLD:
+            self.logger.warning(
+                f"MediaMTX API failed {self._consecutive_failures} consecutive times - triggering restart"
+            )
+            return True
+        return False
+
+    def get_consecutive_failures(self) -> int:
+        """Get the current consecutive failure count"""
+        return self._consecutive_failures
+
+    def needs_restart(self) -> bool:
+        """Check if MediaMTX needs to be restarted due to API failures"""
+        return self._consecutive_failures >= CONSECUTIVE_FAILURES_THRESHOLD
+
+    def _make_api_request(self, endpoint: str, timeout: int = DEFAULT_TIMEOUT) -> Tuple[bool, Optional[requests.Response]]:
+        """
+        Make an API request with retry logic and failure tracking.
+
+        Args:
+            endpoint: API endpoint (e.g., "/v3/paths/list")
+            timeout: Request timeout in seconds
+
+        Returns:
+            Tuple of (success, response)
+        """
+        for attempt in range(MAX_RETRIES):
+            try:
+                response = self._session.get(
+                    f"{MEDIAMTX_API_URL}{endpoint}",
+                    timeout=timeout
+                )
+                self._reset_failure_count()
+                return True, response
+            except requests.exceptions.RequestException as e:
+                if attempt < MAX_RETRIES - 1:
+                    wait_time = BACKOFF_FACTOR * (2 ** attempt)
+                    self.logger.debug(f"API request failed (attempt {attempt + 1}/{MAX_RETRIES}), retrying in {wait_time}s: {e}")
+                    time.sleep(wait_time)
+                else:
+                    self.logger.warning(f"API request failed after {MAX_RETRIES} attempts: {e}")
+                    self._record_failure()
+                    return False, None
+        return False, None
+
     def is_healthy(self) -> bool:
         """
-        Check if MediaMTX is healthy
+        Check if MediaMTX is healthy.
+
+        NOTE: This method does NOT reset the failure counter to avoid
+        masking failures in get_paths(). Only get_paths() success resets
+        the counter, ensuring auto-restart triggers when the paths API
+        is unresponsive even if the root endpoint responds.
 
         Returns:
             True if healthy, False otherwise
@@ -171,12 +257,14 @@ class MediaMTXManager:
             return False
 
         # Check if API port is responding (accept any response, even 404)
+        # NOTE: We intentionally do NOT reset failure count here - only
+        # successful get_paths() calls should reset it
         try:
-            response = requests.get(f"{MEDIAMTX_API_URL}/", timeout=5)
+            response = self._session.get(f"{MEDIAMTX_API_URL}/", timeout=DEFAULT_TIMEOUT)
             # If we get any response (even 404), the server is up
             return True
         except requests.exceptions.ConnectionError:
-            # Port not open
+            # Port not open - but don't record failure here, let get_paths handle it
             return False
         except requests.exceptions.RequestException:
             # Got some response, server is up
@@ -184,20 +272,19 @@ class MediaMTXManager:
 
     def get_paths(self) -> List[Dict]:
         """
-        Get list of active paths (streams) from MediaMTX
+        Get list of active paths (streams) from MediaMTX with retry logic.
 
         Returns:
             List of path dictionaries
         """
-        try:
-            response = requests.get(f"{MEDIAMTX_API_URL}/v3/paths/list", timeout=5)
-            if response.status_code == 200:
+        success, response = self._make_api_request("/v3/paths/list")
+        if success and response and response.status_code == 200:
+            try:
                 data = response.json()
                 return data.get('items', [])
-            return []
-        except requests.exceptions.RequestException as e:
-            self.logger.warning(f"Error getting paths: {e}")
-            return []
+            except ValueError as e:
+                self.logger.warning(f"Error parsing paths response: {e}")
+        return []
 
     def get_active_streams(self) -> List[str]:
         """
@@ -218,7 +305,7 @@ class MediaMTXManager:
 
     def get_stream_info(self, stream_name: str) -> Optional[Dict]:
         """
-        Get information about a specific stream
+        Get information about a specific stream with retry logic.
 
         Args:
             stream_name: Name of the stream
@@ -226,14 +313,32 @@ class MediaMTXManager:
         Returns:
             Dictionary with stream info, or None if not found
         """
-        try:
-            response = requests.get(f"{MEDIAMTX_API_URL}/v3/paths/get/{stream_name}", timeout=5)
-            if response.status_code == 200:
+        success, response = self._make_api_request(f"/v3/paths/get/{stream_name}")
+        if success and response and response.status_code == 200:
+            try:
                 return response.json()
-            return None
-        except requests.exceptions.RequestException as e:
-            self.logger.warning(f"Error getting stream info for {stream_name}: {e}")
-            return None
+            except ValueError as e:
+                self.logger.warning(f"Error parsing stream info for {stream_name}: {e}")
+        return None
+
+    def restart(self) -> bool:
+        """
+        Restart the MediaMTX server.
+        Used when API becomes unresponsive.
+
+        Returns:
+            True if restart was successful, False otherwise
+        """
+        self.logger.info("Restarting MediaMTX server...")
+        self.stop()
+        time.sleep(1)  # Brief pause before restart
+        success = self.start()
+        if success:
+            self.logger.info("MediaMTX server restarted successfully")
+            self._reset_failure_count()
+        else:
+            self.logger.error("Failed to restart MediaMTX server")
+        return success
 
 
 def main():

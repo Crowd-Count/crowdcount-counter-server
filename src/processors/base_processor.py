@@ -525,7 +525,8 @@ class BaseStreamProcessor(ABC):
                         level, max_level = self._jitter_buffer.get_buffer_level()
                         buf_stats = self._jitter_buffer.stats
                         log_msg += (f" | Buffer: {level}/{max_level} "
-                                   f"(under:{buf_stats['underruns']} over:{buf_stats['overflows']})")
+                                   f"(under:{buf_stats['underruns']} over:{buf_stats['overflows']} "
+                                   f"dups:{buf_stats['duplicates_emitted']} read:{buf_stats['frames_read']})")
 
                     self.logger.info(log_msg)
 

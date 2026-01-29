@@ -111,6 +111,7 @@ class FrameJitterBuffer:
         self.stats = {
             'frames_read': 0,
             'frames_emitted': 0,
+            'frames_skipped': 0,  # Frames grabbed but not decoded (saves CPU)
             'underruns': 0,
             'overflows': 0,
             'duplicates_emitted': 0,
@@ -128,13 +129,40 @@ class FrameJitterBuffer:
     def _reader_loop(self):
         """
         Background thread that continuously reads frames from VideoCapture.
-        Reads as fast as the source provides, letting the deque handle overflow.
+
+        Optimized to only decode frames we actually need:
+        - If buffer is getting full, use grab() to skip frames without decoding
+        - Only decode (retrieve()) when buffer has room
+        - This significantly reduces CPU usage when source FPS > target FPS
         """
         consecutive_failures = 0
         max_failures = 30  # ~1 second of failures at 30fps before warning
+        frames_skipped = 0
 
         while not self._stop_event.is_set():
             try:
+                # Check buffer level to decide if we should skip (grab) or decode (read)
+                with self._buffer_lock:
+                    buffer_level = len(self._buffer)
+                    buffer_nearly_full = buffer_level >= (self.buffer_size * 0.8)
+
+                if buffer_nearly_full:
+                    # Buffer is nearly full - skip this frame without decoding
+                    # grab() advances the stream but doesn't decode (much faster)
+                    if self.cap.grab():
+                        frames_skipped += 1
+                        self.stats['frames_skipped'] = frames_skipped
+                    else:
+                        consecutive_failures += 1
+                        if consecutive_failures >= max_failures:
+                            if consecutive_failures == max_failures:
+                                self.logger.warning(
+                                    f"Buffer reader: {max_failures} consecutive read failures"
+                                )
+                        time.sleep(0.01)
+                    continue
+
+                # Buffer has room - decode and store this frame
                 ret, frame = self.cap.read()
 
                 if not ret or frame is None:
@@ -323,6 +351,7 @@ class FrameJitterBuffer:
 
         self.logger.info(
             f"Buffer stopped. Stats: read={self.stats['frames_read']}, "
+            f"skipped={self.stats['frames_skipped']}, "
             f"emitted={self.stats['frames_emitted']}, "
             f"underruns={self.stats['underruns']}, "
             f"overflows={self.stats['overflows']}, "
@@ -340,6 +369,7 @@ class FrameJitterBuffer:
         self.stats = {
             'frames_read': 0,
             'frames_emitted': 0,
+            'frames_skipped': 0,
             'underruns': 0,
             'overflows': 0,
             'duplicates_emitted': 0,

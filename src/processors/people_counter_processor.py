@@ -593,7 +593,7 @@ class PeopleCounterProcessor(BaseStreamProcessor):
 
         # YOLO model setup
         self.model = None
-        self.model_path = str(MODELS_DIR / "v2_1_0.pt")  # Using YOLOv11 Small model for better accuracy
+        self.model_path = str(MODELS_DIR / "v3_0_0.pt")  # Using YOLOv11 Small model for better accuracy
         self.bytetrack_config = str(MODELS_DIR / "bytetrack.yaml")  # ByteTrack config for group tracking
         self.class_names = {0: 'person'}  # Default
 
