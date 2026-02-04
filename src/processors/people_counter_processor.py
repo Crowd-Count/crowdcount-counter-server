@@ -142,7 +142,7 @@ class PersonTracker:
         # Trajectory validation for counting
         self.side_history = deque(maxlen=10)  # Track recent side positions
         self.detection_count = 0  # Total detections for this track
-        self.min_detections_to_count = 4  # TUNED: Balanced between filtering noise and catching real people
+        self.min_detections_to_count = 2  # TUNED: Lowered for faster crossing detection
         self.consecutive_side_detections = 0  # Consecutive detections on same side
         self.min_consecutive_for_crossing = 1  # Reduced from 2 - trajectory validation handles consistency
 
