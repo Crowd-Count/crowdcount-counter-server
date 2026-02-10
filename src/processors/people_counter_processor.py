@@ -379,7 +379,7 @@ class PersonTracker:
                         if velocity_config and velocity_config.get('velocity_validation_enabled', False):
                             velocity_valid = self.validate_velocity_for_crossing(
                                 entry_side=entry_side,
-                                min_approach_speed=velocity_config.get('velocity_min_approach_speed', 15.0),
+                                min_approach_speed=velocity_config.get('velocity_min_approach_speed', 0.0234) * frame_width,
                                 min_approach_frames=velocity_config.get('velocity_min_approach_frames', 5),
                                 approach_ratio_threshold=velocity_config.get('velocity_approach_ratio_threshold', 0.5),
                                 min_transit_frames=velocity_config.get('velocity_min_transit_frames', 2),
@@ -414,7 +414,7 @@ class PersonTracker:
                         if velocity_config and velocity_config.get('velocity_validation_enabled', False):
                             velocity_valid = self.validate_velocity_for_crossing(
                                 entry_side=self.last_side,
-                                min_approach_speed=velocity_config.get('velocity_min_approach_speed', 15.0),
+                                min_approach_speed=velocity_config.get('velocity_min_approach_speed', 0.0234) * frame_width,
                                 min_approach_frames=velocity_config.get('velocity_min_approach_frames', 5),
                                 approach_ratio_threshold=velocity_config.get('velocity_approach_ratio_threshold', 0.5),
                                 min_transit_frames=velocity_config.get('velocity_min_transit_frames', 2),
@@ -476,7 +476,7 @@ class PersonTracker:
 
         Args:
             entry_side: 'left' or 'right' - which side the track entered from
-            min_approach_speed: Minimum pixels/sec toward line to count as approaching
+            min_approach_speed: Minimum speed (pixels/sec) toward line to count as approaching
             min_approach_frames: Minimum frames with valid approach velocity
             approach_ratio_threshold: Minimum ratio of frames moving toward line
             min_transit_frames: Minimum frames in danger zone (anti-teleport check)
@@ -603,7 +603,7 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             'doorway_width': 0.02,      # 2% of frame width (narrow line)
             'approach_zone': 0.15,      # 15% approach zone on each side
             'min_path_length': 50,      # Minimum pixels traveled
-            'max_tracking_distance': 100,  # TUNED: Reduced from 120 for tighter matching
+            'max_tracking_distance': 0.156,  # Proportion of frame width (~100px at 640w)
             'tracker_timeout': 1.5,     # TUNED: Reduced from 3.0 to let false tracks expire faster
             'yolo_conf_threshold': 0.25,  # TUNED: Balanced - catches people but filters noise
             'yolo_iou_threshold': 0.3,   # TUNED: Lowered from 0.45 to separate overlapping people
@@ -620,7 +620,7 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             'lingering_timeout': 10.0,          # Extended timeout for slow-moving people
             # METHOD 5.4: Velocity-gated crossing validation (reflection prevention)
             'velocity_validation_enabled': True,        # Enable velocity-based crossing validation
-            'velocity_min_approach_speed': 15.0,        # Min pixels/sec toward crossing line to be valid
+            'velocity_min_approach_speed': 0.0234,       # Proportion of frame width/sec (~15px/s at 640w)
             'velocity_min_approach_frames': 3,          # Min frames with approach velocity before crossing (was 5 at 30fps)
             'velocity_approach_ratio_threshold': 0.5,   # Min ratio of frames moving toward line (0.0-1.0)
             'velocity_min_transit_frames': 1,           # Min frames detected in danger zone (anti-teleport, was 2 at 30fps)
@@ -751,7 +751,7 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             # Log METHOD 5.4 velocity validation settings
             if self.doorway_config.get('velocity_validation_enabled', False):
                 print(f"✓ Velocity-gated crossing validation enabled (reflection prevention)", flush=True)
-                print(f"  - Min approach speed: {self.doorway_config['velocity_min_approach_speed']} px/s", flush=True)
+                print(f"  - Min approach speed: {self.doorway_config['velocity_min_approach_speed']} (proportion of frame width/s)", flush=True)
                 print(f"  - Min approach frames: {self.doorway_config['velocity_min_approach_frames']}", flush=True)
                 print(f"  - Approach ratio threshold: {self.doorway_config['velocity_approach_ratio_threshold']}", flush=True)
                 print(f"  - Min transit frames: {self.doorway_config['velocity_min_transit_frames']}", flush=True)
@@ -1046,7 +1046,7 @@ class PeopleCounterProcessor(BaseStreamProcessor):
                            f"L->R: {self.crossings[CrossingDirection.LEFT_TO_RIGHT]} | "
                            f"R->L: {self.crossings[CrossingDirection.RIGHT_TO_LEFT]}")
 
-    def _match_by_position_and_reid(self, detection: Detection) -> Optional[int]:
+    def _match_by_position_and_reid(self, detection: Detection, frame_width: int = 640) -> Optional[int]:
         """
         Match detection to tracker using position distance and ReID similarity.
         Used for detections that ByteTrack couldn't match directly.
@@ -1082,7 +1082,7 @@ class PeopleCounterProcessor(BaseStreamProcessor):
 
             position_dist = min(dist, pred_dist)
 
-            if position_dist > self.doorway_config['max_tracking_distance']:
+            if position_dist > self.doorway_config['max_tracking_distance'] * frame_width:
                 continue
 
             # Calculate ReID similarity score (if available)
@@ -1104,7 +1104,7 @@ class PeopleCounterProcessor(BaseStreamProcessor):
 
         return best_match_id
 
-    def match_detection_to_tracker(self, detection: Detection) -> Optional[int]:
+    def match_detection_to_tracker(self, detection: Detection, frame_width: int = 640) -> Optional[int]:
         """
         Match a detection to existing tracker using ByteTrack ID, ReID, and distance.
         Priority: ByteTrack ID > ReID similarity > Position distance
@@ -1152,7 +1152,7 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             position_dist = min(dist, pred_dist)
 
             # Skip if too far away
-            if position_dist > self.doorway_config['max_tracking_distance']:
+            if position_dist > self.doorway_config['max_tracking_distance'] * frame_width:
                 continue
 
             # Calculate ReID similarity score (if available)
@@ -1263,7 +1263,7 @@ class PeopleCounterProcessor(BaseStreamProcessor):
         still_unmatched = []
         for detection in unmatched_detections:
             # Try position + ReID matching
-            track_id = self._match_by_position_and_reid(detection)
+            track_id = self._match_by_position_and_reid(detection, width)
 
             if track_id is not None:
                 self.trackers[track_id].update(detection)
