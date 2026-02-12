@@ -161,6 +161,7 @@ class PersonTracker:
         self.in_danger_zone = False                        # Currently in danger zone
         self.search_active = False                         # Searching for lost track
         self.relinked_from: Optional[int] = None           # Track ID we were relinked from
+        self.needs_checkpoint = False                      # Flag for processor to create checkpoint
 
         # METHOD 5.4: Velocity-gated crossing validation (reflection prevention)
         self.danger_zone_frame_count = 0                   # Frames spent in danger zone during current transit
@@ -308,9 +309,11 @@ class PersonTracker:
         # METHOD 5.4: Track velocity and danger zone frames for validation
         if self.velocities:
             vx = self.velocities[-1][0]  # Most recent X velocity
-            # Record approach velocity when in safe zones (before entering danger zone)
+            # Record approach velocity when in safe zones, but only if actually moving
+            # Idle/near-zero velocities dilute the approach ratio and cause valid crossings to be rejected
             if new_zone in (DangerZone.LEFT_ZONE, DangerZone.RIGHT_ZONE):
-                self.approach_velocities.append(vx)
+                if abs(vx) > 3.0:  # Ignore idle frames (noise threshold ~3 px/s)
+                    self.approach_velocities.append(vx)
 
         # Track frames in danger zone
         if new_zone == DangerZone.DANGER_ZONE:
@@ -342,9 +345,8 @@ class PersonTracker:
 
         # METHOD 5: Checkpoint management
         if zone_changed and new_zone == DangerZone.DANGER_ZONE:
-            # Just entered danger zone - checkpoint should be created by processor
-            # (needs access to ReID extractor which is in the processor)
-            pass
+            # Signal processor to create checkpoint (needs ReID extractor + frame)
+            self.needs_checkpoint = True
 
         # Check for checkpoint timeout
         if self.checkpoint and (current_time - self.checkpoint.entry_time > self.CHECKPOINT_TIMEOUT):
@@ -441,6 +443,26 @@ class PersonTracker:
                 self.danger_zone_frame_count = 0
                 self.approach_velocities.clear()
 
+            # Direct zone skip: LEFT_ZONE <-> RIGHT_ZONE without passing through DANGER_ZONE
+            # This happens when the danger zone is narrow and the person's center jumps over it
+            elif (self.previous_zone in (DangerZone.LEFT_ZONE, DangerZone.RIGHT_ZONE) and
+                  self.current_zone in (DangerZone.LEFT_ZONE, DangerZone.RIGHT_ZONE) and
+                  self.previous_zone != self.current_zone):
+                if self.last_side and self.current_side and self.last_side != self.current_side:
+                    if current_time - self.last_crossing_time >= self.min_crossing_interval:
+                        if self.last_side == 'left' and self.current_side == 'right':
+                            crossing_to_emit = CrossingDirection.LEFT_TO_RIGHT
+                        elif self.last_side == 'right' and self.current_side == 'left':
+                            crossing_to_emit = CrossingDirection.RIGHT_TO_LEFT
+
+                        if crossing_to_emit:
+                            self.total_crossings += 1
+                            self.crossing_events.append((current_time, crossing_to_emit))
+                            self.last_crossing_time = current_time
+                            self.last_side = self.current_side
+
+                    self.approach_velocities.clear()
+
         return crossing_to_emit
 
     def _validate_crossing(self, frame_width: int, doorway_center: float) -> bool:
@@ -504,18 +526,28 @@ class PersonTracker:
         # Left side entry: should be moving RIGHT (positive vx) toward center line
         # Right side entry: should be moving LEFT (negative vx) toward center line
         if entry_side == 'left':
-            # Count frames moving toward line (positive X velocity)
+            # Count frames moving toward line (positive X velocity above speed threshold)
             frames_toward = sum(1 for vx in recent_velocities if vx > min_approach_speed)
+            # Also count frames moving in the correct direction at any speed
+            frames_correct_direction = sum(1 for vx in recent_velocities if vx > 0)
         else:  # entry_side == 'right'
-            # Count frames moving toward line (negative X velocity)
+            # Count frames moving toward line (negative X velocity above speed threshold)
             frames_toward = sum(1 for vx in recent_velocities if vx < -min_approach_speed)
+            frames_correct_direction = sum(1 for vx in recent_velocities if vx < 0)
 
         # Check 3: Was the track consistently moving toward the line?
+        # Primary: strict check with speed threshold
         approach_ratio = frames_toward / len(recent_velocities)
-        if approach_ratio < approach_ratio_threshold:
-            return False
+        if approach_ratio >= approach_ratio_threshold:
+            return True
 
-        return True
+        # Secondary: if most frames move in the correct direction (even slowly),
+        # accept the crossing - this prevents rejecting slow but legitimate crossings
+        direction_ratio = frames_correct_direction / len(recent_velocities)
+        if direction_ratio >= 0.6:
+            return True
+
+        return False
 
     def time_since_update(self) -> float:
         """Time since last update"""
@@ -993,7 +1025,7 @@ class PeopleCounterProcessor(BaseStreamProcessor):
 
         return self.reid_extractor.extract(frame, x1, y1, x2, y2)
 
-    def _check_and_handle_crossing(self, track_id: int, detection: Detection, frame_width: int, current_time: float):
+    def _check_and_handle_crossing(self, track_id: int, detection: Detection, frame_width: int, current_time: float, frame=None):
         """Check for crossing and handle API calls if crossing detected."""
         tracker = self.trackers[track_id]
 
@@ -1010,6 +1042,15 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             self.doorway_config['danger_zone_buffer'],  # METHOD 5: pass danger zone buffer
             self.doorway_config  # METHOD 5.4: pass velocity config for reflection prevention
         )
+
+        # METHOD 5: Create checkpoint when tracker enters danger zone
+        if tracker.needs_checkpoint and frame is not None:
+            tracker.needs_checkpoint = False
+            if self.doorway_config['use_reid'] and self.reid_extractor:
+                x, y, w, h = detection.bbox
+                embedding = self._extract_appearance_features(frame, x, y, x + w, y + h)
+                if embedding is not None:
+                    tracker.create_checkpoint(embedding, detection.center, detection.confidence)
 
         if crossing_dir and crossing_dir != CrossingDirection.NONE:
             # A validated crossing occurred!
@@ -1239,7 +1280,7 @@ class PeopleCounterProcessor(BaseStreamProcessor):
                 matched_trackers.add(track_id)
 
                 # Check for crossing with trajectory validation
-                self._check_and_handle_crossing(track_id, detection, width, current_time)
+                self._check_and_handle_crossing(track_id, detection, width, current_time, frame)
             else:
                 # No ByteTrack match - will need ReID
                 unmatched_detections.append(detection)
@@ -1268,7 +1309,7 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             if track_id is not None:
                 self.trackers[track_id].update(detection)
                 matched_trackers.add(track_id)
-                self._check_and_handle_crossing(track_id, detection, width, current_time)
+                self._check_and_handle_crossing(track_id, detection, width, current_time, frame)
             else:
                 # Try ReID recovery for lost tracks
                 if self.doorway_config['use_reid']:
