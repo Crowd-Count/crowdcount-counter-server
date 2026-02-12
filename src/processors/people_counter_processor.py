@@ -620,12 +620,14 @@ class PeopleCounterProcessor(BaseStreamProcessor):
     Tracks people crossing a virtual line and maintains counts
     """
 
-    def __init__(self, stream_name: str, rtsp_url: str, device_info: Optional[dict] = None, frame_queue=None):
-        super().__init__(stream_name, rtsp_url, device_info, frame_queue)
+    def __init__(self, stream_name: str, rtsp_url: str, device_info: Optional[dict] = None,
+                 frame_queue=None, inference_request_queue=None, inference_result_queue=None):
+        super().__init__(stream_name, rtsp_url, device_info, frame_queue,
+                         inference_request_queue, inference_result_queue)
 
         # YOLO model setup
         self.model = None
-        self.model_path = str(MODELS_DIR / "v3_0_0.pt")  # Using YOLOv11 Small model for better accuracy
+        self.model_path = str(MODELS_DIR / "v4_0_2.pt")  # Using YOLOv11 Small model for better accuracy
         self.bytetrack_config = str(MODELS_DIR / "bytetrack.yaml")  # ByteTrack config for group tracking
         self.class_names = {0: 'person'}  # Default
 
@@ -637,10 +639,10 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             'min_path_length': 50,      # Minimum pixels traveled
             'max_tracking_distance': 0.156,  # Proportion of frame width (~100px at 640w)
             'tracker_timeout': 1.5,     # TUNED: Reduced from 3.0 to let false tracks expire faster
-            'yolo_conf_threshold': 0.25,  # TUNED: Balanced - catches people but filters noise
+            'yolo_conf_threshold': 0.39,  # TUNED: Balanced - catches people but filters noise
             'yolo_iou_threshold': 0.3,   # TUNED: Lowered from 0.45 to separate overlapping people
             'min_crossing_interval': 0.5,  # TUNED: Increased from 0.3 to prevent double counts
-            'min_peak_confidence': 0.30,  # TUNED: Lowered from 0.40 for better daytime accuracy
+            'min_peak_confidence': 0.45,  # TUNED: Above YOLO conf — final quality gate before counting a crossing
             'reid_similarity_threshold': 0.6,  # TUNED: Increased for deep ReID (more discriminative)
             'use_bytetrack': True,       # NEW: Enable ByteTrack
             'use_reid': True,            # NEW: Enable ReID features
@@ -704,14 +706,49 @@ class PeopleCounterProcessor(BaseStreamProcessor):
         self.logger.info(f"Direction flipped setting initialized: {self.direction_flipped}")
 
     def on_start(self):
-        """Initialize YOLO model with ByteTrack when processor starts"""
+        """Initialize models or connect to centralized inference server when processor starts"""
+        # Start periodic refresh of direction_flipped setting (every 60 seconds)
+        self._schedule_direction_refresh()
+
+        # Determine mode: centralized inference vs legacy per-process GPU
+        self.use_centralized_inference = (
+            self.inference_request_queue is not None and
+            self.inference_result_queue is not None
+        )
+
+        if self.use_centralized_inference:
+            self._on_start_centralized()
+        else:
+            self._on_start_legacy()
+
+    def _on_start_centralized(self):
+        """Initialize for centralized inference mode (CPU-only worker)"""
+        from .inference_server import RequestType, InferenceRequest
+        # Store these for use in extract_detections / ReID calls
+        self._RequestType = RequestType
+        self._InferenceRequest = InferenceRequest
+
+        print(f"[{self.stream_name}] Centralized inference mode (CPU-only worker)", flush=True)
+        self.logger.info("Using centralized inference server (no local GPU)")
+
+        # Initialize standalone ByteTrack tracker for local tracking
+        # We use model.predict() on the server side + local ByteTrack
+        self._init_standalone_bytetrack()
+
+        # Initialize CLAHE for night mode preprocessing (runs on CPU)
+        self._init_clahe()
+
+        # Log velocity validation settings
+        self._log_velocity_settings()
+
+        print(f"[{self.stream_name}] Worker ready (ByteTrack + crossing logic on CPU)", flush=True)
+
+    def _on_start_legacy(self):
+        """Initialize for legacy per-process GPU mode (original behavior)"""
         if not YOLO_AVAILABLE:
             print(f"ERROR: YOLO not available - cannot start people counter", flush=True)
             self.logger.error("YOLO not available - cannot start people counter")
             raise ImportError("ultralytics package required. Install with: pip install ultralytics")
-
-        # Start periodic refresh of direction_flipped setting (every 60 seconds)
-        self._schedule_direction_refresh()
 
         try:
             import torch
@@ -747,13 +784,13 @@ class PeopleCounterProcessor(BaseStreamProcessor):
                 self.logger.info(f"Model classes: {', '.join([f'{k}:{v}' for k, v in self.class_names.items()])}")
 
             # Log tuned parameters
-            print(f"✓ Tuned parameters for group detection:", flush=True)
+            print(f"Tuned parameters for group detection:", flush=True)
             print(f"  - Confidence threshold: {self.doorway_config['yolo_conf_threshold']}", flush=True)
             print(f"  - IOU threshold: {self.doorway_config['yolo_iou_threshold']}", flush=True)
             print(f"  - Min crossing interval: {self.doorway_config['min_crossing_interval']}s", flush=True)
             print(f"  - Tracker timeout: {self.doorway_config['tracker_timeout']}s", flush=True)
 
-            print("✓ YOLO + ByteTrack loaded successfully with CUDA!" if cuda_available else "✓ YOLO + ByteTrack loaded (CPU mode)", flush=True)
+            print("YOLO + ByteTrack loaded successfully with CUDA!" if cuda_available else "YOLO + ByteTrack loaded (CPU mode)", flush=True)
             self.logger.info("YOLO model with ByteTrack loaded successfully")
 
             # Initialize Deep ReID extractor
@@ -764,37 +801,75 @@ class PeopleCounterProcessor(BaseStreamProcessor):
                     device=self.device,
                     verbose=True
                 )
-                print(f"✓ Deep ReID loaded (feature dim: {self.reid_extractor.feature_dim})", flush=True)
+                print(f"Deep ReID loaded (feature dim: {self.reid_extractor.feature_dim})", flush=True)
                 self.logger.info(f"Deep ReID initialized: {self.doorway_config['reid_model']}")
 
             # Initialize CLAHE for night mode preprocessing
-            if self.doorway_config['use_clahe']:
-                clip_limit = self.doorway_config['clahe_clip_limit']
-                tile_size = self.doorway_config['clahe_tile_size']
-                engage_threshold = self.doorway_config['clahe_engage_threshold']
-                disengage_threshold = self.doorway_config['clahe_disengage_threshold']
-                self.clahe = cv2.createCLAHE(
-                    clipLimit=clip_limit,
-                    tileGridSize=(tile_size, tile_size)
-                )
-                print(f"✓ CLAHE night mode enabled (clipLimit={clip_limit}, tileSize={tile_size}x{tile_size}, engage<{engage_threshold}, disengage>{disengage_threshold})", flush=True)
-                self.logger.info(f"CLAHE initialized: clipLimit={clip_limit}, tileGridSize={tile_size}, engageThreshold={engage_threshold}, disengageThreshold={disengage_threshold}")
+            self._init_clahe()
 
-            # Log METHOD 5.4 velocity validation settings
-            if self.doorway_config.get('velocity_validation_enabled', False):
-                print(f"✓ Velocity-gated crossing validation enabled (reflection prevention)", flush=True)
-                print(f"  - Min approach speed: {self.doorway_config['velocity_min_approach_speed']} (proportion of frame width/s)", flush=True)
-                print(f"  - Min approach frames: {self.doorway_config['velocity_min_approach_frames']}", flush=True)
-                print(f"  - Approach ratio threshold: {self.doorway_config['velocity_approach_ratio_threshold']}", flush=True)
-                print(f"  - Min transit frames: {self.doorway_config['velocity_min_transit_frames']}", flush=True)
-                self.logger.info(f"Velocity validation enabled: min_speed={self.doorway_config['velocity_min_approach_speed']}, "
-                               f"min_frames={self.doorway_config['velocity_min_approach_frames']}, "
-                               f"ratio={self.doorway_config['velocity_approach_ratio_threshold']}")
+            # Log velocity validation settings
+            self._log_velocity_settings()
 
         except Exception as e:
             print(f"ERROR: Failed to load YOLO model: {e}", flush=True)
             self.logger.error(f"Failed to load YOLO model: {e}")
             raise
+
+    def _init_standalone_bytetrack(self):
+        """Initialize standalone ByteTrack tracker for centralized inference mode."""
+        try:
+            from ultralytics.trackers.byte_tracker import BYTETracker
+            import yaml
+
+            # Load ByteTrack config from yaml
+            with open(self.bytetrack_config, 'r') as f:
+                bt_config = yaml.safe_load(f)
+
+            # Create a simple args object for BYTETracker
+            class ByteTrackArgs:
+                pass
+
+            args = ByteTrackArgs()
+            args.track_high_thresh = bt_config.get('track_high_thresh', 0.25)
+            args.track_low_thresh = bt_config.get('track_low_thresh', 0.15)
+            args.new_track_thresh = bt_config.get('new_track_thresh', 0.3)
+            args.track_buffer = bt_config.get('track_buffer', 30)
+            args.match_thresh = bt_config.get('match_thresh', 0.75)
+            args.fuse_score = bt_config.get('fuse_score', True)
+
+            self.byte_tracker = BYTETracker(args, frame_rate=15)
+            print(f"[{self.stream_name}] Standalone ByteTrack initialized", flush=True)
+            self.logger.info("Standalone ByteTrack tracker initialized")
+
+        except Exception as e:
+            self.logger.error(f"Failed to initialize standalone ByteTrack: {e}")
+            self.byte_tracker = None
+
+    def _init_clahe(self):
+        """Initialize CLAHE for night mode preprocessing."""
+        if self.doorway_config['use_clahe']:
+            clip_limit = self.doorway_config['clahe_clip_limit']
+            tile_size = self.doorway_config['clahe_tile_size']
+            engage_threshold = self.doorway_config['clahe_engage_threshold']
+            disengage_threshold = self.doorway_config['clahe_disengage_threshold']
+            self.clahe = cv2.createCLAHE(
+                clipLimit=clip_limit,
+                tileGridSize=(tile_size, tile_size)
+            )
+            print(f"CLAHE night mode enabled (clipLimit={clip_limit}, tileSize={tile_size}x{tile_size}, engage<{engage_threshold}, disengage>{disengage_threshold})", flush=True)
+            self.logger.info(f"CLAHE initialized: clipLimit={clip_limit}, tileGridSize={tile_size}, engageThreshold={engage_threshold}, disengageThreshold={disengage_threshold}")
+
+    def _log_velocity_settings(self):
+        """Log METHOD 5.4 velocity validation settings."""
+        if self.doorway_config.get('velocity_validation_enabled', False):
+            print(f"Velocity-gated crossing validation enabled (reflection prevention)", flush=True)
+            print(f"  - Min approach speed: {self.doorway_config['velocity_min_approach_speed']} (proportion of frame width/s)", flush=True)
+            print(f"  - Min approach frames: {self.doorway_config['velocity_min_approach_frames']}", flush=True)
+            print(f"  - Approach ratio threshold: {self.doorway_config['velocity_approach_ratio_threshold']}", flush=True)
+            print(f"  - Min transit frames: {self.doorway_config['velocity_min_transit_frames']}", flush=True)
+            self.logger.info(f"Velocity validation enabled: min_speed={self.doorway_config['velocity_min_approach_speed']}, "
+                           f"min_frames={self.doorway_config['velocity_min_approach_frames']}, "
+                           f"ratio={self.doorway_config['velocity_approach_ratio_threshold']}")
 
     def on_stop(self):
         """Cleanup when processor stops"""
@@ -936,12 +1011,165 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             return frame
 
     def extract_detections(self, frame) -> List[Detection]:
-        """Extract person detections from frame using YOLO with ByteTrack tracking"""
-        detections = []
+        """Extract person detections from frame using YOLO with ByteTrack tracking.
 
+        Supports two modes:
+        - Centralized: sends frame to inference server, runs ByteTrack locally
+        - Legacy: runs YOLO model.track() locally with per-process GPU
+        """
         # Apply CLAHE preprocessing for night mode if enabled
         if self.doorway_config['use_clahe'] and self.clahe is not None:
             frame = self._apply_clahe(frame)
+
+        if self.use_centralized_inference:
+            return self._extract_detections_centralized(frame)
+        else:
+            return self._extract_detections_legacy(frame)
+
+    def _extract_detections_centralized(self, frame) -> List[Detection]:
+        """Extract detections via centralized inference server + local ByteTrack."""
+        detections = []
+
+        try:
+            # Send detection request to inference server
+            request = self._InferenceRequest(
+                type=self._RequestType.DETECT,
+                camera_id=self.stream_name,
+                frame=frame,
+                conf=self.doorway_config['yolo_conf_threshold'],
+                iou=self.doorway_config['yolo_iou_threshold'],
+            )
+            self.inference_request_queue.put(request)
+
+            # Wait for response from inference server
+            response = self.inference_result_queue.get(timeout=5.0)
+
+            if response.error:
+                self.logger.warning(f"Inference server error: {response.error}")
+
+            if response.detections:
+                # Run standalone ByteTrack on the detection results
+                det_results = response.detections
+                track_ids = self._run_standalone_bytetrack(det_results, frame)
+
+                for i, det_result in enumerate(det_results):
+                    track_id = track_ids[i] if i < len(track_ids) else None
+
+                    detection = Detection(
+                        center=det_result.center,
+                        bbox=det_result.bbox,
+                        confidence=det_result.confidence,
+                        timestamp=time.time(),
+                        class_id=det_result.class_id,
+                        class_name=det_result.class_name,
+                        track_id=track_id,
+                        appearance_features=None  # Extracted on-demand in update_trackers
+                    )
+                    detections.append(detection)
+
+        except Exception as e:
+            self.logger.error(f"Centralized detection error: {e}")
+            import traceback
+            self.logger.error(traceback.format_exc())
+
+        return detections
+
+    def _run_standalone_bytetrack(self, det_results, frame) -> List[Optional[int]]:
+        """Run standalone ByteTrack tracker on detection results.
+
+        Args:
+            det_results: List of DetectionResult from inference server
+            frame: Current frame (for dimensions)
+
+        Returns:
+            List of track IDs corresponding to each detection (None if untracked)
+        """
+        if self.byte_tracker is None or not det_results:
+            return [None] * len(det_results)
+
+        try:
+            import numpy as np
+
+            # Build arrays in the format ultralytics BYTETracker expects
+            xyxy_list = []
+            xywh_list = []
+            conf_list = []
+            cls_list = []
+            for det in det_results:
+                x1, y1, w, h = det.bbox
+                x2 = x1 + w
+                y2 = y1 + h
+                cx = (x1 + x2) / 2
+                cy = (y1 + y2) / 2
+                xyxy_list.append([x1, y1, x2, y2])
+                xywh_list.append([cx, cy, w, h])
+                conf_list.append(det.confidence)
+                cls_list.append(det.class_id)
+
+            if not xyxy_list:
+                return [None] * len(det_results)
+
+            # Ultralytics BYTETracker.update() expects a Results-like object with
+            # .conf, .cls, .xywh, .xyxy attributes and boolean/integer indexing
+            class DetectionWrapper:
+                """Lightweight wrapper to satisfy ultralytics BYTETracker API."""
+                def __init__(self, xyxy, xywh, conf, cls):
+                    self.xyxy = np.array(xyxy, dtype=np.float32)
+                    self.xywh = np.array(xywh, dtype=np.float32)
+                    self.conf = np.array(conf, dtype=np.float32)
+                    self.cls = np.array(cls, dtype=np.float32)
+                def __len__(self):
+                    return len(self.conf)
+                def __getitem__(self, idx):
+                    return DetectionWrapper(
+                        self.xyxy[idx], self.xywh[idx],
+                        self.conf[idx], self.cls[idx],
+                    )
+
+            wrapper = DetectionWrapper(xyxy_list, xywh_list, conf_list, cls_list)
+
+            # Update ByteTrack with detections
+            # Returns numpy array of shape (N, 8): [x1, y1, x2, y2, track_id, score, cls, det_idx]
+            online_targets = self.byte_tracker.update(wrapper, frame)
+
+            # Match ByteTrack outputs back to input detections by center distance
+            track_ids = [None] * len(det_results)
+
+            if len(online_targets) == 0:
+                return track_ids
+
+            for target in online_targets:
+                t_x1, t_y1, t_x2, t_y2 = target[0], target[1], target[2], target[3]
+                t_track_id = int(target[4])
+                t_center = ((t_x1 + t_x2) / 2, (t_y1 + t_y2) / 2)
+
+                # Find closest input detection by center distance
+                best_idx = None
+                best_dist = float('inf')
+                for i, det in enumerate(det_results):
+                    if track_ids[i] is not None:
+                        continue  # Already matched
+                    dx = det.center[0] - t_center[0]
+                    dy = det.center[1] - t_center[1]
+                    dist = (dx * dx + dy * dy) ** 0.5
+                    if dist < best_dist:
+                        best_dist = dist
+                        best_idx = i
+
+                if best_idx is not None and best_dist < 50:  # Within 50px
+                    track_ids[best_idx] = t_track_id
+
+            return track_ids
+
+        except Exception as e:
+            self.logger.error(f"ByteTrack error: {e}")
+            import traceback
+            self.logger.error(traceback.format_exc())
+            return [None] * len(det_results)
+
+    def _extract_detections_legacy(self, frame) -> List[Detection]:
+        """Extract detections using local YOLO model (legacy per-process GPU mode)."""
+        detections = []
 
         try:
             if self.doorway_config['use_bytetrack']:
@@ -1019,11 +1247,44 @@ class PeopleCounterProcessor(BaseStreamProcessor):
         Extract deep ReID appearance features from a person bounding box.
         Uses OSNet pretrained on person re-identification datasets.
         Returns 512-dimensional L2-normalized feature vector.
-        """
-        if self.reid_extractor is None:
-            return None
 
-        return self.reid_extractor.extract(frame, x1, y1, x2, y2)
+        In centralized mode, sends a ReID request to the inference server.
+        In legacy mode, runs ReID locally on GPU.
+        """
+        if self.use_centralized_inference:
+            return self._extract_appearance_centralized(frame, [(x1, y1, x2, y2)])[0]
+        else:
+            if self.reid_extractor is None:
+                return None
+            return self.reid_extractor.extract(frame, x1, y1, x2, y2)
+
+    def _extract_appearance_batch_centralized(self, frame, boxes: List[Tuple[int, int, int, int]]) -> List[Optional[np.ndarray]]:
+        """Extract ReID features for multiple boxes via centralized inference server."""
+        return self._extract_appearance_centralized(frame, boxes)
+
+    def _extract_appearance_centralized(self, frame, boxes: List[Tuple[int, int, int, int]]) -> List[Optional[np.ndarray]]:
+        """Send ReID extraction request to inference server and wait for response."""
+        if not boxes:
+            return []
+
+        try:
+            request = self._InferenceRequest(
+                type=self._RequestType.REID,
+                camera_id=self.stream_name,
+                frame=frame,
+                boxes=boxes,
+            )
+            self.inference_request_queue.put(request)
+            response = self.inference_result_queue.get(timeout=5.0)
+
+            if response.error:
+                self.logger.warning(f"ReID server error: {response.error}")
+
+            return response.features if response.features else [None] * len(boxes)
+
+        except Exception as e:
+            self.logger.error(f"Centralized ReID error: {e}")
+            return [None] * len(boxes)
 
     def _check_and_handle_crossing(self, track_id: int, detection: Detection, frame_width: int, current_time: float, frame=None):
         """Check for crossing and handle API calls if crossing detected."""
@@ -1286,15 +1547,22 @@ class PeopleCounterProcessor(BaseStreamProcessor):
                 unmatched_detections.append(detection)
 
         # PHASE 2: Extract ReID features ONLY for unmatched detections (performance optimization)
-        if unmatched_detections and self.doorway_config['use_reid'] and self.reid_extractor:
+        reid_available = (
+            self.doorway_config['use_reid'] and
+            (self.reid_extractor is not None or self.use_centralized_inference)
+        )
+        if unmatched_detections and reid_available:
             # Collect bounding boxes for batch extraction
             reid_boxes = []
             for det in unmatched_detections:
                 x, y, w, h = det.bbox
                 reid_boxes.append((x, y, x + w, y + h))
 
-            # Single batch forward pass for all unmatched detections
-            features_list = self.reid_extractor.extract_batch(frame, reid_boxes)
+            # Extract features via centralized server or local GPU
+            if self.use_centralized_inference:
+                features_list = self._extract_appearance_batch_centralized(frame, reid_boxes)
+            else:
+                features_list = self.reid_extractor.extract_batch(frame, reid_boxes)
 
             # Assign features to detections
             for i, det in enumerate(unmatched_detections):

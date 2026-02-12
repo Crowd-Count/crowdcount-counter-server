@@ -37,12 +37,13 @@ class MediaMTXManager:
 
         # Configure retry strategy for the session
         retry_strategy = Retry(
-            total=MAX_RETRIES,
+            total=0,
             backoff_factor=BACKOFF_FACTOR,
             status_forcelist=[500, 502, 503, 504],
             allowed_methods=["GET", "POST"]
         )
-        adapter = HTTPAdapter(max_retries=retry_strategy, pool_connections=5, pool_maxsize=10)
+        pool_size = 25  # Must exceed MAX_PROCESSORS (20) for headroom
+        adapter = HTTPAdapter(max_retries=retry_strategy, pool_connections=2, pool_maxsize=pool_size)
         self._session.mount("http://", adapter)
         self._session.mount("https://", adapter)
 
@@ -201,17 +202,23 @@ class MediaMTXManager:
         """Get the current consecutive failure count"""
         return self._consecutive_failures
 
+    def get_last_successful_api_call(self) -> float:
+        """Get the timestamp of the last successful API call"""
+        return self._last_successful_api_call
+
     def needs_restart(self) -> bool:
         """Check if MediaMTX needs to be restarted due to API failures"""
         return self._consecutive_failures >= CONSECUTIVE_FAILURES_THRESHOLD
 
-    def _make_api_request(self, endpoint: str, timeout: int = DEFAULT_TIMEOUT) -> Tuple[bool, Optional[requests.Response]]:
+    def _make_api_request(self, endpoint: str, timeout: int = DEFAULT_TIMEOUT, track_health: bool = False) -> Tuple[bool, Optional[requests.Response]]:
         """
         Make an API request with retry logic and failure tracking.
 
         Args:
             endpoint: API endpoint (e.g., "/v3/paths/list")
             timeout: Request timeout in seconds
+            track_health: If True, reset/record the consecutive failure counter.
+                          Only get_paths() should set this to True.
 
         Returns:
             Tuple of (success, response)
@@ -222,7 +229,8 @@ class MediaMTXManager:
                     f"{MEDIAMTX_API_URL}{endpoint}",
                     timeout=timeout
                 )
-                self._reset_failure_count()
+                if track_health:
+                    self._reset_failure_count()
                 return True, response
             except requests.exceptions.RequestException as e:
                 if attempt < MAX_RETRIES - 1:
@@ -231,7 +239,8 @@ class MediaMTXManager:
                     time.sleep(wait_time)
                 else:
                     self.logger.warning(f"API request failed after {MAX_RETRIES} attempts: {e}")
-                    self._record_failure()
+                    if track_health:
+                        self._record_failure()
                     return False, None
         return False, None
 
@@ -277,7 +286,7 @@ class MediaMTXManager:
         Returns:
             List of path dictionaries
         """
-        success, response = self._make_api_request("/v3/paths/list")
+        success, response = self._make_api_request("/v3/paths/list", track_health=True)
         if success and response and response.status_code == 200:
             try:
                 data = response.json()
@@ -320,6 +329,50 @@ class MediaMTXManager:
             except ValueError as e:
                 self.logger.warning(f"Error parsing stream info for {stream_name}: {e}")
         return None
+
+    def kick_path_publishers(self, path_name: str) -> int:
+        """Kick all stale RTSP publisher sessions for a given path.
+
+        Lists RTSP sessions, finds publishers matching the path, kicks them.
+        Returns count of sessions kicked.
+        """
+        kicked = 0
+
+        # List all RTSP sessions
+        success, response = self._make_api_request("/v3/rtspsessions/list")
+        if not success or not response or response.status_code != 200:
+            self.logger.warning(f"Failed to list RTSP sessions for path {path_name}")
+            return 0
+
+        try:
+            data = response.json()
+            items = data.get('items') or []
+        except (ValueError, AttributeError):
+            self.logger.warning(f"Failed to parse RTSP sessions response for path {path_name}")
+            return 0
+
+        # Find publisher sessions matching this path
+        for session in items:
+            if session.get('state') == 'publish' and session.get('path') == path_name:
+                session_id = session.get('id')
+                if not session_id:
+                    continue
+                try:
+                    resp = self._session.post(
+                        f"{MEDIAMTX_API_URL}/v3/rtspsessions/kick/{session_id}",
+                        timeout=DEFAULT_TIMEOUT
+                    )
+                    if resp.status_code == 200:
+                        kicked += 1
+                        self.logger.info(f"Kicked stale RTSP session {session_id} for path {path_name}")
+                    else:
+                        self.logger.warning(f"Failed to kick session {session_id}: HTTP {resp.status_code}")
+                except requests.exceptions.RequestException as e:
+                    self.logger.warning(f"Error kicking session {session_id}: {e}")
+
+        if kicked:
+            self.logger.info(f"Kicked {kicked} stale publisher session(s) for path {path_name}")
+        return kicked
 
     def restart(self) -> bool:
         """

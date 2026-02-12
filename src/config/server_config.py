@@ -39,7 +39,7 @@ ORCHESTRATOR_HOST = "0.0.0.0"
 
 # Stream processor settings
 PROCESSOR_TYPE = "subprocess"  # Options: "subprocess", "docker" (docker not implemented yet)
-MAX_PROCESSORS = 20  # Maximum number of concurrent stream processors
+MAX_PROCESSORS = 35  # Maximum number of concurrent stream processors (GPU 1: 25 + GPU 0: 10)
 PROCESSOR_RESTART_DELAY = 5  # Seconds to wait before restarting a failed processor
 
 # Stream settings
@@ -59,6 +59,31 @@ SSH_USER = 'pi'  # Default Raspberry Pi username
 
 # Web dashboard
 STATIC_DIR = BASE_DIR / "static"
+
+# =============================================================================
+# GPU / INFERENCE SERVER SETTINGS
+# =============================================================================
+# Number of GPUs available for centralized inference servers (one server per GPU)
+# Default is 1 because each Docker container typically sees only its assigned GPU.
+# Set to 2+ if running outside Docker with multiple GPUs visible.
+NUM_GPUS = int(os.getenv("NUM_GPUS", "1"))
+
+# Per-GPU slot limits: {gpu_id: max_connections}
+# GPU 1 is primary (25 slots), GPU 0 is overflow (10 slots)
+# This allows prioritizing the more powerful GPU while keeping a backup
+GPU_SLOT_LIMITS = {
+    0: int(os.getenv("GPU_0_SLOTS", "10")),   # Overflow GPU
+    1: int(os.getenv("GPU_1_SLOTS", "25")),   # Primary GPU
+}
+
+# GPU priority order: fill these GPUs in order (GPU 1 first, then overflow to GPU 0)
+GPU_PRIORITY_ORDER = [int(x) for x in os.getenv("GPU_PRIORITY_ORDER", "1,0").split(",")]
+
+# Inference queue settings
+INFERENCE_QUEUE_MAXSIZE = int(os.getenv("INFERENCE_QUEUE_MAXSIZE", "100"))
+
+# YOLO inference image size for centralized inference (smaller = faster)
+INFERENCE_IMGSZ = int(os.getenv("INFERENCE_IMGSZ", "480"))
 
 # =============================================================================
 # VIDEO SETTINGS - Change these values to adjust FPS and resolution globally

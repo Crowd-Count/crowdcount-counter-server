@@ -21,6 +21,8 @@ import sqlite3
 import paramiko
 import subprocess
 from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -41,10 +43,16 @@ from config.server_config import (
     STATIC_DIR,
     VIDEO_FPS,
     VIDEO_WIDTH,
-    VIDEO_HEIGHT
+    VIDEO_HEIGHT,
+    NUM_GPUS,
+    GPU_SLOT_LIMITS,
+    GPU_PRIORITY_ORDER,
+    INFERENCE_QUEUE_MAXSIZE,
+    INFERENCE_IMGSZ,
 )
 from streaming.mediamtx_manager import MediaMTXManager
 from processors import BaseStreamProcessor, ExampleProcessor
+from processors.inference_server import InferenceServer, RequestType, InferenceRequest
 
 
 # Database helper functions
@@ -69,11 +77,58 @@ def init_db():
     conn.close()
 
 
+# Thread-local storage for database connections
+_db_local = threading.local()
+
+
+def _get_thread_db():
+    """Get or create a database connection for the current thread."""
+    if not hasattr(_db_local, 'connection') or _db_local.connection is None:
+        _db_local.connection = sqlite3.connect(str(DB_PATH), check_same_thread=False)
+        _db_local.connection.row_factory = sqlite3.Row
+    return _db_local.connection
+
+
+@contextmanager
 def get_db():
-    """Get database connection"""
-    conn = sqlite3.connect(str(DB_PATH))
-    conn.row_factory = sqlite3.Row
-    return conn
+    """Context manager for database access with thread-local connection pooling."""
+    conn = _get_thread_db()
+    try:
+        yield conn
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def close_db_connections():
+    """Close thread-local database connections."""
+    if hasattr(_db_local, 'connection') and _db_local.connection:
+        _db_local.connection.close()
+        _db_local.connection = None
+
+
+def _cleanup_queue(q):
+    """Safely cleanup a multiprocessing queue."""
+    if q is None:
+        return
+    try:
+        while True:
+            try:
+                q.get_nowait()
+            except queue.Empty:
+                break
+        q.close()
+        q.join_thread()
+    except Exception:
+        pass
+
+
+def _get_fd_count():
+    """Get current open file descriptor count."""
+    try:
+        return len(os.listdir(f'/proc/{os.getpid()}/fd'))
+    except Exception:
+        return -1
 
 
 def ssh_exec(ip: str, command: str, device_id: str = None, password: str = None) -> tuple:
@@ -146,19 +201,18 @@ def ssh_exec(ip: str, command: str, device_id: str = None, password: str = None)
 
 def update_device_status():
     """Update status of all devices based on last_seen"""
-    conn = get_db()
-    c = conn.cursor()
+    with get_db() as conn:
+        c = conn.cursor()
 
-    # Mark devices as offline if not seen in 60 seconds
-    threshold = datetime.now() - timedelta(seconds=60)
-    c.execute('''
-        UPDATE devices
-        SET status = 'offline'
-        WHERE last_seen < ? AND status != 'offline'
-    ''', (threshold,))
+        # Mark devices as offline if not seen in 60 seconds
+        threshold = datetime.now() - timedelta(seconds=60)
+        c.execute('''
+            UPDATE devices
+            SET status = 'offline'
+            WHERE last_seen < ? AND status != 'offline'
+        ''', (threshold,))
 
-    conn.commit()
-    conn.close()
+        conn.commit()
 
 
 class StreamOrchestrator:
@@ -209,8 +263,30 @@ class StreamOrchestrator:
         # Format: {stream_name: {'frame_count': int, 'last_reset': float, 'fps': float}}
         self.stream_stats: Dict[str, dict] = {}
 
+        # Track streams currently being started (to prevent duplicate processor creation)
+        self._starting_processors: set = set()
+
+        # Centralized inference server state
+        self.inference_servers: Dict[int, multiprocessing.Process] = {}  # gpu_id -> Process
+        self.inference_request_queues: Dict[int, multiprocessing.Queue] = {}  # gpu_id -> shared input queue
+        # Pre-allocated result queue pools per GPU: {gpu_id: {slot_name: Queue}}
+        self._result_queue_pools: Dict[int, Dict[str, multiprocessing.Queue]] = {}
+        # Track which slots are in use: {gpu_id: {slot_name: camera_id or None}}
+        self._slot_assignments: Dict[int, Dict[str, Optional[str]]] = {}
+        # Camera -> (gpu_id, slot_name) mapping
+        self.camera_gpu_assignments: Dict[str, tuple] = {}
+
         self.running = False
         self.monitor_thread = None
+
+        # Thread pool for fire-and-forget status updates (prevents thread accumulation)
+        self._status_update_executor = ThreadPoolExecutor(
+            max_workers=10,
+            thread_name_prefix="StatusUpdate"
+        )
+
+        # Thread safety lock for shared state (RLock allows nested acquisition)
+        self._state_lock = threading.RLock()
 
         # Setup logging
         self.logger = logging.getLogger("Orchestrator")
@@ -239,56 +315,64 @@ class StreamOrchestrator:
 
             if stream_name:
                 # Cancel any pending reconnect timeout (stream came back)
-                if stream_name in self.pending_reconnect:
-                    elapsed = time.time() - self.pending_reconnect[stream_name]['stop_time']
-                    self.logger.info(f"Stream {stream_name} reconnected after {elapsed:.1f}s - canceling offline timeout")
-                    del self.pending_reconnect[stream_name]
+                with self._state_lock:
+                    if stream_name in self.pending_reconnect:
+                        elapsed = time.time() - self.pending_reconnect[stream_name]['stop_time']
+                        self.logger.info(f"Stream {stream_name} reconnected after {elapsed:.1f}s - canceling offline timeout")
+                        del self.pending_reconnect[stream_name]
 
-                # Check if this stream is already being processed (avoid duplicate calls)
-                if stream_name in self.processors and self.processors[stream_name].is_alive():
-                    # Stream already has a processor running, ignore
-                    return jsonify({'status': 'ok', 'message': 'Already processing'}), 200
+                    # If a processor already exists and is alive, stop it first.
+                    # runOnReady means MediaMTX has a new publisher - the old processor
+                    # is likely stuck reading from the dead previous connection.
+                    needs_restart = (
+                        stream_name in self.processors
+                        and self.processors[stream_name].is_alive()
+                    )
+
+                if needs_restart:
+                    self.logger.info(f"Stream {stream_name}: new publisher ready but old processor alive - restarting processor")
+                    self.stop_processor(stream_name)
 
                 # Get client IP (Tailscale IP)
                 client_ip = request.remote_addr
 
                 # Get device info from pre-registration, or use defaults
-                if stream_name in self.device_info:
-                    device_id = self.device_info[stream_name].get('device_id', stream_name)
-                    password = self.device_info[stream_name].get('password', '')
-                else:
-                    # No pre-registration, use stream name as device_id
-                    device_id = stream_name
-                    password = ''
-                    self.device_info[stream_name] = {
-                        'device_id': device_id,
-                        'password': password,
-                        'timestamp': time.time()
-                    }
+                with self._state_lock:
+                    if stream_name in self.device_info:
+                        device_id = self.device_info[stream_name].get('device_id', stream_name)
+                        password = self.device_info[stream_name].get('password', '')
+                    else:
+                        # No pre-registration, use stream name as device_id
+                        device_id = stream_name
+                        password = ''
+                        self.device_info[stream_name] = {
+                            'device_id': device_id,
+                            'password': password,
+                            'timestamp': time.time()
+                        }
 
                 # Update device status in database
                 try:
-                    conn = get_db()
-                    c = conn.cursor()
-                    c.execute('SELECT * FROM devices WHERE device_id = ?', (device_id,))
-                    existing = c.fetchone()
+                    with get_db() as conn:
+                        c = conn.cursor()
+                        c.execute('SELECT * FROM devices WHERE device_id = ?', (device_id,))
+                        existing = c.fetchone()
 
-                    if existing:
-                        # Update existing device
-                        c.execute('''
-                            UPDATE devices
-                            SET stream_name = ?, tailscale_ip = ?, last_seen = ?, status = 'online'
-                            WHERE device_id = ?
-                        ''', (stream_name, client_ip, datetime.now(), device_id))
-                    else:
-                        # Insert new device
-                        c.execute('''
-                            INSERT INTO devices (device_id, stream_name, tailscale_ip, last_seen, status)
-                            VALUES (?, ?, ?, ?, 'online')
-                        ''', (device_id, stream_name, client_ip, datetime.now()))
+                        if existing:
+                            # Update existing device
+                            c.execute('''
+                                UPDATE devices
+                                SET stream_name = ?, tailscale_ip = ?, last_seen = ?, status = 'online'
+                                WHERE device_id = ?
+                            ''', (stream_name, client_ip, datetime.now(), device_id))
+                        else:
+                            # Insert new device
+                            c.execute('''
+                                INSERT INTO devices (device_id, stream_name, tailscale_ip, last_seen, status)
+                                VALUES (?, ?, ?, ?, 'online')
+                            ''', (device_id, stream_name, client_ip, datetime.now()))
 
-                    conn.commit()
-                    conn.close()
+                        conn.commit()
                 except Exception as e:
                     self.logger.error(f"Error updating device status in database: {e}")
 
@@ -357,32 +441,61 @@ class StreamOrchestrator:
 
         @self.app.route('/status', methods=['GET'])
         def status():
-            """Get orchestrator status"""
-            return jsonify({
-                'running': self.running,
-                'mediamtx_healthy': self.mediamtx.is_healthy(),
-                'active_streams': list(self.processors.keys()),
-                'processor_count': len(self.processors),
-                'max_processors': MAX_PROCESSORS,
-                'device_info': {
-                    stream: {
-                        'device_id': info['device_id'],
-                        'has_password': bool(info.get('password'))
+            """Get orchestrator status - non-blocking to prevent website hangs"""
+            # Use timeout to prevent blocking forever during high contention
+            # (e.g., mass disconnections causing many webhook handlers to hold the lock)
+            acquired = self._state_lock.acquire(timeout=2)
+            if not acquired:
+                # Lock unavailable - return 503 so website shows error instead of hanging
+                self.logger.warning("Status endpoint: lock unavailable (server busy)")
+                return jsonify({
+                    'error': 'Server busy',
+                    'running': self.running,
+                    'active_streams': [],
+                    'processor_count': 0,
+                    'max_processors': MAX_PROCESSORS
+                }), 503
+            try:
+                return jsonify({
+                    'running': self.running,
+                    'mediamtx_healthy': self.mediamtx.is_healthy(),
+                    'active_streams': list(self.processors.keys()),
+                    'processor_count': len(self.processors),
+                    'max_processors': MAX_PROCESSORS,
+                    'device_info': {
+                        stream: {
+                            'device_id': info['device_id'],
+                            'has_password': bool(info.get('password'))
+                        }
+                        for stream, info in self.device_info.items()
                     }
-                    for stream, info in self.device_info.items()
-                }
-            }), 200
+                }), 200
+            finally:
+                self._state_lock.release()
 
         @self.app.route('/processors', methods=['GET'])
         def processors():
             """Get processor information"""
+            with self._state_lock:
+                processors_copy = list(self.processors.items())
             processor_info = {}
-            for stream_name, proc in self.processors.items():
+            for stream_name, proc in processors_copy:
                 processor_info[stream_name] = {
                     'alive': proc.is_alive(),
                     'pid': proc.pid
                 }
             return jsonify(processor_info), 200
+
+        @self.app.route('/api/resources', methods=['GET'])
+        def get_resources():
+            """Get resource usage statistics for monitoring"""
+            with self._state_lock:
+                processor_count = len(self.processors)
+            return jsonify({
+                'open_fds': _get_fd_count(),
+                'thread_count': threading.active_count(),
+                'processor_count': processor_count,
+            }), 200
 
         @self.app.route('/device/register', methods=['POST'])
         def register_device():
@@ -410,46 +523,63 @@ class StreamOrchestrator:
                 return jsonify({'status': 'error', 'message': 'Invalid credentials'}), 401
             self.logger.info(f"✓ Credentials valid for {device_id}")
 
+            # Clean up stale state from previous connection
+            # This handles unclean disconnects where the old RTSP session lingers
+            if stream_name in self.processors:
+                self.logger.info(f"Stopping stale processor for {stream_name} during re-registration")
+                self.stop_processor(stream_name)
+
+            kicked = self.mediamtx.kick_path_publishers(stream_name)
+            if kicked:
+                self.logger.info(f"Kicked {kicked} stale publisher session(s) for {stream_name}")
+
+            with self._state_lock:
+                self.pending_reconnect.pop(stream_name, None)
+
+            if kicked:
+                time.sleep(1)  # Let MediaMTX fully clean up before counter starts FFmpeg
+
             # Get client IP (Tailscale IP)
             client_ip = request.remote_addr
 
             # Store device info in memory
-            self.device_info[stream_name] = {
-                'device_id': device_id,
-                'password': password,
-                'timestamp': time.time()
-            }
+            with self._state_lock:
+                self.device_info[stream_name] = {
+                    'device_id': device_id,
+                    'password': password,
+                    'timestamp': time.time()
+                }
 
             # Store device info in database
             try:
-                conn = get_db()
-                c = conn.cursor()
+                with get_db() as conn:
+                    c = conn.cursor()
 
-                # Check if device exists
-                c.execute('SELECT * FROM devices WHERE device_id = ?', (device_id,))
-                existing = c.fetchone()
+                    # Check if device exists
+                    c.execute('SELECT * FROM devices WHERE device_id = ?', (device_id,))
+                    existing = c.fetchone()
 
-                if existing:
-                    # Update existing device
-                    c.execute('''
-                        UPDATE devices
-                        SET stream_name = ?, tailscale_ip = ?, last_seen = ?, status = 'online'
-                        WHERE device_id = ?
-                    ''', (stream_name, client_ip, datetime.now(), device_id))
-                else:
-                    # Insert new device
-                    c.execute('''
-                        INSERT INTO devices (device_id, stream_name, tailscale_ip, last_seen, status)
-                        VALUES (?, ?, ?, ?, 'online')
-                    ''', (device_id, stream_name, client_ip, datetime.now()))
+                    if existing:
+                        # Update existing device
+                        c.execute('''
+                            UPDATE devices
+                            SET stream_name = ?, tailscale_ip = ?, last_seen = ?, status = 'online'
+                            WHERE device_id = ?
+                        ''', (stream_name, client_ip, datetime.now(), device_id))
+                    else:
+                        # Insert new device
+                        c.execute('''
+                            INSERT INTO devices (device_id, stream_name, tailscale_ip, last_seen, status)
+                            VALUES (?, ?, ?, ?, 'online')
+                        ''', (device_id, stream_name, client_ip, datetime.now()))
 
-                conn.commit()
-                conn.close()
+                    conn.commit()
 
                 self.logger.info(f"Registered device: {device_id} (stream: {stream_name}, IP: {client_ip})")
 
                 # Reset restart failure tracking - device has re-registered fresh
-                self._restart_failures.pop(stream_name, None)
+                with self._state_lock:
+                    self._restart_failures.pop(stream_name, None)
 
                 return jsonify({'status': 'ok', 'stream_name': stream_name, 'device_id': device_id}), 200
 
@@ -615,7 +745,8 @@ class StreamOrchestrator:
                             <span class="status-dot"></span>
                             Tracking Enabled
                         </span>
-                        <span id="fpsBadge" class="status-badge fps">-- FPS</span>
+                        <span id="inputFpsBadge" class="status-badge fps">IN: -- FPS</span>
+                        <span id="streamFpsBadge" class="status-badge fps">OUT: -- FPS</span>
                     </div>
                     <div class="video-container">
                         <img id="streamImg" src="/video_feed/{{ stream_name }}?overlay=true" alt="Live Stream">
@@ -633,10 +764,11 @@ class StreamOrchestrator:
                         try {
                             const response = await fetch('/api/stream/' + streamName + '/stats');
                             const data = await response.json();
-                            const fpsText = data.fps.toFixed(1) + ' FPS';
-                            document.getElementById('fpsBadge').textContent = fpsText;
+                            document.getElementById('inputFpsBadge').textContent = 'IN: ' + data.input_fps.toFixed(1) + ' FPS';
+                            document.getElementById('streamFpsBadge').textContent = 'OUT: ' + data.stream_fps.toFixed(1) + ' FPS';
                         } catch (e) {
-                            document.getElementById('fpsBadge').textContent = '-- FPS';
+                            document.getElementById('inputFpsBadge').textContent = 'IN: -- FPS';
+                            document.getElementById('streamFpsBadge').textContent = 'OUT: -- FPS';
                         }
                     }
 
@@ -683,58 +815,97 @@ class StreamOrchestrator:
             show_overlay = request.args.get('overlay', 'true').lower() != 'false'
 
             def generate():
-                if stream_name not in self.frame_queues:
-                    return
+                with self._state_lock:
+                    if stream_name not in self.frame_queues:
+                        return
+                    frame_queue = self.frame_queues[stream_name]
 
-                frame_queue = self.frame_queues[stream_name]
+                    # Initialize FPS tracking for this stream
+                    if stream_name not in self.stream_stats:
+                        self.stream_stats[stream_name] = {
+                            'frame_count': 0,
+                            'last_reset': time.time(),
+                            'stream_fps': 0.0,
+                            'input_fps': 0.0,
+                        }
 
-                # Initialize FPS tracking for this stream
-                if stream_name not in self.stream_stats:
-                    self.stream_stats[stream_name] = {
-                        'frame_count': 0,
-                        'last_reset': time.time(),
-                        'fps': 0.0
-                    }
+                # Paced emission: send one frame every frame_interval to prevent
+                # bursty delivery that causes choppy playback in browsers
+                frame_interval = 1.0 / VIDEO_FPS
+                next_emit = time.time()
+                last_frame_data = None
 
                 while True:
                     try:
-                        # Get frame data from queue with timeout
-                        frame_data = frame_queue.get(timeout=1.0)
+                        # Sleep until next scheduled emission
+                        now = time.time()
+                        sleep_time = next_emit - now
+                        if sleep_time > 0.001:
+                            time.sleep(sleep_time)
 
-                        # Drain queue to get the LATEST frame (reduces lag)
-                        while True:
-                            try:
+                        # Drain queue to get the LATEST frame at this emission tick
+                        frame_data = None
+                        try:
+                            while True:
                                 frame_data = frame_queue.get_nowait()
-                            except queue.Empty:
-                                break
+                        except queue.Empty:
+                            pass
+
+                        if frame_data is None:
+                            if last_frame_data is not None:
+                                # No new frame — re-send last frame to maintain cadence
+                                frame_data = last_frame_data
+                            else:
+                                # No frame yet — block briefly for the first one
+                                try:
+                                    frame_data = frame_queue.get(timeout=1.0)
+                                except queue.Empty:
+                                    continue
+
+                        last_frame_data = frame_data
+
+                        # Schedule next emission (increment from scheduled time to prevent drift)
+                        next_emit += frame_interval
+                        if next_emit < time.time() - frame_interval:
+                            next_emit = time.time() + frame_interval
 
                         # Handle both old format (single frame) and new format (dict with clean/annotated)
                         if isinstance(frame_data, dict):
                             frame = frame_data['annotated'] if show_overlay else frame_data['clean']
+                            # Update input FPS from processor stats
+                            processor_fps = frame_data.get('processor_fps', 0.0)
+                            if processor_fps > 0:
+                                with self._state_lock:
+                                    if stream_name in self.stream_stats:
+                                        self.stream_stats[stream_name]['input_fps'] = processor_fps
                         else:
-                            # Backwards compatibility: single frame
                             frame = frame_data
 
-                        # Update FPS stats
-                        stats = self.stream_stats[stream_name]
-                        stats['frame_count'] += 1
-                        elapsed = time.time() - stats['last_reset']
-                        if elapsed >= 1.0:
-                            stats['fps'] = stats['frame_count'] / elapsed
-                            stats['frame_count'] = 0
-                            stats['last_reset'] = time.time()
+                        # Update stream FPS stats (rate of frames delivered to viewer)
+                        with self._state_lock:
+                            if stream_name in self.stream_stats:
+                                stats = self.stream_stats[stream_name]
+                                stats['frame_count'] += 1
+                                elapsed = time.time() - stats['last_reset']
+                                if elapsed >= 1.0:
+                                    stats['stream_fps'] = stats['frame_count'] / elapsed
+                                    stats['frame_count'] = 0
+                                    stats['last_reset'] = time.time()
 
                         # Encode frame as JPEG
                         ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
                         if not ret:
                             continue
 
-                        # Yield frame in MJPEG format
+                        jpeg_bytes = buffer.tobytes()
+
+                        # Yield frame in MJPEG format with Content-Length for efficient browser parsing
                         yield (b'--frame\r\n'
-                               b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
+                               b'Content-Type: image/jpeg\r\n'
+                               b'Content-Length: ' + str(len(jpeg_bytes)).encode() + b'\r\n\r\n'
+                               + jpeg_bytes + b'\r\n')
 
                     except queue.Empty:
-                        # No frame available, continue waiting
                         continue
                     except Exception as e:
                         self.logger.error(f"Error in video feed for {stream_name}: {e}")
@@ -746,18 +917,21 @@ class StreamOrchestrator:
         @self.app.route('/api/stream/<stream_name>/stats')
         def stream_stats(stream_name):
             """Get stream statistics including FPS"""
-            if stream_name in self.stream_stats:
-                stats = self.stream_stats[stream_name]
+            with self._state_lock:
+                if stream_name in self.stream_stats:
+                    stats = self.stream_stats[stream_name]
+                    return jsonify({
+                        'stream_name': stream_name,
+                        'input_fps': round(stats.get('input_fps', 0), 1),
+                        'stream_fps': round(stats.get('stream_fps', 0), 1),
+                        'active': stream_name in self.processors
+                    })
                 return jsonify({
                     'stream_name': stream_name,
-                    'fps': round(stats['fps'], 1),
+                    'input_fps': 0,
+                    'stream_fps': 0,
                     'active': stream_name in self.processors
                 })
-            return jsonify({
-                'stream_name': stream_name,
-                'fps': 0,
-                'active': stream_name in self.processors
-            })
 
         # Web Dashboard Routes
         @self.app.route('/')
@@ -777,11 +951,10 @@ class StreamOrchestrator:
             try:
                 update_device_status()
 
-                conn = get_db()
-                c = conn.cursor()
-                c.execute('SELECT * FROM devices ORDER BY device_id')
-                devices = [dict(row) for row in c.fetchall()]
-                conn.close()
+                with get_db() as conn:
+                    c = conn.cursor()
+                    c.execute('SELECT * FROM devices ORDER BY device_id')
+                    devices = [dict(row) for row in c.fetchall()]
 
                 return jsonify(devices)
 
@@ -793,11 +966,10 @@ class StreamOrchestrator:
         def get_device_info(device_id):
             """Get details of a specific device"""
             try:
-                conn = get_db()
-                c = conn.cursor()
-                c.execute('SELECT * FROM devices WHERE device_id = ?', (device_id,))
-                device = c.fetchone()
-                conn.close()
+                with get_db() as conn:
+                    c = conn.cursor()
+                    c.execute('SELECT * FROM devices WHERE device_id = ?', (device_id,))
+                    device = c.fetchone()
 
                 if not device:
                     return jsonify({'error': 'Device not found'}), 404
@@ -812,11 +984,10 @@ class StreamOrchestrator:
         def restart_device(device_id):
             """Restart a device's camera stream service"""
             try:
-                conn = get_db()
-                c = conn.cursor()
-                c.execute('SELECT tailscale_ip FROM devices WHERE device_id = ?', (device_id,))
-                result = c.fetchone()
-                conn.close()
+                with get_db() as conn:
+                    c = conn.cursor()
+                    c.execute('SELECT tailscale_ip FROM devices WHERE device_id = ?', (device_id,))
+                    result = c.fetchone()
 
                 if not result or not result['tailscale_ip']:
                     return jsonify({'error': 'Device not found or no IP'}), 404
@@ -860,11 +1031,10 @@ class StreamOrchestrator:
         def stop_device(device_id):
             """Stop a device's camera stream service"""
             try:
-                conn = get_db()
-                c = conn.cursor()
-                c.execute('SELECT tailscale_ip FROM devices WHERE device_id = ?', (device_id,))
-                result = c.fetchone()
-                conn.close()
+                with get_db() as conn:
+                    c = conn.cursor()
+                    c.execute('SELECT tailscale_ip FROM devices WHERE device_id = ?', (device_id,))
+                    result = c.fetchone()
 
                 if not result or not result['tailscale_ip']:
                     return jsonify({'error': 'Device not found or no IP'}), 404
@@ -898,11 +1068,10 @@ class StreamOrchestrator:
         def start_device(device_id):
             """Start a device's camera stream service"""
             try:
-                conn = get_db()
-                c = conn.cursor()
-                c.execute('SELECT tailscale_ip FROM devices WHERE device_id = ?', (device_id,))
-                result = c.fetchone()
-                conn.close()
+                with get_db() as conn:
+                    c = conn.cursor()
+                    c.execute('SELECT tailscale_ip FROM devices WHERE device_id = ?', (device_id,))
+                    result = c.fetchone()
 
                 if not result or not result['tailscale_ip']:
                     return jsonify({'error': 'Device not found or no IP'}), 404
@@ -936,11 +1105,10 @@ class StreamOrchestrator:
         def get_device_logs(device_id):
             """Get service logs from a device"""
             try:
-                conn = get_db()
-                c = conn.cursor()
-                c.execute('SELECT tailscale_ip FROM devices WHERE device_id = ?', (device_id,))
-                result = c.fetchone()
-                conn.close()
+                with get_db() as conn:
+                    c = conn.cursor()
+                    c.execute('SELECT tailscale_ip FROM devices WHERE device_id = ?', (device_id,))
+                    result = c.fetchone()
 
                 if not result or not result['tailscale_ip']:
                     return jsonify({'error': 'Device not found or no IP'}), 404
@@ -1004,47 +1172,43 @@ class StreamOrchestrator:
                     except (ValueError, TypeError):
                         return jsonify({'error': 'FPS must be an integer'}), 400
 
-                conn = get_db()
-                c = conn.cursor()
-                c.execute('SELECT tailscale_ip FROM devices WHERE device_id = ?', (device_id,))
-                result = c.fetchone()
+                with get_db() as conn:
+                    c = conn.cursor()
+                    c.execute('SELECT tailscale_ip FROM devices WHERE device_id = ?', (device_id,))
+                    result = c.fetchone()
 
-                if not result or not result['tailscale_ip']:
-                    conn.close()
-                    return jsonify({'error': 'Device not found or no IP'}), 404
+                    if not result or not result['tailscale_ip']:
+                        return jsonify({'error': 'Device not found or no IP'}), 404
 
-                ip = result['tailscale_ip']
+                    ip = result['tailscale_ip']
 
-                # Get SSH password if available
-                password = self.ssh_passwords.get(device_id)
+                    # Get SSH password if available
+                    password = self.ssh_passwords.get(device_id)
 
-                # Check if password is required but not provided
-                if '@' in device_id and not password:
-                    conn.close()
-                    return jsonify({
-                        'error': 'Password required',
-                        'requires_password': True
-                    }), 401
+                    # Check if password is required but not provided
+                    if '@' in device_id and not password:
+                        return jsonify({
+                            'error': 'Password required',
+                            'requires_password': True
+                        }), 401
 
-                # Update database
-                updates = []
-                values = []
-                if 'width' in data:
-                    updates.append('width = ?')
-                    values.append(data['width'])
-                if 'height' in data:
-                    updates.append('height = ?')
-                    values.append(data['height'])
-                if 'fps' in data:
-                    updates.append('fps = ?')
-                    values.append(data['fps'])
+                    # Update database
+                    updates = []
+                    values = []
+                    if 'width' in data:
+                        updates.append('width = ?')
+                        values.append(data['width'])
+                    if 'height' in data:
+                        updates.append('height = ?')
+                        values.append(data['height'])
+                    if 'fps' in data:
+                        updates.append('fps = ?')
+                        values.append(data['fps'])
 
-                if updates:
-                    values.append(device_id)
-                    c.execute(f'UPDATE devices SET {", ".join(updates)} WHERE device_id = ?', values)
-                    conn.commit()
-
-                conn.close()
+                    if updates:
+                        values.append(device_id)
+                        c.execute(f'UPDATE devices SET {", ".join(updates)} WHERE device_id = ?', values)
+                        conn.commit()
 
                 # Update config file on device
                 commands = []
@@ -1079,11 +1243,10 @@ class StreamOrchestrator:
         def get_device_service_status(device_id):
             """Get current service status from device"""
             try:
-                conn = get_db()
-                c = conn.cursor()
-                c.execute('SELECT tailscale_ip FROM devices WHERE device_id = ?', (device_id,))
-                result = c.fetchone()
-                conn.close()
+                with get_db() as conn:
+                    c = conn.cursor()
+                    c.execute('SELECT tailscale_ip FROM devices WHERE device_id = ?', (device_id,))
+                    result = c.fetchone()
 
                 if not result or not result['tailscale_ip']:
                     return jsonify({'error': 'Device not found or no IP'}), 404
@@ -1189,6 +1352,192 @@ class StreamOrchestrator:
                 self.logger.error(f"Error checking password requirement: {e}")
                 return jsonify({'error': str(e)}), 500
 
+    def _detect_available_gpus(self) -> int:
+        """Detect the number of available CUDA GPUs.
+
+        Uses NUM_GPUS environment variable as override if set > 1,
+        otherwise auto-detects via PyTorch.
+        """
+        try:
+            import torch
+            detected = torch.cuda.device_count()
+            self.logger.info(f"Detected {detected} CUDA GPU(s)")
+
+            # Use NUM_GPUS as override if explicitly set higher than detected
+            # This handles cases where Docker GPU mapping differs from CUDA detection
+            if NUM_GPUS > detected:
+                self.logger.info(f"NUM_GPUS={NUM_GPUS} overrides detected count ({detected})")
+                return NUM_GPUS
+
+            return detected
+        except Exception:
+            self.logger.warning("Could not detect CUDA GPUs, falling back to NUM_GPUS config")
+            return NUM_GPUS
+
+    def start_inference_servers(self):
+        """
+        Start centralized inference servers, one per GPU.
+        Must be called before starting any camera processors.
+        """
+        from pathlib import Path
+
+        num_gpus = self._detect_available_gpus()
+        if num_gpus == 0:
+            self.logger.warning("No GPUs detected - processors will use legacy per-process mode")
+            return
+
+        # Get model paths from the processor class defaults
+        models_dir = Path(__file__).parent.parent.parent / "models"
+        model_path = str(models_dir / "v3_0_0.pt")
+        reid_model_name = "osnet_x0_25"  # Default ReID model
+
+        self.logger.info(f"Starting {num_gpus} inference server(s)...")
+
+        # Pre-allocate result queue pools with per-GPU slot limits
+        for gpu_id in range(num_gpus):
+            # Get slot limit for this GPU (default to MAX_PROCESSORS if not specified)
+            slots_for_gpu = GPU_SLOT_LIMITS.get(gpu_id, MAX_PROCESSORS)
+
+            # Create shared request queue for this GPU
+            request_queue = multiprocessing.Queue(maxsize=INFERENCE_QUEUE_MAXSIZE)
+            self.inference_request_queues[gpu_id] = request_queue
+
+            # Pre-allocate result queue pool (these are inherited by the child process)
+            result_queues = {}
+            slot_assignments = {}
+            for slot_idx in range(slots_for_gpu):
+                slot_name = f"slot_{slot_idx}"
+                result_queues[slot_name] = multiprocessing.Queue(maxsize=50)
+                slot_assignments[slot_name] = None  # Not assigned yet
+            self._result_queue_pools[gpu_id] = result_queues
+            self._slot_assignments[gpu_id] = slot_assignments
+
+            # Create and start inference server process
+            server = InferenceServer(
+                gpu_id=gpu_id,
+                model_path=model_path,
+                reid_model_name=reid_model_name,
+                request_queue=request_queue,
+                result_queues=result_queues,
+                config={
+                    'imgsz': INFERENCE_IMGSZ,
+                },
+            )
+
+            proc = multiprocessing.Process(
+                target=server.run,
+                name=f"InferenceServer-GPU{gpu_id}",
+            )
+            proc.start()
+            self.inference_servers[gpu_id] = proc
+            self.logger.info(
+                f"Inference server started on GPU {gpu_id} (PID: {proc.pid}, "
+                f"{slots_for_gpu} result queue slots pre-allocated)"
+            )
+
+    def stop_inference_servers(self):
+        """Stop all inference server processes."""
+        for gpu_id, proc in list(self.inference_servers.items()):
+            self.logger.info(f"Stopping inference server on GPU {gpu_id}...")
+            try:
+                # Send shutdown request
+                if gpu_id in self.inference_request_queues:
+                    try:
+                        self.inference_request_queues[gpu_id].put_nowait(
+                            InferenceRequest(type=RequestType.SHUTDOWN, camera_id="__shutdown__")
+                        )
+                    except Exception:
+                        pass
+
+                proc.join(timeout=10)
+                if proc.is_alive():
+                    self.logger.warning(f"Inference server GPU {gpu_id} didn't stop gracefully, killing")
+                    proc.kill()
+                    proc.join(timeout=3)
+                    if proc.is_alive():
+                        self.logger.error(f"Inference server GPU {gpu_id} won't die - abandoning")
+                self.logger.info(f"Inference server GPU {gpu_id} stopped")
+            except Exception as e:
+                self.logger.error(f"Error stopping inference server GPU {gpu_id}: {e}")
+
+        # Cleanup all queues before clearing
+        for gpu_id, req_queue in list(self.inference_request_queues.items()):
+            _cleanup_queue(req_queue)
+
+        for gpu_id, result_queues in list(self._result_queue_pools.items()):
+            for slot_name, result_queue in result_queues.items():
+                _cleanup_queue(result_queue)
+
+        self.inference_servers.clear()
+        self.inference_request_queues.clear()
+        self._result_queue_pools.clear()
+        self._slot_assignments.clear()
+
+    def _assign_camera_to_gpu(self, stream_name: str) -> tuple:
+        """Assign a camera to a GPU using priority-based allocation.
+
+        GPUs are filled in priority order (GPU_PRIORITY_ORDER config).
+        Default: GPU 1 first (25 slots), then overflow to GPU 0 (10 slots).
+
+        Returns:
+            (gpu_id, slot_name) or (-1, None) if no servers/slots available
+        """
+        with self._state_lock:
+            if not self.inference_servers:
+                return -1, None
+
+            # Check if this camera already has an assignment (race condition protection)
+            if stream_name in self.camera_gpu_assignments:
+                existing = self.camera_gpu_assignments[stream_name]
+                self.logger.warning(f"Camera {stream_name} already assigned to GPU {existing[0]}, slot {existing[1]} - reusing")
+                return existing
+
+            # Try GPUs in priority order (fill primary GPU first, then overflow)
+            available_gpus = [g for g in GPU_PRIORITY_ORDER if g in self.inference_servers]
+            # Also include any GPUs not in priority list (fallback)
+            for gpu_id in self.inference_servers.keys():
+                if gpu_id not in available_gpus:
+                    available_gpus.append(gpu_id)
+
+            for idx, gpu_id in enumerate(available_gpus):
+                # Count current usage on this GPU
+                used_slots = sum(1 for c in self._slot_assignments[gpu_id].values() if c is not None)
+                total_slots = len(self._slot_assignments[gpu_id])
+
+                # Find a free slot on this GPU
+                slot_name = None
+                for sname, camera_id in self._slot_assignments[gpu_id].items():
+                    if camera_id is None:
+                        slot_name = sname
+                        break
+
+                if slot_name is not None:
+                    # Found a free slot - use it
+                    self._slot_assignments[gpu_id][slot_name] = stream_name
+                    self.camera_gpu_assignments[stream_name] = (gpu_id, slot_name)
+                    used_slots += 1  # Include the one we just assigned
+                    if idx > 0:
+                        # We had to overflow to a secondary GPU
+                        self.logger.info(f"Assigned camera {stream_name} to OVERFLOW GPU {gpu_id}, slot {slot_name} ({used_slots}/{total_slots} slots used)")
+                    else:
+                        self.logger.info(f"Assigned camera {stream_name} to GPU {gpu_id}, slot {slot_name} ({used_slots}/{total_slots} slots used)")
+                    return gpu_id, slot_name
+                else:
+                    # This GPU is full, log and try next
+                    self.logger.debug(f"GPU {gpu_id} full ({used_slots}/{total_slots} slots) - trying next GPU")
+
+            # No free slots on any GPU
+            self.logger.error(f"No free result queue slots on any GPU for camera {stream_name}")
+            return -1, None
+
+    def _has_inference_servers(self) -> bool:
+        """Check if centralized inference servers are running."""
+        with self._state_lock:
+            if not self.inference_servers:
+                return False
+            servers_copy = list(self.inference_servers.values())
+        return all(proc.is_alive() for proc in servers_copy)
+
     def start_processor(self, stream_name: str):
         """
         Start a processor for a stream
@@ -1196,26 +1545,43 @@ class StreamOrchestrator:
         Args:
             stream_name: Name of the stream to process
         """
-        # Check if already processing
-        if stream_name in self.processors:
-            proc = self.processors[stream_name]
-            if proc.is_alive():
-                self.logger.info(f"Processor for {stream_name} is already running")
-                return
+        # Check if already processing or being started
+        with self._state_lock:
+            if stream_name in self.processors:
+                proc = self.processors[stream_name]
+                if proc.is_alive():
+                    self.logger.info(f"Processor for {stream_name} is already running")
+                    return
+                else:
+                    self.logger.warning(f"Processor for {stream_name} was dead, restarting")
+                    # Release lock before calling stop_processor (which acquires it)
+                    needs_stop = True
             else:
-                self.logger.warning(f"Processor for {stream_name} was dead, restarting")
-                self.stop_processor(stream_name)
+                needs_stop = False
 
-        # Check processor limit
-        if len(self.processors) >= MAX_PROCESSORS:
-            self.logger.warning(f"Maximum processors ({MAX_PROCESSORS}) reached, cannot start processor for {stream_name}")
-            return
+            # Check if another thread is already starting a processor for this stream
+            if not needs_stop and stream_name in self._starting_processors:
+                self.logger.info(f"Processor for {stream_name} is being started by another thread - skipping")
+                return
+
+            # Check processor limit
+            if len(self.processors) >= MAX_PROCESSORS:
+                self.logger.warning(f"Maximum processors ({MAX_PROCESSORS}) reached, cannot start processor for {stream_name}")
+                return
+
+            # Mark as starting to prevent duplicate attempts
+            if not needs_stop:
+                self._starting_processors.add(stream_name)
+
+        if needs_stop:
+            self.stop_processor(stream_name)
 
         # Create RTSP URL
         rtsp_url = f"rtsp://{RTSP_HOST}:{RTSP_PORT}/{stream_name}"
 
         # Get device info if available
-        device_info = self.device_info.get(stream_name, {})
+        with self._state_lock:
+            device_info = self.device_info.get(stream_name, {})
 
         self.logger.info(f"Starting processor for stream: {stream_name}")
 
@@ -1229,27 +1595,91 @@ class StreamOrchestrator:
                 base_url='https://api.crowdcount.tech',
                 timeout=5
             )
-            self.api_clients[stream_name] = api_client
-
-            # Update device status to online
-            threading.Thread(target=api_client.update_status, args=('online',), daemon=True).start()
 
             # Create frame queue for live viewing
             frame_queue = multiprocessing.Queue(maxsize=15)  # 1 second buffer added
-            self.frame_queues[stream_name] = frame_queue
 
-            # Create processor instance with device info and frame queue
-            processor = self.processor_class(stream_name, rtsp_url, device_info=device_info, frame_queue=frame_queue)
+            with self._state_lock:
+                self.api_clients[stream_name] = api_client
+                self.frame_queues[stream_name] = frame_queue
+
+            # Update device status to online
+            self._status_update_executor.submit(api_client.update_status, 'online')
+
+            # Set up centralized inference queues if servers are running
+            inference_request_queue = None
+            inference_result_queue = None
+
+            if self._has_inference_servers():
+                self.logger.info(f"Assigning {stream_name} to GPU...")
+                gpu_id, slot_name = self._assign_camera_to_gpu(stream_name)
+                self.logger.info(f"Assignment result for {stream_name}: gpu_id={gpu_id}, slot_name={slot_name}")
+                if gpu_id >= 0 and slot_name is not None:
+                    inference_request_queue = self.inference_request_queues[gpu_id]
+                    inference_result_queue = self._result_queue_pools[gpu_id][slot_name]
+                    self.logger.info(f"Sending REGISTER for {stream_name} to GPU {gpu_id}, slot {slot_name}")
+                    # Send REGISTER request so inference server maps camera_id -> slot
+                    inference_request_queue.put(InferenceRequest(
+                        type=RequestType.REGISTER,
+                        camera_id=stream_name,
+                        slot_name=slot_name,
+                    ))
+                    self.logger.info(f"Camera {stream_name} using centralized inference on GPU {gpu_id} (slot {slot_name})")
+                else:
+                    self.logger.warning(f"Failed to assign {stream_name} to GPU - will use legacy mode")
+
+            # Create processor instance with device info, frame queue, and inference queues
+            # Use try/except to handle processor classes that don't accept all kwargs
+            try:
+                processor_kwargs = {
+                    'device_info': device_info,
+                    'frame_queue': frame_queue,
+                }
+                if inference_request_queue is not None:
+                    processor_kwargs['inference_request_queue'] = inference_request_queue
+                    processor_kwargs['inference_result_queue'] = inference_result_queue
+                processor = self.processor_class(stream_name, rtsp_url, **processor_kwargs)
+            except TypeError:
+                # Fallback for processor classes that don't accept all kwargs
+                processor = self.processor_class(stream_name, rtsp_url, device_info=device_info)
 
             # Start in separate process for isolation
             proc = multiprocessing.Process(target=processor.run, name=f"Processor-{stream_name}")
             proc.start()
 
-            self.processors[stream_name] = proc
+            with self._state_lock:
+                self.processors[stream_name] = proc
+                self._starting_processors.discard(stream_name)
             self.logger.info(f"Processor started for {stream_name} (PID: {proc.pid})")
 
         except Exception as e:
             self.logger.error(f"Error starting processor for {stream_name}: {e}")
+            # Clean up GPU assignment if registered but failed to start
+            with self._state_lock:
+                self._starting_processors.discard(stream_name)
+                assignment = self.camera_gpu_assignments.pop(stream_name, None)
+                if assignment:
+                    gpu_id, slot_name = assignment
+                    if gpu_id in self._slot_assignments and slot_name in self._slot_assignments[gpu_id]:
+                        self._slot_assignments[gpu_id][slot_name] = None
+                    # Send UNREGISTER
+                    if gpu_id in self.inference_request_queues:
+                        try:
+                            self.inference_request_queues[gpu_id].put_nowait(InferenceRequest(
+                                type=RequestType.UNREGISTER,
+                                camera_id=stream_name,
+                            ))
+                        except queue.Full:
+                            self.logger.warning(f"Inference queue full, could not send UNREGISTER for {stream_name}")
+                        except Exception as ue:
+                            self.logger.error(f"Failed to send UNREGISTER after startup failure: {ue}")
+                # Pop queue for cleanup outside lock
+                frame_queue = self.frame_queues.pop(stream_name, None)
+                self.api_clients.pop(stream_name, None)
+
+            # Clean up frame queue OUTSIDE lock (join_thread can block)
+            if frame_queue:
+                _cleanup_queue(frame_queue)
 
     def stop_processor(self, stream_name: str):
         """
@@ -1258,13 +1688,13 @@ class StreamOrchestrator:
         Args:
             stream_name: Name of the stream
         """
-        if stream_name not in self.processors:
-            self.logger.warning(f"No processor found for {stream_name}")
-            return
+        with self._state_lock:
+            if stream_name not in self.processors:
+                self.logger.warning(f"No processor found for {stream_name}")
+                return
+            proc = self.processors[stream_name]
 
         self.logger.info(f"Stopping processor for {stream_name}")
-
-        proc = self.processors[stream_name]
 
         try:
             # Terminate process
@@ -1276,7 +1706,9 @@ class StreamOrchestrator:
                 if proc.is_alive():
                     self.logger.warning(f"Processor for {stream_name} didn't stop gracefully, killing")
                     proc.kill()
-                    proc.join()
+                    proc.join(timeout=3)  # Timeout to prevent blocking forever
+                    if proc.is_alive():
+                        self.logger.error(f"Processor for {stream_name} won't die even after kill - abandoning")
 
             self.logger.info(f"Processor stopped for {stream_name}")
 
@@ -1285,73 +1717,119 @@ class StreamOrchestrator:
 
         finally:
             # Update device status to offline
-            if stream_name in self.api_clients:
-                api_client = self.api_clients[stream_name]
-                threading.Thread(target=api_client.update_status, args=('offline',), daemon=True).start()
-                del self.api_clients[stream_name]
+            with self._state_lock:
+                api_client = self.api_clients.pop(stream_name, None)
+            if api_client:
+                self._status_update_executor.submit(api_client.update_status, 'offline')
 
-            # Clean up processor entry (use pop to avoid KeyError)
-            self.processors.pop(stream_name, None)
-            # Clean up frame queue
-            if stream_name in self.frame_queues:
-                del self.frame_queues[stream_name]
+            with self._state_lock:
+                # Clean up processor entry (use pop to avoid KeyError)
+                self.processors.pop(stream_name, None)
+                # Pop frame queue for cleanup outside lock (join_thread can block)
+                frame_queue = self.frame_queues.pop(stream_name, None)
+                # Clean up stream stats
+                self.stream_stats.pop(stream_name, None)
+                # Clean up inference assignment and send UNREGISTER
+                assignment = self.camera_gpu_assignments.pop(stream_name, None)
+                if assignment is not None:
+                    gpu_id, slot_name = assignment
+                    # Release the slot
+                    if gpu_id in self._slot_assignments and slot_name in self._slot_assignments[gpu_id]:
+                        self._slot_assignments[gpu_id][slot_name] = None
+                    # Tell inference server to unregister this camera
+                    if gpu_id in self.inference_request_queues:
+                        try:
+                            self.inference_request_queues[gpu_id].put_nowait(InferenceRequest(
+                                type=RequestType.UNREGISTER,
+                                camera_id=stream_name,
+                            ))
+                        except queue.Full:
+                            self.logger.warning(f"Inference queue full, could not send UNREGISTER for {stream_name}")
+                        except Exception as e:
+                            self.logger.error(f"Failed to send UNREGISTER for {stream_name}: {e}")
+
+            # Clean up frame queue OUTSIDE lock (join_thread can block)
+            if frame_queue:
+                _cleanup_queue(frame_queue)
             # Keep device info for reconnection (don't delete credentials)
 
     def _handle_stream_interruption(self, stream_name: str):
         """
         Handle stream interruption with reconnect grace period.
-        Stops the processor but doesn't mark offline immediately - waits for possible reconnection.
+        Does NOT kill the processor — lets it exit naturally when the jitter buffer
+        declares staleness (~15s) and consecutive failures accumulate (~2s more).
+        This avoids the SIGTERM-during-FFmpeg race condition.
         """
-        if stream_name in self.pending_reconnect:
-            # Already pending, just update timestamp
-            self.pending_reconnect[stream_name]['stop_time'] = time.time()
-            return
+        with self._state_lock:
+            if stream_name in self.pending_reconnect:
+                # Already pending, just update timestamp
+                self.pending_reconnect[stream_name]['stop_time'] = time.time()
+                return
 
-        # Stop processor but preserve API client for later offline update
-        api_client = self.api_clients.pop(stream_name, None)
+            # Preserve API client for later offline update
+            api_client = self.api_clients.pop(stream_name, None)
 
-        if stream_name in self.processors:
-            proc = self.processors[stream_name]
-            try:
-                if proc.is_alive():
-                    proc.terminate()
-                    proc.join(timeout=5)
-                    if proc.is_alive():
-                        proc.kill()
-                        proc.join()
-                self.logger.info(f"Processor stopped for {stream_name}")
-            except Exception as e:
-                self.logger.error(f"Error stopping processor for {stream_name}: {e}")
-            finally:
-                self.processors.pop(stream_name, None)
+            # Add to pending reconnect — processor will die on its own
+            self.pending_reconnect[stream_name] = {
+                'stop_time': time.time(),
+                'api_client': api_client
+            }
 
-        # Clean up frame queue
-        if stream_name in self.frame_queues:
-            del self.frame_queues[stream_name]
+        self.logger.info(f"Stream {stream_name} added to reconnect queue (timeout: {STREAM_RECONNECT_TIMEOUT}s) - processor will exit naturally")
 
-        # Add to pending reconnect instead of marking offline immediately
-        self.pending_reconnect[stream_name] = {
-            'stop_time': time.time(),
-            'api_client': api_client
-        }
-        self.logger.info(f"Stream {stream_name} added to reconnect queue (timeout: {STREAM_RECONNECT_TIMEOUT}s)")
+    def _cleanup_dead_processor(self, stream_name: str):
+        """
+        Clean up a dead processor's resources without marking the device offline.
+        Used by monitor_streams when a dead processor is in pending_reconnect.
+        Releases GPU slot, cleans frame queue, sends UNREGISTER.
+        """
+        with self._state_lock:
+            # Clean up processor entry
+            self.processors.pop(stream_name, None)
+            # Pop frame queue for cleanup outside lock (join_thread can block)
+            frame_queue = self.frame_queues.pop(stream_name, None)
+            # Clean up stream stats
+            self.stream_stats.pop(stream_name, None)
+            # Clean up inference assignment and send UNREGISTER
+            assignment = self.camera_gpu_assignments.pop(stream_name, None)
+            if assignment is not None:
+                gpu_id, slot_name = assignment
+                if gpu_id in self._slot_assignments and slot_name in self._slot_assignments[gpu_id]:
+                    self._slot_assignments[gpu_id][slot_name] = None
+                if gpu_id in self.inference_request_queues:
+                    try:
+                        self.inference_request_queues[gpu_id].put_nowait(InferenceRequest(
+                            type=RequestType.UNREGISTER,
+                            camera_id=stream_name,
+                        ))
+                    except queue.Full:
+                        self.logger.warning(f"Inference queue full, could not send UNREGISTER for {stream_name}")
+                    except Exception as e:
+                        self.logger.error(f"Failed to send UNREGISTER for {stream_name}: {e}")
+
+        # Clean up frame queue OUTSIDE lock (join_thread can block)
+        if frame_queue:
+            _cleanup_queue(frame_queue)
+        self.logger.info(f"Cleaned up dead processor for {stream_name} (pending reconnect)")
 
     def _check_pending_reconnects(self):
         """Check pending streams - mark offline if timeout expired, restart if reconnected."""
         current_time = time.time()
         active_streams = self.mediamtx.get_active_streams()
         streams_to_remove = []
+        streams_to_restart = []
+        streams_to_mark_offline = []
 
-        for stream_name, info in self.pending_reconnect.items():
+        with self._state_lock:
+            pending_copy = list(self.pending_reconnect.items())
+
+        for stream_name, info in pending_copy:
             elapsed = current_time - info['stop_time']
 
             # Stream came back - restart processor
             if stream_name in active_streams:
                 self.logger.info(f"Stream {stream_name} reappeared after {elapsed:.1f}s - restarting processor")
-                # Restore API client before starting processor
-                if info.get('api_client'):
-                    self.api_clients[stream_name] = info['api_client']
-                self.start_processor(stream_name)
+                streams_to_restart.append(stream_name)
                 streams_to_remove.append(stream_name)
 
             # Timeout expired - mark offline
@@ -1359,15 +1837,21 @@ class StreamOrchestrator:
                 self.logger.warning(f"Stream {stream_name} reconnect timeout ({STREAM_RECONNECT_TIMEOUT}s) - marking offline")
                 # Now mark offline
                 if info.get('api_client'):
-                    threading.Thread(
-                        target=info['api_client'].update_status,
-                        args=('offline',),
-                        daemon=True
-                    ).start()
+                    streams_to_mark_offline.append(info['api_client'])
                 streams_to_remove.append(stream_name)
 
-        for stream_name in streams_to_remove:
-            self.pending_reconnect.pop(stream_name, None)
+        # Mark offline outside the lock
+        for api_client in streams_to_mark_offline:
+            self._status_update_executor.submit(api_client.update_status, 'offline')
+
+        with self._state_lock:
+            for stream_name in streams_to_remove:
+                self.pending_reconnect.pop(stream_name, None)
+
+        # Restart processors outside the lock (start_processor acquires its own lock)
+        # Don't restore old API client - start_processor creates fresh one with current credentials
+        for stream_name in streams_to_restart:
+            self.start_processor(stream_name)
 
     def monitor_streams(self):
         """
@@ -1375,9 +1859,21 @@ class StreamOrchestrator:
         Runs in a background thread
         """
         self.logger.info("Stream monitor started")
+        _monitor_iteration = 0
 
         while self.running:
             try:
+                _monitor_iteration += 1
+
+                # Periodic resource monitoring (every 10 iterations = ~150s with 15s interval)
+                if _monitor_iteration % 10 == 0:
+                    fd_count = _get_fd_count()
+                    with self._state_lock:
+                        proc_count = len(self.processors)
+                    self.logger.info(f"Resource stats: FDs={fd_count}, threads={threading.active_count()}, processors={proc_count}")
+                    if fd_count > 50000:
+                        self.logger.warning(f"HIGH FD COUNT: {fd_count}")
+
                 # Check MediaMTX health
                 mediamtx_healthy = self.mediamtx.is_healthy()
                 if not mediamtx_healthy:
@@ -1396,35 +1892,53 @@ class StreamOrchestrator:
 
                 # Check processor health
                 dead_processors = []
-                for stream_name, proc in self.processors.items():
+                with self._state_lock:
+                    processors_copy = list(self.processors.items())
+                for stream_name, proc in processors_copy:
                     if not proc.is_alive():
                         self.logger.warning(f"Processor for {stream_name} died unexpectedly")
                         dead_processors.append(stream_name)
 
                 # Clean up dead processors
                 for stream_name in dead_processors:
+                    # If this stream is in pending_reconnect, use lightweight cleanup
+                    # (don't mark offline — the grace period handles that)
+                    with self._state_lock:
+                        in_pending = stream_name in self.pending_reconnect
+                    if in_pending:
+                        self._cleanup_dead_processor(stream_name)
+                        continue
+
                     self.stop_processor(stream_name)
 
                     # Check if stream is still active, restart processor (with limit)
                     active_streams = self.mediamtx.get_active_streams()
                     if stream_name in active_streams:
                         # Track restart failures to prevent infinite loops
-                        if stream_name not in self._restart_failures:
-                            self._restart_failures[stream_name] = {'count': 0, 'last_failure': 0}
+                        with self._state_lock:
+                            if stream_name not in self._restart_failures:
+                                self._restart_failures[stream_name] = {'count': 0, 'last_failure': 0}
 
-                        failures = self._restart_failures[stream_name]
-                        max_restarts = 3
+                            failures = self._restart_failures[stream_name]
+                            max_restarts = 3
 
-                        # Reset failure count if last failure was more than 10 minutes ago
-                        if time.time() - failures['last_failure'] > 300:
-                            failures['count'] = 0
+                            # Reset failure count if last failure was more than 10 minutes ago
+                            if time.time() - failures['last_failure'] > 300:
+                                failures['count'] = 0
 
-                        if failures['count'] < max_restarts:
-                            failures['count'] += 1
-                            failures['last_failure'] = time.time()
+                            should_restart = failures['count'] < max_restarts
+                            if should_restart:
+                                failures['count'] += 1
+                                failures['last_failure'] = time.time()
+                                restart_attempt = failures['count']
+
+                            # Get API client for offline notification if needed
+                            api_client = self.api_clients.get(stream_name) if not should_restart else None
+
+                        if should_restart:
                             self.logger.info(
                                 f"Stream {stream_name} is still active, restarting processor "
-                                f"(attempt {failures['count']}/{max_restarts})"
+                                f"(attempt {restart_attempt}/{max_restarts})"
                             )
                             self.start_processor(stream_name)
                         else:
@@ -1433,11 +1947,8 @@ class StreamOrchestrator:
                                 f"giving up until stream reconnects. Device may be sending no video data."
                             )
                             # Mark device offline since we can't process its stream
-                            if stream_name in self.api_clients:
-                                threading.Thread(
-                                    target=self.api_clients[stream_name].update_status,
-                                    args=('offline',), daemon=True
-                                ).start()
+                            if api_client:
+                                self._status_update_executor.submit(api_client.update_status, 'offline')
 
                 # Get active streams and ensure processors exist
                 # Note: If MediaMTX API is having issues, get_active_streams() returns empty list
@@ -1447,15 +1958,21 @@ class StreamOrchestrator:
                 # Only process new streams if API call was successful (consecutive failures = 0)
                 if self.mediamtx.get_consecutive_failures() == 0:
                     for stream_name in active_streams:
-                        if stream_name not in self.processors and stream_name not in self.pending_reconnect:
+                        with self._state_lock:
+                            already_processing = stream_name in self.processors
+                            pending = stream_name in self.pending_reconnect
                             # Check if this stream has hit its restart limit
                             failures = self._restart_failures.get(stream_name, {})
-                            if failures.get('count', 0) >= 3 and time.time() - failures.get('last_failure', 0) < 300:
-                                # Still in cooldown - don't restart
-                                continue
-                            elif failures.get('count', 0) >= 3:
+                            in_cooldown = failures.get('count', 0) >= 3 and time.time() - failures.get('last_failure', 0) < 300
+                            cooldown_expired = failures.get('count', 0) >= 3 and not in_cooldown
+                            if cooldown_expired:
                                 # Cooldown expired - reset and try again
                                 self._restart_failures.pop(stream_name, None)
+
+                        if not already_processing and not pending:
+                            if in_cooldown:
+                                # Still in cooldown - don't restart
+                                continue
                             self.logger.info(f"Found active stream without processor: {stream_name}")
                             self.start_processor(stream_name)
                 else:
@@ -1466,9 +1983,25 @@ class StreamOrchestrator:
                     )
 
                 # Check streams pending reconnection
-                # Only check if API is responding, otherwise we can't reliably determine stream state
-                if self.mediamtx.get_consecutive_failures() == 0:
-                    self._check_pending_reconnects()
+                # Always check pending reconnects - timeout logic uses timestamps, not MediaMTX state
+                # Even if MediaMTX API is having issues, we still need to mark devices offline after timeout
+                # to prevent them from staying in limbo forever
+                api_failures = self.mediamtx.get_consecutive_failures()
+                if api_failures > 0:
+                    time_since_last_success = time.time() - self.mediamtx.get_last_successful_api_call()
+                    self.logger.debug(
+                        f"MediaMTX API has {api_failures} failures, {time_since_last_success:.1f}s since last success - "
+                        "still checking pending reconnects for timeout processing"
+                    )
+                self._check_pending_reconnects()
+
+                # Periodic cleanup of stale restart failure entries (older than 10 minutes)
+                current_time = time.time()
+                with self._state_lock:
+                    stale = [n for n, i in self._restart_failures.items()
+                             if current_time - i.get('last_failure', 0) > 600]
+                    for name in stale:
+                        self._restart_failures.pop(name, None)
 
             except Exception as e:
                 self.logger.error(f"Error in monitor loop: {e}")
@@ -1490,6 +2023,9 @@ class StreamOrchestrator:
             return False
 
         self.running = True
+
+        # Start centralized inference servers (one per GPU)
+        self.start_inference_servers()
 
         # Start monitoring thread
         self.monitor_thread = threading.Thread(target=self.monitor_streams, daemon=True)
@@ -1515,6 +2051,10 @@ class StreamOrchestrator:
         self.logger.info(f"Orchestrator API listening on {ORCHESTRATOR_HOST}:{ORCHESTRATOR_PORT}")
         self.logger.info(f"Using processor class: {self.processor_class.__name__}")
         self.logger.info(f"Max concurrent processors: {MAX_PROCESSORS}")
+        if self.inference_servers:
+            self.logger.info(f"Inference servers: {len(self.inference_servers)} GPU(s) [centralized mode]")
+        else:
+            self.logger.info("Inference servers: none [legacy per-process GPU mode]")
         self.logger.info("=" * 60)
         self.logger.info("Ready to receive streams!")
         self.logger.info("Raspberry Pis can now connect via RTSP")
@@ -1527,20 +2067,19 @@ class StreamOrchestrator:
         self.logger.info("Stopping orchestrator...")
         self.running = False
 
-        # Set all devices offline (in parallel for speed)
-        threads = []
+        # Set all devices offline (using executor for consistency)
         for stream_name, api_client in list(self.api_clients.items()):
-            thread = threading.Thread(target=api_client.update_status, args=('offline',), daemon=False)
-            thread.start()
-            threads.append(thread)
+            self._status_update_executor.submit(api_client.update_status, 'offline')
+
+        # Shutdown status update executor and wait for pending updates
+        self._status_update_executor.shutdown(wait=True, cancel_futures=False)
 
         # Stop all processors
         for stream_name in list(self.processors.keys()):
             self.stop_processor(stream_name)
 
-        # Wait for all status updates to complete (max 2 seconds)
-        for thread in threads:
-            thread.join(timeout=2)
+        # Stop inference servers
+        self.stop_inference_servers()
 
         # Stop MediaMTX
         self.mediamtx.stop()

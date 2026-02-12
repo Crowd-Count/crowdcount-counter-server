@@ -80,6 +80,7 @@ paths:
   # Catch-all regex pattern to match any stream name
   ~^.*$:
     source: publisher
+    overridePublisher: yes
 
     # Run a command when a stream is ready (used to notify our orchestrator)
     runOnReady: 'curl -X POST http://127.0.0.1:5000/stream/ready -H "Content-Type: application/json" -d "{\"stream\":\"$MTX_PATH\"}"'

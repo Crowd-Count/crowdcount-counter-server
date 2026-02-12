@@ -23,12 +23,13 @@ services:
     restart: unless-stopped
 
     # GPU Configuration - NVIDIA CUDA support
+    # GPU 1 is primary (25 slots), GPU 0 is overflow (10 slots)
     deploy:
       resources:
         reservations:
           devices:
             - driver: nvidia
-              device_ids: ['1']
+              device_ids: ['0', '1']
               capabilities: [gpu]
 
     # Mount production code (prod branch worktree)
@@ -53,6 +54,13 @@ services:
       - RTCP_PORT=8001
       - RTMP_PORT=1935
       - ENV=production
+      # GPU allocation: GPU 1 primary (25 slots), GPU 0 overflow (10 slots)
+      - NUM_GPUS=2
+      - GPU_1_SLOTS=25
+      - GPU_0_SLOTS=10
+      - GPU_PRIORITY_ORDER=1,0
+      # Explicitly set visible GPUs for CUDA
+      - NVIDIA_VISIBLE_DEVICES=0,1
 
     ports:
       - "5000:5000"     # Flask API

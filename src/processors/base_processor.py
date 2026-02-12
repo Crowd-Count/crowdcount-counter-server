@@ -18,16 +18,14 @@ except ImportError:
     FRAME_BUFFER_ENABLED = False
     FRAME_BUFFER_SECONDS = 2.5
 
-MAX_RECONNECT_ATTEMPTS = 3  # Auto-reconnect attempts before terminating
-
-
 class BaseStreamProcessor(ABC):
     """
     Base class for stream processors.
     Each processor handles one video stream and runs its own processing logic.
     """
 
-    def __init__(self, stream_name: str, rtsp_url: str, device_info: Optional[dict] = None, frame_queue=None):
+    def __init__(self, stream_name: str, rtsp_url: str, device_info: Optional[dict] = None,
+                 frame_queue=None, inference_request_queue=None, inference_result_queue=None):
         """
         Initialize the stream processor
 
@@ -36,6 +34,8 @@ class BaseStreamProcessor(ABC):
             rtsp_url: Full RTSP URL to pull frames from (e.g., 'rtsp://127.0.0.1:8554/camera1')
             device_info: Optional dictionary containing device information (device_id, password, etc.)
             frame_queue: Optional multiprocessing.Queue for sending processed frames for live viewing
+            inference_request_queue: Optional queue for sending inference requests to centralized GPU server
+            inference_result_queue: Optional queue for receiving inference results from GPU server
         """
         self.stream_name = stream_name
         self.rtsp_url = rtsp_url
@@ -45,6 +45,10 @@ class BaseStreamProcessor(ABC):
         self.running = False
         self.cap: Optional[cv2.VideoCapture] = None
         self.frame_queue = frame_queue  # Queue for live viewing
+
+        # Centralized inference queues (None = legacy per-process GPU mode)
+        self.inference_request_queue = inference_request_queue
+        self.inference_result_queue = inference_result_queue
 
         # Setup logging (only add handler if not already configured)
         self.logger = logging.getLogger(f"Processor-{stream_name}")
@@ -63,6 +67,7 @@ class BaseStreamProcessor(ABC):
         self.last_frame_time = time.time()
         self.last_log_time = None
         self.frames_since_log = 0
+        self._current_interval_fps = 0.0  # Updated every 5s, published to frame_data
 
         # Frame validation and recovery (optimized for minimal overhead)
         self._last_valid_frame_ref: Optional[np.ndarray] = None  # Reference only, no copy
@@ -75,9 +80,6 @@ class BaseStreamProcessor(ABC):
         self.use_frame_buffer = FRAME_BUFFER_ENABLED
         self.frame_buffer_seconds = FRAME_BUFFER_SECONDS
         self._jitter_buffer = None  # FrameJitterBuffer instance when enabled
-
-        # Reconnection tracking
-        self._reconnect_attempts = 0
 
     def connect_stream(self, max_retries: int = 10, initial_delay: float = 0.5) -> bool:
         """
@@ -219,39 +221,6 @@ class BaseStreamProcessor(ABC):
             self.cap.release()
             self.cap = None
             self.logger.info("Disconnected from stream")
-
-    def _attempt_reconnect(self) -> bool:
-        """
-        Attempt to reconnect to the stream.
-
-        Returns:
-            True if reconnection successful, False otherwise
-        """
-        self._reconnect_attempts += 1
-        self.logger.warning(
-            f"Attempting reconnection ({self._reconnect_attempts}/{MAX_RECONNECT_ATTEMPTS})..."
-        )
-
-        # Stop and release current connection
-        if self._jitter_buffer is not None:
-            self._jitter_buffer.stop()
-            self._jitter_buffer = None
-
-        if self.cap:
-            self.cap.release()
-            self.cap = None
-
-        # Brief pause before reconnecting
-        time.sleep(1.0)
-
-        # Try to reconnect with fewer retries (faster failure)
-        if self.connect_stream(max_retries=5, initial_delay=0.5):
-            self.logger.info("Reconnection successful!")
-            self._reconnect_attempts = 0  # Reset on success
-            return True
-
-        self.logger.warning("Reconnection failed")
-        return False
 
     def _validate_frame_fast(self, frame: np.ndarray) -> tuple[bool, str]:
         """
@@ -421,7 +390,7 @@ class BaseStreamProcessor(ABC):
         # Main processing loop
         frame_number = 0
         consecutive_failures = 0
-        max_consecutive_failures = 60  # Increased tolerance for network hiccups
+        max_consecutive_failures = 30  # Exit quickly (~2s) — let orchestrator handle reconnection
 
         try:
             while self.running:
@@ -436,27 +405,21 @@ class BaseStreamProcessor(ABC):
                 except Exception as e:
                     # FFmpeg decode error (e.g., macroblock corruption)
                     consecutive_failures += 1
-                    self.logger.warning(f"Decode error ({consecutive_failures}/{max_consecutive_failures}): {e}")
+                    if consecutive_failures <= 3 or consecutive_failures % 10 == 0:
+                        self.logger.warning(f"Decode error ({consecutive_failures}/{max_consecutive_failures}): {e}")
                     if consecutive_failures >= max_consecutive_failures:
-                        self.logger.error("Too many decode errors, stopping")
+                        self.logger.error("Too many decode errors, exiting")
                         break
                     time.sleep(0.05)  # Brief pause before retry
                     continue
 
                 if not ret or frame is None:
                     consecutive_failures += 1
-                    self.logger.warning(f"Failed to read frame ({consecutive_failures}/{max_consecutive_failures})")
+                    if consecutive_failures <= 3 or consecutive_failures % 10 == 0:
+                        self.logger.warning(f"Failed to read frame ({consecutive_failures}/{max_consecutive_failures})")
 
                     if consecutive_failures >= max_consecutive_failures:
-                        # Try to reconnect before giving up
-                        if self._reconnect_attempts < MAX_RECONNECT_ATTEMPTS:
-                            if self._attempt_reconnect():
-                                consecutive_failures = 0  # Reset and continue
-                                continue
-
-                        self.logger.error(
-                            f"Stream failed after {self._reconnect_attempts} reconnection attempts, stopping"
-                        )
+                        self.logger.error("Stream failed, exiting (orchestrator will handle reconnection)")
                         break
 
                     time.sleep(0.1)
@@ -489,9 +452,16 @@ class BaseStreamProcessor(ABC):
                     # Send both clean and processed frames to queue for live viewing (non-blocking)
                     if self.frame_queue is not None and processed_frame is not None:
                         try:
+                            # input_fps = raw camera rate (from jitter buffer if active,
+                            # otherwise processor loop rate which equals camera rate in direct mode)
+                            if self._jitter_buffer is not None:
+                                input_fps = self._jitter_buffer.stats.get('input_fps', 0.0)
+                            else:
+                                input_fps = self._current_interval_fps
                             frame_data = {
                                 'clean': clean_frame,
-                                'annotated': processed_frame
+                                'annotated': processed_frame,
+                                'processor_fps': input_fps,
                             }
                             self.frame_queue.put_nowait(frame_data)
                         except Exception:
@@ -514,6 +484,7 @@ class BaseStreamProcessor(ABC):
                     overall_fps = self.frames_processed / elapsed if elapsed > 0 else 0
                     interval_time = timestamp - self.last_log_time
                     interval_fps = self.frames_since_log / interval_time if interval_time > 0 else 0
+                    self._current_interval_fps = interval_fps
 
                     # Build log message
                     log_msg = (f"Processed {self.frames_processed} frames | "

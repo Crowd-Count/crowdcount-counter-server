@@ -39,8 +39,8 @@ if [ -f "$TEMPLATE_FILE" ]; then
     echo "  MEDIAMTX_API_PORT: ${MEDIAMTX_API_PORT}"
     echo "  MEDIAMTX_METRICS_PORT: ${MEDIAMTX_METRICS_PORT}"
 
-    # Use envsubst to substitute environment variables in the template
-    envsubst < "$TEMPLATE_FILE" > "$OUTPUT_FILE"
+    # Only substitute Docker env vars, preserve $MTX_PATH for MediaMTX runtime
+    envsubst '${RTSP_PORT} ${RTSPS_PORT} ${RTP_PORT} ${RTCP_PORT} ${RTMP_PORT} ${HLS_PORT} ${WEBRTC_PORT} ${ORCHESTRATOR_PORT} ${MEDIAMTX_API_PORT} ${MEDIAMTX_METRICS_PORT}' < "$TEMPLATE_FILE" > "$OUTPUT_FILE"
     echo "Generated: $OUTPUT_FILE"
 else
     echo "Warning: Template file not found: $TEMPLATE_FILE"

@@ -60,7 +60,7 @@ class FrameJitterBuffer:
     DEFAULT_BUFFER_SECONDS = 2.5
     DEFAULT_TARGET_FPS = VIDEO_FPS
     MIN_PREFILL_RATIO = 0.5  # Wait for 50% buffer fill before starting emission
-    MAX_DUPLICATE_SECONDS = 5.0  # Signal stream failure after 5s of frame duplication
+    MAX_DUPLICATE_SECONDS = 15.0  # Signal stream failure after 15s of frame duplication (allow network hiccups to recover)
 
     def __init__(
         self,
@@ -101,6 +101,7 @@ class FrameJitterBuffer:
 
         # Track when duplication started (for stale stream detection)
         self._duplicate_start_time: Optional[float] = None
+        self._staleness_logged = False  # Only log staleness error once per episode
 
         # Reader thread state
         self._reader_thread: Optional[threading.Thread] = None
@@ -115,7 +116,12 @@ class FrameJitterBuffer:
             'underruns': 0,
             'overflows': 0,
             'duplicates_emitted': 0,
+            'input_fps': 0.0,  # Actual camera frame rate (computed in reader thread)
         }
+
+        # Input FPS tracking (reader thread)
+        self._input_fps_last_count = 0
+        self._input_fps_last_time = None
 
         # Events
         self._prefill_complete = threading.Event()
@@ -201,6 +207,18 @@ class FrameJitterBuffer:
                     if not self._prefill_complete.is_set() and len(self._buffer) >= self.min_prefill:
                         self._prefill_complete.set()
 
+                # Compute actual camera input FPS (every 2 seconds)
+                if self._input_fps_last_time is None:
+                    self._input_fps_last_time = capture_time
+                    self._input_fps_last_count = self.stats['frames_read']
+                else:
+                    fps_elapsed = capture_time - self._input_fps_last_time
+                    if fps_elapsed >= 2.0:
+                        frames_delta = self.stats['frames_read'] - self._input_fps_last_count
+                        self.stats['input_fps'] = frames_delta / fps_elapsed
+                        self._input_fps_last_count = self.stats['frames_read']
+                        self._input_fps_last_time = capture_time
+
                 # Store for underrun recovery (no lock needed, atomic reference assignment)
                 self._last_valid_frame = frame
 
@@ -254,6 +272,7 @@ class FrameJitterBuffer:
                 buffered = self._buffer.popleft()
                 self.stats['frames_emitted'] += 1
                 self._duplicate_start_time = None  # Reset duplication timer on real frame
+                self._staleness_logged = False  # Reset so we log again if staleness recurs
                 return True, buffered.frame
             else:
                 # Underrun - buffer empty, must duplicate last frame
@@ -269,9 +288,11 @@ class FrameJitterBuffer:
 
                 # Signal stream failure after prolonged duplication
                 if duplicate_duration >= self.MAX_DUPLICATE_SECONDS:
-                    self.logger.error(
-                        f"Stream stale - duplicating frames for {duplicate_duration:.1f}s"
-                    )
+                    if not self._staleness_logged:
+                        self.logger.error(
+                            f"Stream stale - duplicating frames for {duplicate_duration:.1f}s"
+                        )
+                        self._staleness_logged = True
                     return False, None  # Signal failure to processor
 
                 # Warn if underruns are frequent (source FPS may be lower than target)
@@ -363,6 +384,7 @@ class FrameJitterBuffer:
         with self._buffer_lock:
             self._buffer.clear()
         self._duplicate_start_time = None
+        self._staleness_logged = False
         self._last_valid_frame = None
         self._prefill_complete.clear()
         self._next_emit_time = None
@@ -373,7 +395,10 @@ class FrameJitterBuffer:
             'underruns': 0,
             'overflows': 0,
             'duplicates_emitted': 0,
+            'input_fps': 0.0,
         }
+        self._input_fps_last_count = 0
+        self._input_fps_last_time = None
         self.logger.info("Buffer state reset for reconnection")
 
     def get_buffer_level(self) -> Tuple[int, int]:
