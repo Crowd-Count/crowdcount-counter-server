@@ -5,6 +5,7 @@ Handles API calls to the CrowdCount backend server
 
 import requests
 import logging
+import time
 from typing import Optional
 
 
@@ -44,12 +45,13 @@ class CrowdCountAPIClient:
             else:
                 self.logger.info(f"API Client disabled (no credentials provided)")
 
-    def add_to_count(self, count: int = 1) -> bool:
+    def add_to_count(self, count: int = 1, max_retries: int = 2) -> bool:
         """
         Add to the count (person entered)
 
         Args:
             count: Number to add to count (default: 1)
+            max_retries: Maximum number of retries on transient failure (default: 2)
 
         Returns:
             True if successful, False otherwise
@@ -57,40 +59,46 @@ class CrowdCountAPIClient:
         if not self.enabled:
             return True  # Silently succeed if API is disabled
 
-        try:
-            url = f"{self.base_url}/add_to_count"
-            data = {
-                'device_id': self.device_id,
-                'password': self.password,
-                'count_to_add': str(count)
-            }
+        url = f"{self.base_url}/add_to_count"
+        data = {
+            'device_id': self.device_id,
+            'password': self.password,
+            'count_to_add': str(count)
+        }
 
-            self.logger.debug(f"POST {url} - Adding {count} to count")
-            response = requests.post(url, json=data, timeout=self.timeout)
+        for attempt in range(1 + max_retries):
+            try:
+                self.logger.debug(f"POST {url} - Adding {count} to count (attempt {attempt + 1})")
+                response = requests.post(url, json=data, timeout=self.timeout)
 
-            if response.status_code == 200:
-                self.logger.info(f"✓ Added {count} to remote count")
-                return True
-            else:
-                self.logger.warning(f"✗ API Error: HTTP {response.status_code}")
+                if response.status_code == 200:
+                    self.logger.info(f"✓ Added {count} to remote count")
+                    return True
+                else:
+                    self.logger.warning(f"✗ API Error: HTTP {response.status_code}")
+                    return False  # Non-transient error, don't retry
+
+            except (requests.Timeout, requests.ConnectionError) as e:
+                if attempt < max_retries:
+                    delay = 1.0 * (2 ** attempt)  # 1s, 2s
+                    self.logger.warning(f"✗ API {type(e).__name__} (attempt {attempt + 1}/{1 + max_retries}), retrying in {delay:.0f}s")
+                    time.sleep(delay)
+                else:
+                    self.logger.warning(f"✗ API {type(e).__name__}: Failed after {1 + max_retries} attempts")
+                    return False
+            except Exception as e:
+                self.logger.warning(f"✗ API Error: {e}")
                 return False
 
-        except requests.Timeout:
-            self.logger.warning(f"✗ API Timeout: Request took longer than {self.timeout}s")
-            return False
-        except requests.ConnectionError:
-            self.logger.warning(f"✗ API Connection Error: Could not reach {self.base_url}")
-            return False
-        except Exception as e:
-            self.logger.warning(f"✗ API Error: {e}")
-            return False
+        return False
 
-    def subtract_from_count(self, count: int = 1) -> bool:
+    def subtract_from_count(self, count: int = 1, max_retries: int = 2) -> bool:
         """
         Subtract from the count (person exited)
 
         Args:
             count: Number to subtract from count (default: 1)
+            max_retries: Maximum number of retries on transient failure (default: 2)
 
         Returns:
             True if successful, False otherwise
@@ -98,33 +106,38 @@ class CrowdCountAPIClient:
         if not self.enabled:
             return True  # Silently succeed if API is disabled
 
-        try:
-            url = f"{self.base_url}/sub_from_count"
-            data = {
-                'device_id': self.device_id,
-                'password': self.password,
-                'count_to_sub': str(count)
-            }
+        url = f"{self.base_url}/sub_from_count"
+        data = {
+            'device_id': self.device_id,
+            'password': self.password,
+            'count_to_sub': str(count)
+        }
 
-            self.logger.debug(f"POST {url} - Subtracting {count} from count")
-            response = requests.post(url, json=data, timeout=self.timeout)
+        for attempt in range(1 + max_retries):
+            try:
+                self.logger.debug(f"POST {url} - Subtracting {count} from count (attempt {attempt + 1})")
+                response = requests.post(url, json=data, timeout=self.timeout)
 
-            if response.status_code == 200:
-                self.logger.info(f"✓ Subtracted {count} from remote count")
-                return True
-            else:
-                self.logger.warning(f"✗ API Error: HTTP {response.status_code}")
+                if response.status_code == 200:
+                    self.logger.info(f"✓ Subtracted {count} from remote count")
+                    return True
+                else:
+                    self.logger.warning(f"✗ API Error: HTTP {response.status_code}")
+                    return False  # Non-transient error, don't retry
+
+            except (requests.Timeout, requests.ConnectionError) as e:
+                if attempt < max_retries:
+                    delay = 1.0 * (2 ** attempt)  # 1s, 2s
+                    self.logger.warning(f"✗ API {type(e).__name__} (attempt {attempt + 1}/{1 + max_retries}), retrying in {delay:.0f}s")
+                    time.sleep(delay)
+                else:
+                    self.logger.warning(f"✗ API {type(e).__name__}: Failed after {1 + max_retries} attempts")
+                    return False
+            except Exception as e:
+                self.logger.warning(f"✗ API Error: {e}")
                 return False
 
-        except requests.Timeout:
-            self.logger.warning(f"✗ API Timeout: Request took longer than {self.timeout}s")
-            return False
-        except requests.ConnectionError:
-            self.logger.warning(f"✗ API Connection Error: Could not reach {self.base_url}")
-            return False
-        except Exception as e:
-            self.logger.warning(f"✗ API Error: {e}")
-            return False
+        return False
 
     def get_current_count(self) -> Optional[int]:
         """

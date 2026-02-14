@@ -1619,6 +1619,7 @@ class PeopleCounterProcessor(BaseStreamProcessor):
                         self.trackers[reid_match].update(detection)
                         matched_trackers.add(reid_match)
                         self.logger.debug(f"ReID recovered track #{reid_match}")
+                        self._check_and_handle_crossing(reid_match, detection, width, current_time, frame)
                         continue
                 still_unmatched.append(detection)
 
@@ -1637,6 +1638,29 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             if new_id not in self.trackers:
                 self.trackers[new_id] = PersonTracker(new_id, detection)
 
+                # Check active_checkpoints for a ReID match from an expired tracker
+                if detection.appearance_features is not None and self.active_checkpoints:
+                    best_cp_id = None
+                    best_cp_sim = self.doorway_config.get('relink_similarity_threshold', 0.55)
+
+                    for cp_id, cp_data in self.active_checkpoints.items():
+                        sim = float(np.dot(cp_data['embedding'], detection.appearance_features))
+                        sim = max(0.0, min(1.0, sim))
+                        if sim > best_cp_sim:
+                            best_cp_sim = sim
+                            best_cp_id = cp_id
+
+                    if best_cp_id is not None:
+                        recovered_cp = self.active_checkpoints.pop(best_cp_id)
+                        checkpoint = recovered_cp['checkpoint']
+                        tracker = self.trackers[new_id]
+                        # Set last_side to entry side so crossing check detects the transition
+                        tracker.last_side = checkpoint.entry_side
+                        self.logger.info(f"Checkpoint recovered: new track #{new_id} matched expired track #{best_cp_id} "
+                                        f"(similarity={best_cp_sim:.2f}, entry_side={checkpoint.entry_side})")
+                        # Check for crossing now that we have the entry side context
+                        self._check_and_handle_crossing(new_id, detection, width, current_time, frame)
+
         # Check for crossings on unmatched trackers using interpolation
         # This catches crossings that may have occurred during dropped frames
         for track_id, tracker in self.trackers.items():
@@ -1652,6 +1676,25 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             if 0.1 < time_gap < 1.0 and len(tracker.positions) >= 2 and tracker.peak_confidence >= min_conf:
                 # Get interpolated positions through the gap
                 interpolated = tracker.interpolate_positions(current_time, num_steps=5)
+
+                # Save all mutable state that check_crossing() modifies
+                saved_state = {
+                    'current_zone': tracker.current_zone,
+                    'previous_zone': tracker.previous_zone,
+                    'current_side': tracker.current_side,
+                    'last_side': tracker.last_side,
+                    'in_danger_zone': tracker.in_danger_zone,
+                    'danger_zone_frame_count': tracker.danger_zone_frame_count,
+                    'approach_velocities': deque(tracker.approach_velocities, maxlen=30),
+                    'needs_checkpoint': tracker.needs_checkpoint,
+                    'side_history': deque(tracker.side_history, maxlen=10),
+                    'consecutive_side_detections': tracker.consecutive_side_detections,
+                    'checkpoint': tracker.checkpoint,
+                    'search_active': tracker.search_active,
+                    'total_crossings': tracker.total_crossings,
+                    'crossing_events': list(tracker.crossing_events),
+                    'last_crossing_time': tracker.last_crossing_time,
+                }
 
                 for interp_pos in interpolated:
                     # Temporarily add interpolated position to check crossing
@@ -1708,11 +1751,38 @@ class PeopleCounterProcessor(BaseStreamProcessor):
                                        f"R->L: {self.crossings[CrossingDirection.RIGHT_TO_LEFT]}")
                         break  # Only count one crossing per interpolation check
 
+                # Restore all mutable state after interpolation loop
+                tracker.current_zone = saved_state['current_zone']
+                tracker.previous_zone = saved_state['previous_zone']
+                tracker.current_side = saved_state['current_side']
+                tracker.last_side = saved_state['last_side']
+                tracker.in_danger_zone = saved_state['in_danger_zone']
+                tracker.danger_zone_frame_count = saved_state['danger_zone_frame_count']
+                tracker.approach_velocities = saved_state['approach_velocities']
+                tracker.needs_checkpoint = saved_state['needs_checkpoint']
+                tracker.side_history = saved_state['side_history']
+                tracker.consecutive_side_detections = saved_state['consecutive_side_detections']
+                tracker.checkpoint = saved_state['checkpoint']
+                tracker.search_active = saved_state['search_active']
+                tracker.total_crossings = saved_state['total_crossings']
+                tracker.crossing_events = saved_state['crossing_events']
+                tracker.last_crossing_time = saved_state['last_crossing_time']
+
         # Remove stale trackers
         trackers_to_remove = []
         for track_id, tracker in self.trackers.items():
             if tracker.time_since_update() > self.doorway_config['tracker_timeout']:
                 trackers_to_remove.append(track_id)
+
+                # Save checkpoint from expiring tracker for cross-track recovery
+                if tracker.checkpoint and tracker.mean_appearance is not None:
+                    self.active_checkpoints[track_id] = {
+                        'checkpoint': tracker.checkpoint,
+                        'embedding': tracker.mean_appearance.copy(),
+                        'saved_time': current_time,
+                    }
+                    self.logger.debug(f"Saved checkpoint from expiring track #{track_id} "
+                                    f"(entry_side={tracker.checkpoint.entry_side})")
 
                 # Return ID to pool for reuse (only for non-ByteTrack IDs)
                 if track_id not in self.track_id_pool and track_id < 1000:
@@ -1720,6 +1790,15 @@ class PeopleCounterProcessor(BaseStreamProcessor):
 
         for track_id in trackers_to_remove:
             del self.trackers[track_id]
+
+        # Clean up expired active checkpoints
+        checkpoint_timeout = self.doorway_config.get('checkpoint_timeout', 5.0)
+        expired_checkpoints = [
+            cp_id for cp_id, cp_data in self.active_checkpoints.items()
+            if current_time - cp_data['saved_time'] > checkpoint_timeout
+        ]
+        for cp_id in expired_checkpoints:
+            del self.active_checkpoints[cp_id]
 
     def draw_visualization(self, frame, detections: List[Detection]) -> np.ndarray:
         """Draw visualization overlay on frame"""
