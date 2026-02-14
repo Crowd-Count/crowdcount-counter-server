@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 from typing import Optional, Tuple, List, Dict
 from enum import Enum
 import os
+import queue as queue_module
 
 from .base_processor import BaseStreamProcessor
 
@@ -627,7 +628,7 @@ class PeopleCounterProcessor(BaseStreamProcessor):
 
         # YOLO model setup
         self.model = None
-        self.model_path = str(MODELS_DIR / "v4_0_2.pt")  # Using YOLOv11 Small model for better accuracy
+        self.model_path = str(MODELS_DIR / "crowdcount-v5.pt")  # V5 model trained on V5_data dataset
         self.bytetrack_config = str(MODELS_DIR / "bytetrack.yaml")  # ByteTrack config for group tracking
         self.class_names = {0: 'person'}  # Default
 
@@ -639,10 +640,10 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             'min_path_length': 50,      # Minimum pixels traveled
             'max_tracking_distance': 0.156,  # Proportion of frame width (~100px at 640w)
             'tracker_timeout': 1.5,     # TUNED: Reduced from 3.0 to let false tracks expire faster
-            'yolo_conf_threshold': 0.39,  # TUNED: Balanced - catches people but filters noise
+            'yolo_conf_threshold': 0.53,  # V5 F1-optimal confidence threshold
             'yolo_iou_threshold': 0.3,   # TUNED: Lowered from 0.45 to separate overlapping people
             'min_crossing_interval': 0.5,  # TUNED: Increased from 0.3 to prevent double counts
-            'min_peak_confidence': 0.45,  # TUNED: Above YOLO conf — final quality gate before counting a crossing
+            'min_peak_confidence': 0.60,  # Above YOLO conf — final quality gate before counting a crossing
             'reid_similarity_threshold': 0.6,  # TUNED: Increased for deep ReID (more discriminative)
             'use_bytetrack': True,       # NEW: Enable ByteTrack
             'use_reid': True,            # NEW: Enable ReID features
@@ -727,6 +728,9 @@ class PeopleCounterProcessor(BaseStreamProcessor):
         # Store these for use in extract_detections / ReID calls
         self._RequestType = RequestType
         self._InferenceRequest = InferenceRequest
+
+        # Consecutive inference failure counter for fast backoff
+        self._centralized_inference_failures = 0
 
         print(f"[{self.stream_name}] Centralized inference mode (CPU-only worker)", flush=True)
         self.logger.info("Using centralized inference server (no local GPU)")
@@ -1030,6 +1034,12 @@ class PeopleCounterProcessor(BaseStreamProcessor):
         """Extract detections via centralized inference server + local ByteTrack."""
         detections = []
 
+        # Fast backoff: after 5 consecutive failures, return empty immediately
+        # Lets processor die naturally via jitter buffer staleness instead of
+        # wasting 5s per frame on the get() timeout
+        if self._centralized_inference_failures >= 5:
+            return detections
+
         try:
             # Send detection request to inference server
             request = self._InferenceRequest(
@@ -1039,10 +1049,18 @@ class PeopleCounterProcessor(BaseStreamProcessor):
                 conf=self.doorway_config['yolo_conf_threshold'],
                 iou=self.doorway_config['yolo_iou_threshold'],
             )
-            self.inference_request_queue.put(request)
+            try:
+                self.inference_request_queue.put(request, timeout=2.0)
+            except queue_module.Full:
+                self.logger.warning("Inference request queue full - skipping detection")
+                self._centralized_inference_failures += 1
+                return detections
 
             # Wait for response from inference server
             response = self.inference_result_queue.get(timeout=5.0)
+
+            # Success - reset failure counter
+            self._centralized_inference_failures = 0
 
             if response.error:
                 self.logger.warning(f"Inference server error: {response.error}")
@@ -1068,6 +1086,7 @@ class PeopleCounterProcessor(BaseStreamProcessor):
                     detections.append(detection)
 
         except Exception as e:
+            self._centralized_inference_failures += 1
             self.logger.error(f"Centralized detection error: {e}")
             import traceback
             self.logger.error(traceback.format_exc())
@@ -1267,6 +1286,10 @@ class PeopleCounterProcessor(BaseStreamProcessor):
         if not boxes:
             return []
 
+        # Share failure counter with detection — both use the same inference server
+        if self._centralized_inference_failures >= 5:
+            return [None] * len(boxes)
+
         try:
             request = self._InferenceRequest(
                 type=self._RequestType.REID,
@@ -1274,8 +1297,17 @@ class PeopleCounterProcessor(BaseStreamProcessor):
                 frame=frame,
                 boxes=boxes,
             )
-            self.inference_request_queue.put(request)
+            try:
+                self.inference_request_queue.put(request, timeout=2.0)
+            except queue_module.Full:
+                self.logger.warning("Inference request queue full - skipping ReID")
+                self._centralized_inference_failures += 1
+                return [None] * len(boxes)
+
             response = self.inference_result_queue.get(timeout=5.0)
+
+            # Success - reset failure counter
+            self._centralized_inference_failures = 0
 
             if response.error:
                 self.logger.warning(f"ReID server error: {response.error}")
@@ -1283,6 +1315,7 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             return response.features if response.features else [None] * len(boxes)
 
         except Exception as e:
+            self._centralized_inference_failures += 1
             self.logger.error(f"Centralized ReID error: {e}")
             return [None] * len(boxes)
 

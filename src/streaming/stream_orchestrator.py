@@ -264,7 +264,8 @@ class StreamOrchestrator:
         self.stream_stats: Dict[str, dict] = {}
 
         # Track streams currently being started (to prevent duplicate processor creation)
-        self._starting_processors: set = set()
+        # Maps stream_name -> timestamp when start began (for stale entry cleanup)
+        self._starting_processors: Dict[str, float] = {}
 
         # Centralized inference server state
         self.inference_servers: Dict[int, multiprocessing.Process] = {}  # gpu_id -> Process
@@ -275,6 +276,8 @@ class StreamOrchestrator:
         self._slot_assignments: Dict[int, Dict[str, Optional[str]]] = {}
         # Camera -> (gpu_id, slot_name) mapping
         self.camera_gpu_assignments: Dict[str, tuple] = {}
+        # Heartbeat values for inference server liveness monitoring
+        self._inference_heartbeats: Dict[int, multiprocessing.Value] = {}
 
         self.running = False
         self.monitor_thread = None
@@ -1388,7 +1391,7 @@ class StreamOrchestrator:
 
         # Get model paths from the processor class defaults
         models_dir = Path(__file__).parent.parent.parent / "models"
-        model_path = str(models_dir / "v3_0_0.pt")
+        model_path = str(models_dir / "crowdcount-v5.pt")
         reid_model_name = "osnet_x0_25"  # Default ReID model
 
         self.logger.info(f"Starting {num_gpus} inference server(s)...")
@@ -1412,6 +1415,10 @@ class StreamOrchestrator:
             self._result_queue_pools[gpu_id] = result_queues
             self._slot_assignments[gpu_id] = slot_assignments
 
+            # Create heartbeat for liveness monitoring
+            heartbeat = multiprocessing.Value('d', 0.0)
+            self._inference_heartbeats[gpu_id] = heartbeat
+
             # Create and start inference server process
             server = InferenceServer(
                 gpu_id=gpu_id,
@@ -1422,6 +1429,7 @@ class StreamOrchestrator:
                 config={
                     'imgsz': INFERENCE_IMGSZ,
                 },
+                heartbeat=heartbeat,
             )
 
             proc = multiprocessing.Process(
@@ -1472,6 +1480,85 @@ class StreamOrchestrator:
         self.inference_request_queues.clear()
         self._result_queue_pools.clear()
         self._slot_assignments.clear()
+        self._inference_heartbeats.clear()
+
+    def _restart_inference_server(self, gpu_id: int):
+        """Restart a single inference server on the given GPU.
+
+        Drains the old request queue (and closes it), drains stale results from
+        existing result queues (reuses them), creates a new request queue, and
+        spawns a fresh InferenceServer process.
+        """
+        from pathlib import Path
+
+        self.logger.info(f"Restarting inference server on GPU {gpu_id}...")
+
+        # Drain and close the old request queue
+        if gpu_id in self.inference_request_queues:
+            _cleanup_queue(self.inference_request_queues[gpu_id])
+
+        # Create a new request queue
+        request_queue = multiprocessing.Queue(maxsize=INFERENCE_QUEUE_MAXSIZE)
+        self.inference_request_queues[gpu_id] = request_queue
+
+        # Drain stale results from existing result queues (reuse them)
+        if gpu_id in self._result_queue_pools:
+            for slot_name, result_queue in self._result_queue_pools[gpu_id].items():
+                try:
+                    while True:
+                        result_queue.get_nowait()
+                except queue.Empty:
+                    pass
+
+        # Get model paths
+        models_dir = Path(__file__).parent.parent.parent / "models"
+        model_path = str(models_dir / "crowdcount-v5.pt")
+        reid_model_name = "osnet_x0_25"
+
+        # Create new heartbeat for the restarted server
+        heartbeat = multiprocessing.Value('d', 0.0)
+        self._inference_heartbeats[gpu_id] = heartbeat
+
+        # Create and start new inference server (reuses existing result queue pool)
+        server = InferenceServer(
+            gpu_id=gpu_id,
+            model_path=model_path,
+            reid_model_name=reid_model_name,
+            request_queue=request_queue,
+            result_queues=self._result_queue_pools[gpu_id],
+            config={
+                'imgsz': INFERENCE_IMGSZ,
+            },
+            heartbeat=heartbeat,
+        )
+
+        proc = multiprocessing.Process(
+            target=server.run,
+            name=f"InferenceServer-GPU{gpu_id}",
+        )
+        proc.start()
+        self.inference_servers[gpu_id] = proc
+        self.logger.info(f"Inference server restarted on GPU {gpu_id} (PID: {proc.pid})")
+
+    def _restart_processors_on_gpu(self, gpu_id: int):
+        """Restart all camera processors assigned to a GPU after inference server restart.
+
+        After an inference server restart, processors still hold old (closed) queue
+        references and will never get results. This stops each affected processor
+        and starts a fresh one that gets the new queue references.
+        """
+        with self._state_lock:
+            cameras_on_gpu = [
+                cam for cam, (gid, slot) in self.camera_gpu_assignments.items()
+                if gid == gpu_id
+            ]
+        self.logger.info(f"Restarting {len(cameras_on_gpu)} processors on GPU {gpu_id}")
+        for cam_name in cameras_on_gpu:
+            try:
+                self.stop_processor(cam_name)
+                self.start_processor(cam_name)
+            except Exception as e:
+                self.logger.error(f"Error restarting processor {cam_name} after GPU {gpu_id} recovery: {e}")
 
     def _assign_camera_to_gpu(self, stream_name: str) -> tuple:
         """Assign a camera to a GPU using priority-based allocation.
@@ -1571,7 +1658,7 @@ class StreamOrchestrator:
 
             # Mark as starting to prevent duplicate attempts
             if not needs_stop:
-                self._starting_processors.add(stream_name)
+                self._starting_processors[stream_name] = time.time()
 
         if needs_stop:
             self.stop_processor(stream_name)
@@ -1617,14 +1704,36 @@ class StreamOrchestrator:
                 if gpu_id >= 0 and slot_name is not None:
                     inference_request_queue = self.inference_request_queues[gpu_id]
                     inference_result_queue = self._result_queue_pools[gpu_id][slot_name]
+                    # Drain stale results from slot before reuse
+                    drained = 0
+                    try:
+                        while True:
+                            inference_result_queue.get_nowait()
+                            drained += 1
+                    except queue.Empty:
+                        pass
+                    if drained:
+                        self.logger.info(f"Drained {drained} stale results from {slot_name} for {stream_name}")
                     self.logger.info(f"Sending REGISTER for {stream_name} to GPU {gpu_id}, slot {slot_name}")
                     # Send REGISTER request so inference server maps camera_id -> slot
-                    inference_request_queue.put(InferenceRequest(
-                        type=RequestType.REGISTER,
-                        camera_id=stream_name,
-                        slot_name=slot_name,
-                    ))
-                    self.logger.info(f"Camera {stream_name} using centralized inference on GPU {gpu_id} (slot {slot_name})")
+                    try:
+                        inference_request_queue.put(InferenceRequest(
+                            type=RequestType.REGISTER,
+                            camera_id=stream_name,
+                            slot_name=slot_name,
+                        ), timeout=5.0)
+                    except queue.Full:
+                        self.logger.error(f"Inference queue full - cannot register {stream_name}. Inference server may be dead.")
+                        # Release the GPU slot we just assigned
+                        with self._state_lock:
+                            self.camera_gpu_assignments.pop(stream_name, None)
+                            if gpu_id in self._slot_assignments and slot_name in self._slot_assignments[gpu_id]:
+                                self._slot_assignments[gpu_id][slot_name] = None
+                        # Fall back to legacy mode (no centralized inference)
+                        inference_request_queue = None
+                        inference_result_queue = None
+                    else:
+                        self.logger.info(f"Camera {stream_name} using centralized inference on GPU {gpu_id} (slot {slot_name})")
                 else:
                     self.logger.warning(f"Failed to assign {stream_name} to GPU - will use legacy mode")
 
@@ -1649,14 +1758,14 @@ class StreamOrchestrator:
 
             with self._state_lock:
                 self.processors[stream_name] = proc
-                self._starting_processors.discard(stream_name)
+                self._starting_processors.pop(stream_name, None)
             self.logger.info(f"Processor started for {stream_name} (PID: {proc.pid})")
 
         except Exception as e:
             self.logger.error(f"Error starting processor for {stream_name}: {e}")
             # Clean up GPU assignment if registered but failed to start
             with self._state_lock:
-                self._starting_processors.discard(stream_name)
+                self._starting_processors.pop(stream_name, None)
                 assignment = self.camera_gpu_assignments.pop(stream_name, None)
                 if assignment:
                     gpu_id, slot_name = assignment
@@ -1665,14 +1774,12 @@ class StreamOrchestrator:
                     # Send UNREGISTER
                     if gpu_id in self.inference_request_queues:
                         try:
-                            self.inference_request_queues[gpu_id].put_nowait(InferenceRequest(
+                            self.inference_request_queues[gpu_id].put(InferenceRequest(
                                 type=RequestType.UNREGISTER,
                                 camera_id=stream_name,
-                            ))
-                        except queue.Full:
-                            self.logger.warning(f"Inference queue full, could not send UNREGISTER for {stream_name}")
+                            ), timeout=2.0)
                         except Exception as ue:
-                            self.logger.error(f"Failed to send UNREGISTER after startup failure: {ue}")
+                            self.logger.warning(f"Could not send UNREGISTER for {stream_name}: {ue}")
                 # Pop queue for cleanup outside lock
                 frame_queue = self.frame_queues.pop(stream_name, None)
                 self.api_clients.pop(stream_name, None)
@@ -1739,14 +1846,12 @@ class StreamOrchestrator:
                     # Tell inference server to unregister this camera
                     if gpu_id in self.inference_request_queues:
                         try:
-                            self.inference_request_queues[gpu_id].put_nowait(InferenceRequest(
+                            self.inference_request_queues[gpu_id].put(InferenceRequest(
                                 type=RequestType.UNREGISTER,
                                 camera_id=stream_name,
-                            ))
-                        except queue.Full:
-                            self.logger.warning(f"Inference queue full, could not send UNREGISTER for {stream_name}")
+                            ), timeout=2.0)
                         except Exception as e:
-                            self.logger.error(f"Failed to send UNREGISTER for {stream_name}: {e}")
+                            self.logger.warning(f"Could not send UNREGISTER for {stream_name}: {e}")
 
             # Clean up frame queue OUTSIDE lock (join_thread can block)
             if frame_queue:
@@ -1798,14 +1903,12 @@ class StreamOrchestrator:
                     self._slot_assignments[gpu_id][slot_name] = None
                 if gpu_id in self.inference_request_queues:
                     try:
-                        self.inference_request_queues[gpu_id].put_nowait(InferenceRequest(
+                        self.inference_request_queues[gpu_id].put(InferenceRequest(
                             type=RequestType.UNREGISTER,
                             camera_id=stream_name,
-                        ))
-                    except queue.Full:
-                        self.logger.warning(f"Inference queue full, could not send UNREGISTER for {stream_name}")
+                        ), timeout=2.0)
                     except Exception as e:
-                        self.logger.error(f"Failed to send UNREGISTER for {stream_name}: {e}")
+                        self.logger.warning(f"Could not send UNREGISTER for {stream_name}: {e}")
 
         # Clean up frame queue OUTSIDE lock (join_thread can block)
         if frame_queue:
@@ -1890,6 +1993,36 @@ class StreamOrchestrator:
                     time.sleep(STREAM_HEALTH_CHECK_INTERVAL)
                     continue
 
+                # Check inference server health (process death + heartbeat staleness)
+                with self._state_lock:
+                    servers_copy = list(self.inference_servers.items())
+                for gpu_id, server_proc in servers_copy:
+                    needs_restart = False
+                    if not server_proc.is_alive():
+                        self.logger.error(f"Inference server on GPU {gpu_id} died! Restarting...")
+                        needs_restart = True
+                    elif gpu_id in self._inference_heartbeats:
+                        hb = self._inference_heartbeats[gpu_id]
+                        if hb.value > 0 and time.time() - hb.value > 30:
+                            self.logger.error(
+                                f"Inference server on GPU {gpu_id} stuck! "
+                                f"No heartbeat for {time.time() - hb.value:.1f}s - force-killing..."
+                            )
+                            try:
+                                server_proc.kill()
+                                server_proc.join(timeout=5)
+                            except Exception:
+                                pass
+                            needs_restart = True
+
+                    if needs_restart:
+                        try:
+                            self._restart_inference_server(gpu_id)
+                            # Restart all processors on this GPU — they hold stale queue refs
+                            self._restart_processors_on_gpu(gpu_id)
+                        except Exception as e:
+                            self.logger.error(f"Failed to restart inference server on GPU {gpu_id}: {e}")
+
                 # Check processor health
                 dead_processors = []
                 with self._state_lock:
@@ -1950,6 +2083,15 @@ class StreamOrchestrator:
                             if api_client:
                                 self._status_update_executor.submit(api_client.update_status, 'offline')
 
+                # Clean up stale _starting_processors entries (stuck for > 30s)
+                with self._state_lock:
+                    now = time.time()
+                    stale_starting = [name for name, start_time in self._starting_processors.items()
+                                      if now - start_time > 30]
+                    for name in stale_starting:
+                        self._starting_processors.pop(name, None)
+                        self.logger.warning(f"Cleared stale _starting_processors entry for {name} (stuck > 30s)")
+
                 # Get active streams and ensure processors exist
                 # Note: If MediaMTX API is having issues, get_active_streams() returns empty list
                 # We should NOT treat this as "all streams stopped" - only trust webhook notifications
@@ -1994,6 +2136,35 @@ class StreamOrchestrator:
                         "still checking pending reconnects for timeout processing"
                     )
                 self._check_pending_reconnects()
+
+                # Proactive stale session sweep (every 3rd iteration ~45s)
+                # Kick MediaMTX sessions for paths that are "ready" but have no healthy processor
+                if _monitor_iteration % 3 == 0 and self.mediamtx.get_consecutive_failures() == 0:
+                    try:
+                        all_paths = self.mediamtx.get_paths()
+                        with self._state_lock:
+                            healthy_streams = {
+                                name for name, proc in self.processors.items()
+                                if proc.is_alive()
+                            }
+                            pending_streams = set(self.pending_reconnect.keys())
+
+                        for path_info in all_paths:
+                            path_name = path_info.get('name', '')
+                            if not path_name:
+                                continue
+                            if not path_info.get('ready', False):
+                                continue
+                            # Skip if we have a healthy processor or it's pending reconnect
+                            if path_name in healthy_streams or path_name in pending_streams:
+                                continue
+                            self.logger.warning(
+                                f"Stale session detected: path {path_name} is ready in MediaMTX "
+                                f"but has no healthy processor - kicking sessions"
+                            )
+                            self.mediamtx.kick_all_sessions_for_path(path_name)
+                    except Exception as e:
+                        self.logger.error(f"Error in stale session sweep: {e}")
 
                 # Periodic cleanup of stale restart failure entries (older than 10 minutes)
                 current_time = time.time()
