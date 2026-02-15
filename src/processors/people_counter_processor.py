@@ -622,9 +622,11 @@ class PeopleCounterProcessor(BaseStreamProcessor):
     """
 
     def __init__(self, stream_name: str, rtsp_url: str, device_info: Optional[dict] = None,
-                 frame_queue=None, inference_request_queue=None, inference_result_queue=None):
+                 frame_queue=None, inference_request_queue=None, inference_result_queue=None,
+                 processor_heartbeat=None):
         super().__init__(stream_name, rtsp_url, device_info, frame_queue,
-                         inference_request_queue, inference_result_queue)
+                         inference_request_queue, inference_result_queue,
+                         processor_heartbeat=processor_heartbeat)
 
         # YOLO model setup
         self.model = None
@@ -1041,6 +1043,16 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             now = time.time()
             if now - self._last_inference_retry_time < 10.0:
                 return detections  # Still in backoff window
+            # Drain stale results so retry reads a fresh response
+            drained = 0
+            while True:
+                try:
+                    self.inference_result_queue.get_nowait()
+                    drained += 1
+                except queue_module.Empty:
+                    break
+            if drained > 0:
+                self.logger.info(f"Drained {drained} stale inference results before retry")
             self._last_inference_retry_time = now
             self.logger.info("Inference backoff: attempting periodic retry")
 
@@ -1295,6 +1307,16 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             now = time.time()
             if now - self._last_inference_retry_time < 10.0:
                 return [None] * len(boxes)
+            # Drain stale results so retry reads a fresh response
+            drained = 0
+            while True:
+                try:
+                    self.inference_result_queue.get_nowait()
+                    drained += 1
+                except queue_module.Empty:
+                    break
+            if drained > 0:
+                self.logger.info(f"Drained {drained} stale inference results before ReID retry")
             self._last_inference_retry_time = now
 
         try:

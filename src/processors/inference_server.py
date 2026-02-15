@@ -228,8 +228,12 @@ class InferenceServer:
                 try:
                     result_queue.put_nowait(response)
                 except Exception:
-                    # Queue full - camera worker may be slow
-                    self.logger.warning(f"Result queue full for camera {request.camera_id}")
+                    # Queue full — replace oldest with fresh response
+                    try:
+                        result_queue.get_nowait()
+                        result_queue.put_nowait(response)
+                    except Exception:
+                        self.logger.warning(f"Result queue full for camera {request.camera_id}")
 
                 self.requests_processed += 1
 

@@ -25,7 +25,8 @@ class BaseStreamProcessor(ABC):
     """
 
     def __init__(self, stream_name: str, rtsp_url: str, device_info: Optional[dict] = None,
-                 frame_queue=None, inference_request_queue=None, inference_result_queue=None):
+                 frame_queue=None, inference_request_queue=None, inference_result_queue=None,
+                 processor_heartbeat=None):
         """
         Initialize the stream processor
 
@@ -49,6 +50,9 @@ class BaseStreamProcessor(ABC):
         # Centralized inference queues (None = legacy per-process GPU mode)
         self.inference_request_queue = inference_request_queue
         self.inference_result_queue = inference_result_queue
+
+        # Heartbeat for stuck-processor detection by orchestrator
+        self.processor_heartbeat = processor_heartbeat
 
         # Setup logging (only add handler if not already configured)
         self.logger = logging.getLogger(f"Processor-{stream_name}")
@@ -394,6 +398,10 @@ class BaseStreamProcessor(ABC):
 
         try:
             while self.running:
+                # Update heartbeat so orchestrator knows we're alive
+                if self.processor_heartbeat is not None:
+                    self.processor_heartbeat.value = time.time()
+
                 # Read frame from jitter buffer or directly from capture
                 try:
                     if self._jitter_buffer is not None:

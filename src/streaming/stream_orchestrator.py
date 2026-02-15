@@ -279,6 +279,9 @@ class StreamOrchestrator:
         # Heartbeat values for inference server liveness monitoring
         self._inference_heartbeats: Dict[int, multiprocessing.Value] = {}
 
+        # Heartbeat values for per-processor stuck detection
+        self._processor_heartbeats: Dict[str, multiprocessing.Value] = {}
+
         self.running = False
         self.monitor_thread = None
 
@@ -1739,10 +1742,12 @@ class StreamOrchestrator:
 
             # Create processor instance with device info, frame queue, and inference queues
             # Use try/except to handle processor classes that don't accept all kwargs
+            processor_heartbeat = multiprocessing.Value('d', time.time())
             try:
                 processor_kwargs = {
                     'device_info': device_info,
                     'frame_queue': frame_queue,
+                    'processor_heartbeat': processor_heartbeat,
                 }
                 if inference_request_queue is not None:
                     processor_kwargs['inference_request_queue'] = inference_request_queue
@@ -1758,6 +1763,7 @@ class StreamOrchestrator:
 
             with self._state_lock:
                 self.processors[stream_name] = proc
+                self._processor_heartbeats[stream_name] = processor_heartbeat
                 self._starting_processors.pop(stream_name, None)
             self.logger.info(f"Processor started for {stream_name} (PID: {proc.pid})")
 
@@ -1832,6 +1838,7 @@ class StreamOrchestrator:
             with self._state_lock:
                 # Clean up processor entry (use pop to avoid KeyError)
                 self.processors.pop(stream_name, None)
+                self._processor_heartbeats.pop(stream_name, None)
                 # Pop frame queue for cleanup outside lock (join_thread can block)
                 frame_queue = self.frame_queues.pop(stream_name, None)
                 # Clean up stream stats
@@ -1891,6 +1898,7 @@ class StreamOrchestrator:
         with self._state_lock:
             # Clean up processor entry
             self.processors.pop(stream_name, None)
+            self._processor_heartbeats.pop(stream_name, None)
             # Pop frame queue for cleanup outside lock (join_thread can block)
             frame_queue = self.frame_queues.pop(stream_name, None)
             # Clean up stream stats
@@ -2031,6 +2039,14 @@ class StreamOrchestrator:
                     if not proc.is_alive():
                         self.logger.warning(f"Processor for {stream_name} died unexpectedly")
                         dead_processors.append(stream_name)
+                    elif stream_name in self._processor_heartbeats:
+                        hb = self._processor_heartbeats[stream_name]
+                        if hb.value > 0 and time.time() - hb.value > 60:
+                            self.logger.warning(
+                                f"Processor for {stream_name} stuck — no heartbeat for "
+                                f"{time.time() - hb.value:.1f}s, restarting"
+                            )
+                            dead_processors.append(stream_name)
 
                 # Clean up dead processors
                 for stream_name in dead_processors:
