@@ -1661,26 +1661,78 @@ class PeopleCounterProcessor(BaseStreamProcessor):
                         recovered_cp = self.active_checkpoints.pop(best_cp_id)
                         checkpoint = recovered_cp['checkpoint']
                         tracker = self.trackers[new_id]
-                        # Transfer checkpoint so normal zone-transition logic detects the crossing
-                        # when the tracker physically transits through zones (not immediately)
-                        tracker.checkpoint = checkpoint
-                        tracker.search_active = True
-                        self.logger.info(f"Checkpoint recovered: new track #{new_id} matched expired track #{best_cp_id} "
-                                        f"(similarity={best_cp_sim:.2f}, entry_side={checkpoint.entry_side})")
+
+                        # Determine which zone the person is currently in
+                        det_x = detection.center[0]
+                        current_zone = tracker._determine_zone(
+                            det_x, width,
+                            self.doorway_config['doorway_center'],
+                            self.doorway_config.get('danger_zone_buffer', 0.10))
+
+                        if current_zone in (DangerZone.LEFT_ZONE, DangerZone.RIGHT_ZONE):
+                            exit_side = 'left' if current_zone == DangerZone.LEFT_ZONE else 'right'
+
+                            if checkpoint.entry_side != exit_side:
+                                # Person entered from one side, now on the other — count crossing directly
+                                crossing_dir = (CrossingDirection.LEFT_TO_RIGHT
+                                               if checkpoint.entry_side == 'left'
+                                               else CrossingDirection.RIGHT_TO_LEFT)
+                                self.crossings[crossing_dir] += 1
+
+                                if self.direction_flipped:
+                                    api_method = (self.api_client.subtract_from_count
+                                                 if crossing_dir == CrossingDirection.LEFT_TO_RIGHT
+                                                 else self.api_client.add_to_count)
+                                else:
+                                    api_method = (self.api_client.add_to_count
+                                                 if crossing_dir == CrossingDirection.LEFT_TO_RIGHT
+                                                 else self.api_client.subtract_from_count)
+                                threading.Thread(target=api_method, args=(1,), daemon=True).start()
+
+                                tracker.last_crossing_time = current_time
+                                tracker.last_side = exit_side
+                                tracker.total_crossings += 1
+
+                                total = sum(self.crossings.values())
+                                self.logger.info(
+                                    f"CHECKPOINT CROSSING #{total}: {crossing_dir.value} | "
+                                    f"Track #{new_id} recovered from #{best_cp_id} "
+                                    f"(similarity={best_cp_sim:.2f}, entry_side={checkpoint.entry_side})")
+                            else:
+                                # Same side as entry — no crossing occurred
+                                tracker.last_side = exit_side
+                                self.logger.info(
+                                    f"Checkpoint recovered (same side): track #{new_id} from #{best_cp_id} "
+                                    f"(similarity={best_cp_sim:.2f}, side={exit_side})")
+                        else:
+                            # Still in danger zone — transfer checkpoint for zone-transition detection
+                            tracker.checkpoint = checkpoint
+                            tracker.search_active = True
+                            tracker.checkpoint_is_recovered = True
+                            self.logger.info(
+                                f"Checkpoint transferred: track #{new_id} from #{best_cp_id} "
+                                f"(similarity={best_cp_sim:.2f}, entry_side={checkpoint.entry_side})")
 
         # Check for crossings on unmatched trackers using interpolation
         # This catches crossings that may have occurred during dropped frames
+        interp_crossing_this_frame = False
         for track_id, tracker in self.trackers.items():
             if track_id in matched_trackers:
                 continue  # Already processed
+
+            # Only allow one interpolated crossing per frame to prevent
+            # multiple fragmented trackers from each counting the same person
+            if interp_crossing_this_frame:
+                continue
 
             time_gap = tracker.time_since_update()
 
             # Only interpolate if there's a significant time gap (dropped frames)
             # but not too stale (likely lost track)
             # Also require minimum peak confidence to avoid counting shadows/reflections
+            # Require 5+ positions to filter out short-lived fragmented tracks
             min_conf = self.doorway_config.get('min_peak_confidence', 0.40)
-            if 0.1 < time_gap < 1.0 and len(tracker.positions) >= 2 and tracker.peak_confidence >= min_conf:
+            if 0.1 < time_gap < 1.0 and len(tracker.positions) >= 5 and tracker.peak_confidence >= min_conf:
                 # Get interpolated positions through the gap
                 interpolated = tracker.interpolate_positions(current_time, num_steps=5)
 
@@ -1703,6 +1755,7 @@ class PeopleCounterProcessor(BaseStreamProcessor):
                     'last_crossing_time': tracker.last_crossing_time,
                 }
 
+                interp_crossing_fired = False
                 for interp_pos in interpolated:
                     # Temporarily add interpolated position to check crossing
                     original_positions = list(tracker.positions)
@@ -1721,6 +1774,8 @@ class PeopleCounterProcessor(BaseStreamProcessor):
 
                     if crossing_dir and crossing_dir != CrossingDirection.NONE:
                         # Interpolation detected a crossing during frame gap
+                        interp_crossing_fired = True
+                        interp_crossing_this_frame = True
                         self.crossings[crossing_dir] += 1
 
                         # Make API call
@@ -1758,11 +1813,10 @@ class PeopleCounterProcessor(BaseStreamProcessor):
                                        f"R->L: {self.crossings[CrossingDirection.RIGHT_TO_LEFT]}")
                         break  # Only count one crossing per interpolation check
 
-                # Restore all mutable state after interpolation loop
+                # Restore zone/velocity state so real detections start fresh
                 tracker.current_zone = saved_state['current_zone']
                 tracker.previous_zone = saved_state['previous_zone']
                 tracker.current_side = saved_state['current_side']
-                tracker.last_side = saved_state['last_side']
                 tracker.in_danger_zone = saved_state['in_danger_zone']
                 tracker.danger_zone_frame_count = saved_state['danger_zone_frame_count']
                 tracker.approach_velocities = saved_state['approach_velocities']
@@ -1771,9 +1825,17 @@ class PeopleCounterProcessor(BaseStreamProcessor):
                 tracker.consecutive_side_detections = saved_state['consecutive_side_detections']
                 tracker.checkpoint = saved_state['checkpoint']
                 tracker.search_active = saved_state['search_active']
-                tracker.total_crossings = saved_state['total_crossings']
-                tracker.crossing_events = saved_state['crossing_events']
-                tracker.last_crossing_time = saved_state['last_crossing_time']
+
+                if interp_crossing_fired:
+                    # Keep crossing-related state so tracker "remembers" the crossing.
+                    # This prevents the same tracker from re-firing every frame
+                    # (the per-tracker cooldown now applies to future interpolation attempts).
+                    pass
+                else:
+                    tracker.last_side = saved_state['last_side']
+                    tracker.total_crossings = saved_state['total_crossings']
+                    tracker.crossing_events = saved_state['crossing_events']
+                    tracker.last_crossing_time = saved_state['last_crossing_time']
 
         # Remove stale trackers
         trackers_to_remove = []
@@ -1782,7 +1844,10 @@ class PeopleCounterProcessor(BaseStreamProcessor):
                 trackers_to_remove.append(track_id)
 
                 # Save checkpoint from expiring tracker for cross-track recovery
-                if tracker.checkpoint and tracker.mean_appearance is not None:
+                # Don't save recovered checkpoints back — prevents recycling loop
+                # where fragmented tracks endlessly pass the same checkpoint around
+                if (tracker.checkpoint and tracker.mean_appearance is not None
+                        and not getattr(tracker, 'checkpoint_is_recovered', False)):
                     self.active_checkpoints[track_id] = {
                         'checkpoint': tracker.checkpoint,
                         'embedding': tracker.mean_appearance.copy(),
