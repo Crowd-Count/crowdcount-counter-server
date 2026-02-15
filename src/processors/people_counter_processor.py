@@ -731,6 +731,7 @@ class PeopleCounterProcessor(BaseStreamProcessor):
 
         # Consecutive inference failure counter for fast backoff
         self._centralized_inference_failures = 0
+        self._last_inference_retry_time = 0.0
 
         print(f"[{self.stream_name}] Centralized inference mode (CPU-only worker)", flush=True)
         self.logger.info("Using centralized inference server (no local GPU)")
@@ -1034,11 +1035,14 @@ class PeopleCounterProcessor(BaseStreamProcessor):
         """Extract detections via centralized inference server + local ByteTrack."""
         detections = []
 
-        # Fast backoff: after 5 consecutive failures, return empty immediately
-        # Lets processor die naturally via jitter buffer staleness instead of
-        # wasting 5s per frame on the get() timeout
+        # Fast backoff: after 5 consecutive failures, only retry every 10s
+        # to avoid wasting time on get() timeout while allowing recovery
         if self._centralized_inference_failures >= 5:
-            return detections
+            now = time.time()
+            if now - self._last_inference_retry_time < 10.0:
+                return detections  # Still in backoff window
+            self._last_inference_retry_time = now
+            self.logger.info("Inference backoff: attempting periodic retry")
 
         try:
             # Send detection request to inference server
@@ -1288,7 +1292,10 @@ class PeopleCounterProcessor(BaseStreamProcessor):
 
         # Share failure counter with detection — both use the same inference server
         if self._centralized_inference_failures >= 5:
-            return [None] * len(boxes)
+            now = time.time()
+            if now - self._last_inference_retry_time < 10.0:
+                return [None] * len(boxes)
+            self._last_inference_retry_time = now
 
         try:
             request = self._InferenceRequest(
