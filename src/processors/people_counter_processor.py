@@ -1661,12 +1661,12 @@ class PeopleCounterProcessor(BaseStreamProcessor):
                         recovered_cp = self.active_checkpoints.pop(best_cp_id)
                         checkpoint = recovered_cp['checkpoint']
                         tracker = self.trackers[new_id]
-                        # Set last_side to entry side so crossing check detects the transition
-                        tracker.last_side = checkpoint.entry_side
+                        # Transfer checkpoint so normal zone-transition logic detects the crossing
+                        # when the tracker physically transits through zones (not immediately)
+                        tracker.checkpoint = checkpoint
+                        tracker.search_active = True
                         self.logger.info(f"Checkpoint recovered: new track #{new_id} matched expired track #{best_cp_id} "
                                         f"(similarity={best_cp_sim:.2f}, entry_side={checkpoint.entry_side})")
-                        # Check for crossing now that we have the entry side context
-                        self._check_and_handle_crossing(new_id, detection, width, current_time, frame)
 
         # Check for crossings on unmatched trackers using interpolation
         # This catches crossings that may have occurred during dropped frames
