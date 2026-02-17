@@ -703,6 +703,12 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             timeout=5
         )
 
+        # Attach persistent backlog for failed API counts
+        from api.count_backlog import CountBacklog
+        from config.server_config import BACKLOG_DB_PATH
+        backlog = CountBacklog(str(BACKLOG_DB_PATH))
+        self.api_client.set_backlog(backlog)
+
         # Fetch direction flip setting and set up periodic refresh
         self.direction_flipped = self.api_client.get_direction_flipped()
         self.direction_refresh_timer = None
@@ -1383,14 +1389,18 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             # Apply direction flip logic if enabled
             if self.direction_flipped:
                 if crossing_dir == CrossingDirection.LEFT_TO_RIGHT:
-                    threading.Thread(target=self.api_client.subtract_from_count, args=(1,), daemon=True).start()
+                    threading.Thread(target=self.api_client.subtract_from_count, args=(1,),
+                                     kwargs={'crossing_timestamp': current_time}, daemon=True).start()
                 elif crossing_dir == CrossingDirection.RIGHT_TO_LEFT:
-                    threading.Thread(target=self.api_client.add_to_count, args=(1,), daemon=True).start()
+                    threading.Thread(target=self.api_client.add_to_count, args=(1,),
+                                     kwargs={'crossing_timestamp': current_time}, daemon=True).start()
             else:
                 if crossing_dir == CrossingDirection.LEFT_TO_RIGHT:
-                    threading.Thread(target=self.api_client.add_to_count, args=(1,), daemon=True).start()
+                    threading.Thread(target=self.api_client.add_to_count, args=(1,),
+                                     kwargs={'crossing_timestamp': current_time}, daemon=True).start()
                 elif crossing_dir == CrossingDirection.RIGHT_TO_LEFT:
-                    threading.Thread(target=self.api_client.subtract_from_count, args=(1,), daemon=True).start()
+                    threading.Thread(target=self.api_client.subtract_from_count, args=(1,),
+                                     kwargs={'crossing_timestamp': current_time}, daemon=True).start()
 
             # Log the crossing
             crossing_info = {
@@ -1709,7 +1719,8 @@ class PeopleCounterProcessor(BaseStreamProcessor):
                                     api_method = (self.api_client.add_to_count
                                                  if crossing_dir == CrossingDirection.LEFT_TO_RIGHT
                                                  else self.api_client.subtract_from_count)
-                                threading.Thread(target=api_method, args=(1,), daemon=True).start()
+                                threading.Thread(target=api_method, args=(1,),
+                                                 kwargs={'crossing_timestamp': current_time}, daemon=True).start()
 
                                 tracker.last_crossing_time = current_time
                                 tracker.last_side = exit_side
@@ -1806,12 +1817,14 @@ class PeopleCounterProcessor(BaseStreamProcessor):
                                 threading.Thread(
                                     target=self.api_client.subtract_from_count,
                                     args=(1,),
+                                    kwargs={'crossing_timestamp': current_time},
                                     daemon=True
                                 ).start()
                             elif crossing_dir == CrossingDirection.RIGHT_TO_LEFT:
                                 threading.Thread(
                                     target=self.api_client.add_to_count,
                                     args=(1,),
+                                    kwargs={'crossing_timestamp': current_time},
                                     daemon=True
                                 ).start()
                         else:
@@ -1819,12 +1832,14 @@ class PeopleCounterProcessor(BaseStreamProcessor):
                                 threading.Thread(
                                     target=self.api_client.add_to_count,
                                     args=(1,),
+                                    kwargs={'crossing_timestamp': current_time},
                                     daemon=True
                                 ).start()
                             elif crossing_dir == CrossingDirection.RIGHT_TO_LEFT:
                                 threading.Thread(
                                     target=self.api_client.subtract_from_count,
                                     args=(1,),
+                                    kwargs={'crossing_timestamp': current_time},
                                     daemon=True
                                 ).start()
 
