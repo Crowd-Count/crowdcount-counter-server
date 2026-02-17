@@ -53,11 +53,6 @@ LOG_FILE = DATA_DIR / "server.log"
 # Database settings (for device management)
 DB_PATH = DATA_DIR / "devices.db"
 
-# Count backlog settings (persists failed API counts across crashes)
-BACKLOG_DB_PATH = DATA_DIR / "count_backlog.db"
-BACKLOG_FLUSH_INTERVAL = 30      # Seconds between flush attempts
-BACKLOG_FLUSH_BATCH_SIZE = 50    # Max entries to process per flush cycle
-
 # SSH settings for remote device control
 SSH_KEY_PATH = os.path.expanduser('~/.ssh/id_rsa')
 SSH_USER = 'pi'  # Default Raspberry Pi username

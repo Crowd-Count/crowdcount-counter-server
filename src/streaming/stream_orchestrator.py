@@ -15,7 +15,6 @@ from typing import Dict, Type, Optional
 from flask import Flask, request, jsonify, Response, render_template_string, send_from_directory
 from flask_cors import CORS
 import multiprocessing
-import requests as req_lib
 import cv2
 import queue
 import sqlite3
@@ -29,7 +28,6 @@ from contextlib import contextmanager
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from api.crowdcount_api_client import CrowdCountAPIClient
-from api.count_backlog import CountBacklog
 from config.server_config import (
     ORCHESTRATOR_HOST,
     ORCHESTRATOR_PORT,
@@ -51,9 +49,6 @@ from config.server_config import (
     GPU_PRIORITY_ORDER,
     INFERENCE_QUEUE_MAXSIZE,
     INFERENCE_IMGSZ,
-    BACKLOG_DB_PATH,
-    BACKLOG_FLUSH_INTERVAL,
-    BACKLOG_FLUSH_BATCH_SIZE,
 )
 from streaming.mediamtx_manager import MediaMTXManager
 from processors import BaseStreamProcessor, ExampleProcessor
@@ -289,7 +284,6 @@ class StreamOrchestrator:
 
         self.running = False
         self.monitor_thread = None
-        self._backlog = None  # CountBacklog instance, initialized in start()
 
         # Thread pool for fire-and-forget status updates (prevents thread accumulation)
         self._status_update_executor = ThreadPoolExecutor(
@@ -1364,83 +1358,6 @@ class StreamOrchestrator:
                 self.logger.error(f"Error checking password requirement: {e}")
                 return jsonify({'error': str(e)}), 500
 
-        @self.app.route('/api/backlog/status', methods=['GET'])
-        def backlog_status():
-            """Get count backlog status for observability"""
-            if self._backlog is None:
-                return jsonify({'total_pending': 0, 'by_device': {}})
-            try:
-                return jsonify({
-                    'total_pending': self._backlog.get_count(),
-                    'by_device': self._backlog.get_count_by_device()
-                })
-            except Exception as e:
-                self.logger.error(f"Error getting backlog status: {e}")
-                return jsonify({'error': str(e)}), 500
-
-    def _flush_backlog_loop(self):
-        """Background loop that drains the count backlog when the API is reachable."""
-        self.logger.info(f"Backlog flush thread started (interval={BACKLOG_FLUSH_INTERVAL}s, batch={BACKLOG_FLUSH_BATCH_SIZE})")
-        while self.running:
-            time.sleep(BACKLOG_FLUSH_INTERVAL)
-            if not self.running or self._backlog is None:
-                break
-
-            try:
-                entries = self._backlog.get_pending(limit=BACKLOG_FLUSH_BATCH_SIZE)
-                if not entries:
-                    continue
-
-                flushed = 0
-                for entry in entries:
-                    if not self.running:
-                        break
-                    self._backlog.mark_attempted(entry['id'])
-                    if self._flush_single_entry(entry):
-                        self._backlog.mark_completed(entry['id'])
-                        flushed += 1
-                    else:
-                        # API probably down again - stop this cycle, retry next interval
-                        break
-
-                if flushed > 0:
-                    remaining = self._backlog.get_count()
-                    self.logger.info(f"Backlog flush: sent {flushed} entries, {remaining} remaining")
-
-            except Exception as e:
-                self.logger.error(f"Backlog flush error: {e}")
-
-    def _flush_single_entry(self, entry: dict) -> bool:
-        """Attempt to send a single backlogged count to the API. Returns True on success."""
-        op = entry['operation']
-        if op == 'add':
-            endpoint = '/add_to_count'
-            data = {
-                'device_id': entry['device_id'],
-                'password': entry['password'],
-                'count_to_add': str(entry['count'])
-            }
-        else:
-            endpoint = '/sub_from_count'
-            data = {
-                'device_id': entry['device_id'],
-                'password': entry['password'],
-                'count_to_sub': str(entry['count'])
-            }
-
-        # Future timed-API hook: entry['crossing_timestamp'] is available here.
-        # When timed endpoints are ready, include the timestamp in the payload.
-
-        try:
-            url = f"https://api.crowdcount.tech{endpoint}"
-            response = req_lib.post(url, json=data, timeout=10)
-            return response.status_code == 200
-        except (req_lib.Timeout, req_lib.ConnectionError):
-            return False
-        except Exception as e:
-            self.logger.error(f"Backlog flush unexpected error: {e}")
-            return False
-
     def _detect_available_gpus(self) -> int:
         """Detect the number of available CUDA GPUs.
 
@@ -2301,20 +2218,6 @@ class StreamOrchestrator:
         self.monitor_thread = threading.Thread(target=self.monitor_streams, daemon=True)
         self.monitor_thread.start()
 
-        # Initialize count backlog and start flush thread
-        try:
-            self._backlog = CountBacklog(str(BACKLOG_DB_PATH))
-            pending = self._backlog.get_count()
-            if pending > 0:
-                self.logger.warning(f"Count backlog has {pending} entries from previous session - will flush when API is reachable")
-            else:
-                self.logger.info("Count backlog initialized (empty)")
-            self._backlog_flush_thread = threading.Thread(target=self._flush_backlog_loop, daemon=True)
-            self._backlog_flush_thread.start()
-        except Exception as e:
-            self.logger.error(f"Failed to initialize count backlog: {e}")
-            self._backlog = None
-
         # Suppress Flask/Werkzeug logging
         import logging as flask_logging
         flask_log = flask_logging.getLogger('werkzeug')
@@ -2350,16 +2253,6 @@ class StreamOrchestrator:
         """Stop the orchestrator"""
         self.logger.info("Stopping orchestrator...")
         self.running = False
-
-        # Log remaining backlog count before shutdown
-        if self._backlog is not None:
-            try:
-                remaining = self._backlog.get_count()
-                if remaining > 0:
-                    self.logger.warning(f"Shutting down with {remaining} backlogged count entries - will be flushed on next startup")
-                self._backlog.close()
-            except Exception as e:
-                self.logger.error(f"Error closing backlog: {e}")
 
         # Set all devices offline (using executor for consistency)
         for stream_name, api_client in list(self.api_clients.items()):

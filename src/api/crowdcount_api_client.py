@@ -31,16 +31,6 @@ class CrowdCountAPIClient:
         self.timeout = timeout
         self.enabled = bool(device_id and password)  # Only enabled if both credentials provided
 
-        # Health tracking for fast-fail when API is down
-        self._api_healthy = True
-        self._last_failure_time = 0.0
-        self._consecutive_failures = 0
-        self._health_recheck_interval = 30.0  # Allow a probe request every 30s when unhealthy
-        self._failure_threshold = 2  # Failures before marking unhealthy
-
-        # Backlog for persisting failed counts (attached via set_backlog)
-        self._backlog = None
-
         # Setup logging (only add handler and log once per device_id)
         self.logger = logging.getLogger(f"APIClient-{device_id}")
         if not self.logger.handlers:
@@ -55,68 +45,19 @@ class CrowdCountAPIClient:
             else:
                 self.logger.info(f"API Client disabled (no credentials provided)")
 
-    def set_backlog(self, backlog):
-        """Attach a CountBacklog instance for persisting failed counts."""
-        self._backlog = backlog
-
-    def _is_api_healthy(self) -> bool:
-        """Returns True if API is healthy, or if enough time has passed for a probe attempt."""
-        if self._api_healthy:
-            return True
-        # Allow periodic probe attempts when unhealthy
-        return (time.time() - self._last_failure_time) >= self._health_recheck_interval
-
-    def _record_success(self):
-        """Mark API as healthy and reset failure counter."""
-        self._api_healthy = True
-        self._consecutive_failures = 0
-
-    def _record_failure(self):
-        """Increment failure counter. Mark unhealthy after threshold."""
-        self._consecutive_failures += 1
-        self._last_failure_time = time.time()
-        if self._consecutive_failures >= self._failure_threshold:
-            if self._api_healthy:
-                self.logger.warning("API marked unhealthy - will fast-fail and backlog until recovery")
-            self._api_healthy = False
-
-    def _backlog_count(self, operation: str, count: int, crossing_timestamp: float):
-        """Queue a failed count operation to the backlog if available."""
-        if self._backlog is not None:
-            self._backlog.add(
-                device_id=self.device_id,
-                password=self.password,
-                operation=operation,
-                count=count,
-                crossing_timestamp=crossing_timestamp
-            )
-        else:
-            self.logger.warning(f"No backlog attached - {operation} {count} lost permanently")
-
-    def add_to_count(self, count: int = 1, max_retries: int = 2,
-                     crossing_timestamp: float = None) -> bool:
+    def add_to_count(self, count: int = 1, max_retries: int = 2) -> bool:
         """
         Add to the count (person entered)
 
         Args:
             count: Number to add to count (default: 1)
             max_retries: Maximum number of retries on transient failure (default: 2)
-            crossing_timestamp: Original time the crossing occurred (for backlog)
 
         Returns:
             True if successful, False otherwise
         """
         if not self.enabled:
             return True  # Silently succeed if API is disabled
-
-        if crossing_timestamp is None:
-            crossing_timestamp = time.time()
-
-        # Fast-fail path: API is known to be down, skip retries and queue directly
-        if not self._is_api_healthy():
-            self.logger.debug(f"API unhealthy - fast-failing add {count} to backlog")
-            self._backlog_count('add', count, crossing_timestamp)
-            return False
 
         url = f"{self.base_url}/add_to_count"
         data = {
@@ -132,11 +73,10 @@ class CrowdCountAPIClient:
 
                 if response.status_code == 200:
                     self.logger.info(f"✓ Added {count} to remote count")
-                    self._record_success()
                     return True
                 else:
                     self.logger.warning(f"✗ API Error: HTTP {response.status_code}")
-                    return False  # Non-transient error (4xx/5xx), don't retry or backlog
+                    return False  # Non-transient error, don't retry
 
             except (requests.Timeout, requests.ConnectionError) as e:
                 if attempt < max_retries:
@@ -144,9 +84,7 @@ class CrowdCountAPIClient:
                     self.logger.warning(f"✗ API {type(e).__name__} (attempt {attempt + 1}/{1 + max_retries}), retrying in {delay:.0f}s")
                     time.sleep(delay)
                 else:
-                    self.logger.warning(f"✗ API {type(e).__name__}: Failed after {1 + max_retries} attempts - backlogging")
-                    self._record_failure()
-                    self._backlog_count('add', count, crossing_timestamp)
+                    self.logger.warning(f"✗ API {type(e).__name__}: Failed after {1 + max_retries} attempts")
                     return False
             except Exception as e:
                 self.logger.warning(f"✗ API Error: {e}")
@@ -154,30 +92,19 @@ class CrowdCountAPIClient:
 
         return False
 
-    def subtract_from_count(self, count: int = 1, max_retries: int = 2,
-                            crossing_timestamp: float = None) -> bool:
+    def subtract_from_count(self, count: int = 1, max_retries: int = 2) -> bool:
         """
         Subtract from the count (person exited)
 
         Args:
             count: Number to subtract from count (default: 1)
             max_retries: Maximum number of retries on transient failure (default: 2)
-            crossing_timestamp: Original time the crossing occurred (for backlog)
 
         Returns:
             True if successful, False otherwise
         """
         if not self.enabled:
             return True  # Silently succeed if API is disabled
-
-        if crossing_timestamp is None:
-            crossing_timestamp = time.time()
-
-        # Fast-fail path: API is known to be down, skip retries and queue directly
-        if not self._is_api_healthy():
-            self.logger.debug(f"API unhealthy - fast-failing sub {count} to backlog")
-            self._backlog_count('sub', count, crossing_timestamp)
-            return False
 
         url = f"{self.base_url}/sub_from_count"
         data = {
@@ -193,11 +120,10 @@ class CrowdCountAPIClient:
 
                 if response.status_code == 200:
                     self.logger.info(f"✓ Subtracted {count} from remote count")
-                    self._record_success()
                     return True
                 else:
                     self.logger.warning(f"✗ API Error: HTTP {response.status_code}")
-                    return False  # Non-transient error (4xx/5xx), don't retry or backlog
+                    return False  # Non-transient error, don't retry
 
             except (requests.Timeout, requests.ConnectionError) as e:
                 if attempt < max_retries:
@@ -205,9 +131,7 @@ class CrowdCountAPIClient:
                     self.logger.warning(f"✗ API {type(e).__name__} (attempt {attempt + 1}/{1 + max_retries}), retrying in {delay:.0f}s")
                     time.sleep(delay)
                 else:
-                    self.logger.warning(f"✗ API {type(e).__name__}: Failed after {1 + max_retries} attempts - backlogging")
-                    self._record_failure()
-                    self._backlog_count('sub', count, crossing_timestamp)
+                    self.logger.warning(f"✗ API {type(e).__name__}: Failed after {1 + max_retries} attempts")
                     return False
             except Exception as e:
                 self.logger.warning(f"✗ API Error: {e}")
