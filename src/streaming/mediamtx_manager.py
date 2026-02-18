@@ -87,10 +87,11 @@ class MediaMTXManager:
             self.logger.info(f"Config: {MEDIAMTX_CONFIG}")
 
             # Start MediaMTX process
+            # Use DEVNULL to prevent pipe buffer deadlock — MediaMTX logs to its own file
             self.process = subprocess.Popen(
                 [str(MEDIAMTX_BINARY), str(MEDIAMTX_CONFIG)],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
                 cwd=MEDIAMTX_BINARY.parent.parent  # Run from base directory
             )
 
@@ -99,10 +100,7 @@ class MediaMTXManager:
 
             # Check if process is still running
             if self.process.poll() is not None:
-                stdout, stderr = self.process.communicate()
-                self.logger.error("MediaMTX failed to start")
-                self.logger.error(f"stdout: {stdout.decode()}")
-                self.logger.error(f"stderr: {stderr.decode()}")
+                self.logger.error(f"MediaMTX failed to start (exit code: {self.process.returncode})")
                 return False
 
             # Verify server is responding
@@ -333,7 +331,8 @@ class MediaMTXManager:
     def kick_path_publishers(self, path_name: str) -> int:
         """Kick all stale RTSP publisher sessions for a given path.
 
-        Lists RTSP sessions, finds publishers matching the path, kicks them.
+        Lists RTSP sessions, finds ANY session matching the path (regardless
+        of state), and kicks them. Also kicks RTMP connections on the path.
         Returns count of sessions kicked.
         """
         kicked = 0
@@ -342,36 +341,111 @@ class MediaMTXManager:
         success, response = self._make_api_request("/v3/rtspsessions/list")
         if not success or not response or response.status_code != 200:
             self.logger.warning(f"Failed to list RTSP sessions for path {path_name}")
+        else:
+            try:
+                data = response.json()
+                items = data.get('items') or []
+            except (ValueError, AttributeError):
+                self.logger.warning(f"Failed to parse RTSP sessions response for path {path_name}")
+                items = []
+
+            for session in items:
+                if session.get('path') == path_name:
+                    session_id = session.get('id')
+                    if not session_id:
+                        continue
+                    try:
+                        resp = self._session.post(
+                            f"{MEDIAMTX_API_URL}/v3/rtspsessions/kick/{session_id}",
+                            timeout=DEFAULT_TIMEOUT
+                        )
+                        if resp.status_code == 200:
+                            kicked += 1
+                            self.logger.info(f"Kicked RTSP session {session_id} (state={session.get('state')}) for path {path_name}")
+                        else:
+                            self.logger.warning(f"Failed to kick RTSP session {session_id}: HTTP {resp.status_code}")
+                    except requests.exceptions.RequestException as e:
+                        self.logger.warning(f"Error kicking RTSP session {session_id}: {e}")
+
+        # Also kick RTMP connections on this path
+        kicked += self._kick_rtmp_connections(path_name)
+
+        if kicked:
+            self.logger.info(f"Kicked {kicked} total session(s) for path {path_name}")
+        return kicked
+
+    def _kick_rtmp_connections(self, path_name: str) -> int:
+        """Kick all RTMP connections for a given path. Returns count kicked."""
+        kicked = 0
+        success, response = self._make_api_request("/v3/rtmpconns/list")
+        if not success or not response or response.status_code != 200:
             return 0
 
         try:
             data = response.json()
             items = data.get('items') or []
         except (ValueError, AttributeError):
-            self.logger.warning(f"Failed to parse RTSP sessions response for path {path_name}")
             return 0
 
-        # Find publisher sessions matching this path
-        for session in items:
-            if session.get('state') == 'publish' and session.get('path') == path_name:
-                session_id = session.get('id')
-                if not session_id:
+        for conn in items:
+            if conn.get('path') == path_name:
+                conn_id = conn.get('id')
+                if not conn_id:
                     continue
                 try:
                     resp = self._session.post(
-                        f"{MEDIAMTX_API_URL}/v3/rtspsessions/kick/{session_id}",
+                        f"{MEDIAMTX_API_URL}/v3/rtmpconns/kick/{conn_id}",
                         timeout=DEFAULT_TIMEOUT
                     )
                     if resp.status_code == 200:
                         kicked += 1
-                        self.logger.info(f"Kicked stale RTSP session {session_id} for path {path_name}")
+                        self.logger.info(f"Kicked RTMP connection {conn_id} for path {path_name}")
                     else:
-                        self.logger.warning(f"Failed to kick session {session_id}: HTTP {resp.status_code}")
+                        self.logger.warning(f"Failed to kick RTMP connection {conn_id}: HTTP {resp.status_code}")
                 except requests.exceptions.RequestException as e:
-                    self.logger.warning(f"Error kicking session {session_id}: {e}")
+                    self.logger.warning(f"Error kicking RTMP connection {conn_id}: {e}")
+
+        return kicked
+
+    def kick_all_sessions_for_path(self, path_name: str) -> int:
+        """Kick ALL RTSP sessions and RTMP connections for a given path.
+
+        Used by the proactive stale session sweep. Checks both RTSP and RTMP,
+        kicks everything regardless of state.
+        Returns total count of sessions/connections kicked.
+        """
+        kicked = 0
+
+        # Kick all RTSP sessions on this path
+        success, response = self._make_api_request("/v3/rtspsessions/list")
+        if success and response and response.status_code == 200:
+            try:
+                data = response.json()
+                items = data.get('items') or []
+            except (ValueError, AttributeError):
+                items = []
+
+            for session in items:
+                if session.get('path') == path_name:
+                    session_id = session.get('id')
+                    if not session_id:
+                        continue
+                    try:
+                        resp = self._session.post(
+                            f"{MEDIAMTX_API_URL}/v3/rtspsessions/kick/{session_id}",
+                            timeout=DEFAULT_TIMEOUT
+                        )
+                        if resp.status_code == 200:
+                            kicked += 1
+                            self.logger.info(f"Stale sweep: kicked RTSP session {session_id} (state={session.get('state')}) for path {path_name}")
+                    except requests.exceptions.RequestException as e:
+                        self.logger.warning(f"Stale sweep: error kicking RTSP session {session_id}: {e}")
+
+        # Kick all RTMP connections on this path
+        kicked += self._kick_rtmp_connections(path_name)
 
         if kicked:
-            self.logger.info(f"Kicked {kicked} stale publisher session(s) for path {path_name}")
+            self.logger.info(f"Stale sweep: kicked {kicked} total session(s) for path {path_name}")
         return kicked
 
     def restart(self) -> bool:

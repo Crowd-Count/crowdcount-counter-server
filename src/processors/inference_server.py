@@ -13,7 +13,7 @@ Architecture:
 import time
 import logging
 import multiprocessing
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, List, Tuple, Dict
 from enum import Enum
 from pathlib import Path
@@ -53,6 +53,8 @@ class InferenceRequest:
     boxes: Optional[List[Tuple[int, int, int, int]]] = None
     # For REGISTER requests
     slot_name: Optional[str] = None
+    # Timestamp for staleness checking
+    created_at: float = field(default_factory=time.time)
 
 
 @dataclass
@@ -92,6 +94,7 @@ class InferenceServer:
         request_queue: multiprocessing.Queue,
         result_queues: Dict[str, multiprocessing.Queue],
         config: dict,
+        heartbeat: Optional[multiprocessing.Value] = None,
     ):
         """
         Initialize inference server configuration.
@@ -105,6 +108,9 @@ class InferenceServer:
                           Created before spawn and inherited by the child process.
                           Keys are slot names like "slot_0", "slot_1", etc.
             config: Configuration dict with inference parameters
+            heartbeat: Shared multiprocessing.Value('d') for liveness monitoring.
+                      Updated after each main loop iteration so the orchestrator can
+                      detect stuck inference (CUDA hang, OOM) even when is_alive() is True.
         """
         self.gpu_id = gpu_id
         self.model_path = model_path
@@ -112,6 +118,7 @@ class InferenceServer:
         self.request_queue = request_queue
         self.result_queues = result_queues  # Pre-allocated pool, inherited at spawn
         self.config = config
+        self.heartbeat = heartbeat
         self.running = False
         # Maps camera_id to slot name, populated dynamically as cameras register
         self.camera_to_slot: Dict[str, str] = {}
@@ -184,7 +191,9 @@ class InferenceServer:
                 try:
                     request = self.request_queue.get(timeout=1.0)
                 except Exception:
-                    # Queue.get timeout - just loop and check self.running
+                    # Queue.get timeout - update heartbeat to prove loop is alive even when idle
+                    if self.heartbeat is not None:
+                        self.heartbeat.value = time.time()
                     continue
 
                 if request.type == RequestType.SHUTDOWN:
@@ -213,6 +222,14 @@ class InferenceServer:
                     self.logger.warning(f"No result queue for slot {slot_name}, dropping request")
                     continue
 
+                # Skip stale requests — drop before GPU inference so the
+                # response doesn't arrive after the processor's 5s timeout.
+                # Using 3s threshold leaves ~2s headroom for inference.
+                if request.type in (RequestType.DETECT, RequestType.REID):
+                    age = time.time() - request.created_at
+                    if age > 3.0:
+                        continue
+
                 if request.type == RequestType.DETECT:
                     response = self._handle_detect(request)
                 elif request.type == RequestType.REID:
@@ -228,14 +245,26 @@ class InferenceServer:
                 try:
                     result_queue.put_nowait(response)
                 except Exception:
-                    # Queue full — replace oldest with fresh response
+                    # Queue full — drain all stale items then put fresh response
+                    drained = 0
                     try:
-                        result_queue.get_nowait()
+                        while True:
+                            result_queue.get_nowait()
+                            drained += 1
+                    except Exception:
+                        pass
+                    try:
                         result_queue.put_nowait(response)
                     except Exception:
                         self.logger.warning(f"Result queue full for camera {request.camera_id}")
+                    if drained > 0:
+                        self.logger.debug(f"Drained {drained} stale results for camera {request.camera_id}")
 
                 self.requests_processed += 1
+
+                # Update heartbeat after each processed request
+                if self.heartbeat is not None:
+                    self.heartbeat.value = time.time()
 
                 # Log stats periodically
                 now = time.time()

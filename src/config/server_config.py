@@ -57,6 +57,12 @@ DB_PATH = DATA_DIR / "devices.db"
 SSH_KEY_PATH = os.path.expanduser('~/.ssh/id_rsa')
 SSH_USER = 'pi'  # Default Raspberry Pi username
 
+# Device management API key (required for /api/device/ endpoints)
+DEVICE_API_KEY = os.getenv("DEVICE_API_KEY", "")
+
+# CORS allowed origins (comma-separated, empty = allow all for backwards compat)
+CORS_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "https://api.crowdcount.tech,https://crowdcount.tech").split(",") if o.strip()]
+
 # Web dashboard
 STATIC_DIR = BASE_DIR / "static"
 

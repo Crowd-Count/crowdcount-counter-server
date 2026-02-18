@@ -3,10 +3,46 @@ CrowdCount API Client
 Handles API calls to the CrowdCount backend server
 """
 
-import requests
+import hashlib
+import hmac as hmac_mod
+import json
 import logging
 import time
+import uuid
 from typing import Optional
+
+import requests
+
+
+def _derive_signing_key(device_id: str, password: str) -> str:
+    """Derive signing key: hex-encoded SHA256(device_id + ":" + password).
+
+    Must match crowdcount-server's signature_manager.derive_signing_key().
+    """
+    raw = f"{device_id}:{password}".encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _compute_signature(
+    signing_key: str,
+    method: str,
+    path: str,
+    body: bytes,
+    timestamp: str,
+    nonce: str,
+) -> str:
+    """Compute HMAC-SHA256 signature for a request.
+
+    String to sign: METHOD\nPATH\nSHA256(body)\nTIMESTAMP\nNONCE
+    Must match crowdcount-server's signature_manager.compute_signature().
+    """
+    body_hash = hashlib.sha256(body).hexdigest()
+    string_to_sign = f"{method}\n{path}\n{body_hash}\n{timestamp}\n{nonce}"
+    return hmac_mod.new(
+        bytes.fromhex(signing_key),
+        string_to_sign.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
 
 
 class CrowdCountAPIClient:
@@ -31,6 +67,12 @@ class CrowdCountAPIClient:
         self.timeout = timeout
         self.enabled = bool(device_id and password)  # Only enabled if both credentials provided
 
+        # Derive signing key once at init
+        if self.enabled:
+            self._signing_key = _derive_signing_key(device_id, password)
+        else:
+            self._signing_key = ""
+
         # Setup logging (only add handler and log once per device_id)
         self.logger = logging.getLogger(f"APIClient-{device_id}")
         if not self.logger.handlers:
@@ -44,6 +86,43 @@ class CrowdCountAPIClient:
                 self.logger.info(f"API Client initialized for device: {device_id}")
             else:
                 self.logger.info(f"API Client disabled (no credentials provided)")
+
+    def _signed_request(self, path: str, data: dict, idempotent: bool = False) -> requests.Response:
+        """Send a signed POST request with optional idempotency key.
+
+        Serializes the body, computes HMAC-SHA256 signature, and attaches
+        all required headers for phase-3 signature verification.
+
+        Args:
+            path: API path (e.g. "/add_to_count")
+            data: JSON payload dict
+            idempotent: Whether to attach an Idempotency-Key header
+
+        Returns:
+            The requests.Response object
+        """
+        body = json.dumps(data, separators=(",", ":")).encode("utf-8")
+        ts = str(int(time.time()))
+        nonce = uuid.uuid4().hex
+
+        sig = _compute_signature(self._signing_key, "POST", path, body, ts, nonce)
+
+        headers = {
+            "Content-Type": "application/json",
+            "X-CC-Signature": sig,
+            "X-CC-Timestamp": ts,
+            "X-CC-Nonce": nonce,
+            "X-CC-Device-Id": self.device_id,
+        }
+        if idempotent:
+            headers["Idempotency-Key"] = uuid.uuid4().hex
+
+        return requests.post(
+            f"{self.base_url}{path}",
+            data=body,
+            headers=headers,
+            timeout=self.timeout,
+        )
 
     def add_to_count(self, count: int = 1, max_retries: int = 2) -> bool:
         """
@@ -59,7 +138,6 @@ class CrowdCountAPIClient:
         if not self.enabled:
             return True  # Silently succeed if API is disabled
 
-        url = f"{self.base_url}/add_to_count"
         data = {
             'device_id': self.device_id,
             'password': self.password,
@@ -68,12 +146,14 @@ class CrowdCountAPIClient:
 
         for attempt in range(1 + max_retries):
             try:
-                self.logger.debug(f"POST {url} - Adding {count} to count (attempt {attempt + 1})")
-                response = requests.post(url, json=data, timeout=self.timeout)
+                self.logger.debug(f"POST /add_to_count - Adding {count} to count (attempt {attempt + 1})")
+                response = self._signed_request("/add_to_count", data, idempotent=True)
 
                 if response.status_code == 200:
                     self.logger.info(f"✓ Added {count} to remote count")
                     return True
+                elif response.status_code == 503:
+                    raise requests.ConnectionError("Server starting up (503)")
                 else:
                     self.logger.warning(f"✗ API Error: HTTP {response.status_code}")
                     return False  # Non-transient error, don't retry
@@ -106,7 +186,6 @@ class CrowdCountAPIClient:
         if not self.enabled:
             return True  # Silently succeed if API is disabled
 
-        url = f"{self.base_url}/sub_from_count"
         data = {
             'device_id': self.device_id,
             'password': self.password,
@@ -115,12 +194,14 @@ class CrowdCountAPIClient:
 
         for attempt in range(1 + max_retries):
             try:
-                self.logger.debug(f"POST {url} - Subtracting {count} from count (attempt {attempt + 1})")
-                response = requests.post(url, json=data, timeout=self.timeout)
+                self.logger.debug(f"POST /sub_from_count - Subtracting {count} from count (attempt {attempt + 1})")
+                response = self._signed_request("/sub_from_count", data, idempotent=True)
 
                 if response.status_code == 200:
                     self.logger.info(f"✓ Subtracted {count} from remote count")
                     return True
+                elif response.status_code == 503:
+                    raise requests.ConnectionError("Server starting up (503)")
                 else:
                     self.logger.warning(f"✗ API Error: HTTP {response.status_code}")
                     return False  # Non-transient error, don't retry
@@ -150,17 +231,16 @@ class CrowdCountAPIClient:
             return None
 
         try:
-            url = f"{self.base_url}/get_count"
             data = {
                 'device_id': self.device_id,
                 'password': self.password
             }
 
-            response = requests.post(url, json=data, timeout=self.timeout)
+            response = self._signed_request("/get_count", data)
 
             if response.status_code == 200:
-                data = response.json()
-                count = data.get('count')
+                resp_data = response.json()
+                count = resp_data.get('count')
                 self.logger.debug(f"Current count: {count}")
                 return count
             else:
@@ -182,12 +262,13 @@ class CrowdCountAPIClient:
         status = "enabled" if enabled else "disabled"
         self.logger.info(f"API calls {status}")
 
-    def update_status(self, status: str) -> bool:
+    def update_status(self, status: str, max_retries: int = 2) -> bool:
         """
         Update device online/offline status on the server
 
         Args:
             status: Either "online" or "offline"
+            max_retries: Maximum number of retries on transient failure (default: 2)
 
         Returns:
             True if successful, False otherwise
@@ -202,37 +283,46 @@ class CrowdCountAPIClient:
             self.logger.warning("Cannot update status: no credentials")
             return False
 
-        try:
-            url = f"{self.base_url}/update_status"
-            data = {
-                'device_id': self.device_id,
-                'password': self.password,
-                'status': status
-            }
+        data = {
+            'device_id': self.device_id,
+            'password': self.password,
+            'status': status
+        }
 
-            self.logger.debug(f"POST {url} - Updating status to {status}")
-            response = requests.post(url, json=data, timeout=self.timeout)
+        for attempt in range(1 + max_retries):
+            try:
+                self.logger.debug(f"POST /update_status - Updating status to {status} (attempt {attempt + 1})")
+                response = self._signed_request("/update_status", data, idempotent=True)
 
-            if response.status_code == 200:
-                self.logger.info(f"✓ Device status updated to {status}")
-                return True
-            else:
-                self.logger.warning(f"✗ Status Update Error: HTTP {response.status_code}")
+                if response.status_code == 200:
+                    self.logger.info(f"✓ Device status updated to {status}")
+                    return True
+                elif response.status_code == 503:
+                    raise requests.ConnectionError("Server starting up (503)")
+                else:
+                    self.logger.warning(f"✗ Status Update Error: HTTP {response.status_code}")
+                    return False
+
+            except (requests.Timeout, requests.ConnectionError) as e:
+                if attempt < max_retries:
+                    delay = 1.0 * (2 ** attempt)  # 1s, 2s
+                    self.logger.warning(f"✗ Status Update {type(e).__name__} (attempt {attempt + 1}/{1 + max_retries}), retrying in {delay:.0f}s")
+                    time.sleep(delay)
+                else:
+                    self.logger.warning(f"✗ Status Update {type(e).__name__}: Failed after {1 + max_retries} attempts")
+                    return False
+            except Exception as e:
+                self.logger.warning(f"✗ Status Update Error: {e}")
                 return False
 
-        except requests.Timeout:
-            self.logger.warning(f"✗ Status Update Timeout: Request took longer than {self.timeout}s")
-            return False
-        except requests.ConnectionError:
-            self.logger.warning(f"✗ Status Update Connection Error: Could not reach {self.base_url}")
-            return False
-        except Exception as e:
-            self.logger.warning(f"✗ Status Update Error: {e}")
-            return False
+        return False
 
-    def get_direction_flipped(self) -> bool:
+    def get_direction_flipped(self, max_retries: int = 2) -> bool:
         """
         Get the direction_flipped setting from the server
+
+        Args:
+            max_retries: Maximum number of retries on transient failure (default: 2)
 
         Returns:
             True if direction is flipped, False otherwise (defaults to False on error)
@@ -240,32 +330,48 @@ class CrowdCountAPIClient:
         if not self.enabled:
             return False
 
-        try:
-            url = f"{self.base_url}/get_direction_flipped"
-            data = {
-                'device_id': self.device_id,
-                'password': self.password
-            }
+        data = {
+            'device_id': self.device_id,
+            'password': self.password
+        }
 
-            response = requests.post(url, json=data, timeout=self.timeout)
+        for attempt in range(1 + max_retries):
+            try:
+                response = self._signed_request("/get_direction_flipped", data)
 
-            if response.status_code == 200:
-                data = response.json()
-                flipped = data.get('direction_flipped', False)
-                self.logger.debug(f"Direction flipped setting: {flipped}")
-                return bool(flipped)
-            else:
-                self.logger.warning(f"✗ Failed to get direction_flipped: HTTP {response.status_code}")
+                if response.status_code == 200:
+                    resp_data = response.json()
+                    flipped = resp_data.get('direction_flipped', False)
+                    self.logger.debug(f"Direction flipped setting: {flipped}")
+                    return bool(flipped)
+                elif response.status_code == 503:
+                    raise requests.ConnectionError("Server starting up (503)")
+                else:
+                    self.logger.warning(f"✗ Failed to get direction_flipped: HTTP {response.status_code}")
+                    return False
+
+            except (requests.Timeout, requests.ConnectionError) as e:
+                if attempt < max_retries:
+                    delay = 1.0 * (2 ** attempt)  # 1s, 2s
+                    self.logger.warning(f"✗ get_direction_flipped {type(e).__name__} (attempt {attempt + 1}/{1 + max_retries}), retrying in {delay:.0f}s")
+                    time.sleep(delay)
+                else:
+                    self.logger.warning(f"✗ get_direction_flipped {type(e).__name__}: Failed after {1 + max_retries} attempts")
+                    return False
+            except Exception as e:
+                self.logger.warning(f"✗ Error getting direction_flipped: {e}")
                 return False
 
-        except Exception as e:
-            self.logger.warning(f"✗ Error getting direction_flipped: {e}")
-            return False
+        return False
 
     @staticmethod
-    def check_password(device_id: str, password: str, base_url: str = 'https://api.crowdcount.tech', timeout: int = 5) -> bool:
+    def check_password(device_id: str, password: str, base_url: str = 'https://api.crowdcount.tech', timeout: int = 10) -> bool:
         """
-        Check if a password is correct for a given device_id
+        Check if a password is correct for a given device_id.
+        Retries on timeout/connection errors (server may be starting up).
+
+        This is a static method used before a client instance exists,
+        so it signs the request inline.
 
         Args:
             device_id: Device identifier
@@ -276,26 +382,55 @@ class CrowdCountAPIClient:
         Returns:
             True if password is correct, False otherwise
         """
-        try:
-            url = f"{base_url.rstrip('/')}/check_password"
-            data = {
-                'device_id': device_id,
-                'password': password
-            }
+        base_url = base_url.rstrip('/')
+        path = "/check_password"
+        data = {
+            'device_id': device_id,
+            'password': password
+        }
+        body = json.dumps(data, separators=(",", ":")).encode("utf-8")
 
-            response = requests.post(url, json=data, timeout=timeout)
+        max_attempts = 3
+        for attempt in range(1, max_attempts + 1):
+            try:
+                # Fresh timestamp/nonce each attempt
+                ts = str(int(time.time()))
+                nonce = uuid.uuid4().hex
+                signing_key = _derive_signing_key(device_id, password)
+                sig = _compute_signature(signing_key, "POST", path, body, ts, nonce)
 
-            if response.status_code == 200:
-                resp_data = response.json()
-                is_correct = resp_data.get('is_password_correct', False)
-                return bool(is_correct)
-            elif response.status_code == 404:
-                # Device does not exist
+                headers = {
+                    "Content-Type": "application/json",
+                    "X-CC-Signature": sig,
+                    "X-CC-Timestamp": ts,
+                    "X-CC-Nonce": nonce,
+                    "X-CC-Device-Id": device_id,
+                }
+
+                response = requests.post(
+                    f"{base_url}{path}",
+                    data=body,
+                    headers=headers,
+                    timeout=timeout,
+                )
+
+                if response.status_code == 200:
+                    resp_data = response.json()
+                    return bool(resp_data.get('is_password_correct', False))
+                elif response.status_code == 503:
+                    # Server starting up — retry
+                    raise requests.ConnectionError("Server starting up (503)")
+                elif response.status_code == 404:
+                    return False
+                else:
+                    return False
+
+            except (requests.Timeout, requests.ConnectionError) as e:
+                if attempt < max_attempts:
+                    print(f"✗ check_password timeout (attempt {attempt}/{max_attempts}), retrying in {attempt}s", flush=True)
+                    time.sleep(attempt)
+                    continue
+                print(f"✗ check_password: Failed after {max_attempts} attempts", flush=True)
+                raise requests.ConnectionError(f"API unreachable after {max_attempts} attempts") from e
+            except Exception:
                 return False
-            else:
-                # Other errors - fail closed (deny access)
-                return False
-
-        except Exception:
-            # On error, fail closed (deny access)
-            return False

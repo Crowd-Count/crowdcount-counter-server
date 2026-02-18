@@ -642,10 +642,10 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             'min_path_length': 50,      # Minimum pixels traveled
             'max_tracking_distance': 0.156,  # Proportion of frame width (~100px at 640w)
             'tracker_timeout': 1.5,     # TUNED: Reduced from 3.0 to let false tracks expire faster
-            'yolo_conf_threshold': 0.53,  # V5 F1-optimal confidence threshold
+            'yolo_conf_threshold': 0.45,  # Lowered from 0.53 for better recall
             'yolo_iou_threshold': 0.3,   # TUNED: Lowered from 0.45 to separate overlapping people
             'min_crossing_interval': 0.5,  # TUNED: Increased from 0.3 to prevent double counts
-            'min_peak_confidence': 0.60,  # Above YOLO conf — final quality gate before counting a crossing
+            'min_peak_confidence': 0.53,  # Above YOLO conf — final quality gate before counting a crossing
             'reid_similarity_threshold': 0.6,  # TUNED: Increased for deep ReID (more discriminative)
             'use_bytetrack': True,       # NEW: Enable ByteTrack
             'use_reid': True,            # NEW: Enable ReID features
@@ -1041,18 +1041,15 @@ class PeopleCounterProcessor(BaseStreamProcessor):
         # to avoid wasting time on get() timeout while allowing recovery
         if self._centralized_inference_failures >= 5:
             now = time.time()
+            # Always drain during backoff to prevent result queue buildup
+            # from orphaned responses the server is still sending
+            try:
+                while True:
+                    self.inference_result_queue.get_nowait()
+            except queue_module.Empty:
+                pass
             if now - self._last_inference_retry_time < 10.0:
                 return detections  # Still in backoff window
-            # Drain stale results so retry reads a fresh response
-            drained = 0
-            while True:
-                try:
-                    self.inference_result_queue.get_nowait()
-                    drained += 1
-                except queue_module.Empty:
-                    break
-            if drained > 0:
-                self.logger.info(f"Drained {drained} stale inference results before retry")
             self._last_inference_retry_time = now
             self.logger.info("Inference backoff: attempting periodic retry")
 
@@ -1314,18 +1311,14 @@ class PeopleCounterProcessor(BaseStreamProcessor):
         # Share failure counter with detection — both use the same inference server
         if self._centralized_inference_failures >= 5:
             now = time.time()
+            # Always drain during backoff to prevent result queue buildup
+            try:
+                while True:
+                    self.inference_result_queue.get_nowait()
+            except queue_module.Empty:
+                pass
             if now - self._last_inference_retry_time < 10.0:
                 return [None] * len(boxes)
-            # Drain stale results so retry reads a fresh response
-            drained = 0
-            while True:
-                try:
-                    self.inference_result_queue.get_nowait()
-                    drained += 1
-                except queue_module.Empty:
-                    break
-            if drained > 0:
-                self.logger.info(f"Drained {drained} stale inference results before ReID retry")
             self._last_inference_retry_time = now
 
         try:

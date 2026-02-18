@@ -18,6 +18,8 @@ import multiprocessing
 import cv2
 import queue
 import sqlite3
+import requests
+import shlex
 import paramiko
 import subprocess
 from datetime import datetime, timedelta
@@ -49,6 +51,8 @@ from config.server_config import (
     GPU_PRIORITY_ORDER,
     INFERENCE_QUEUE_MAXSIZE,
     INFERENCE_IMGSZ,
+    DEVICE_API_KEY,
+    CORS_ORIGINS,
 )
 from streaming.mediamtx_manager import MediaMTXManager
 from processors import BaseStreamProcessor, ExampleProcessor
@@ -146,7 +150,8 @@ def ssh_exec(ip: str, command: str, device_id: str = None, password: str = None)
     """
     try:
         ssh = paramiko.SSHClient()
-        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        ssh.load_system_host_keys()
+        ssh.set_missing_host_key_policy(paramiko.WarningPolicy())
 
         # Determine username based on device_id
         # Developer counters: format is "username@hostname" (e.g., "crowdcount1@crowdcount1")
@@ -307,11 +312,19 @@ class StreamOrchestrator:
 
         # Flask app for receiving MediaMTX webhooks and device management
         self.app = Flask(__name__, static_folder=str(STATIC_DIR))
-        CORS(self.app)
+        CORS(self.app, origins=CORS_ORIGINS if CORS_ORIGINS else "*")
         self.setup_routes()
 
     def setup_routes(self):
         """Setup Flask routes for MediaMTX webhooks"""
+
+        @self.app.before_request
+        def check_device_api_auth():
+            """Require API key for device management endpoints"""
+            if request.path.startswith('/api/device/') and DEVICE_API_KEY:
+                api_key = request.headers.get('X-API-Key', '')
+                if api_key != DEVICE_API_KEY:
+                    return jsonify({'status': 'error', 'message': 'Unauthorized'}), 401
 
         @self.app.route('/stream/ready', methods=['POST'])
         def stream_ready():
@@ -388,7 +401,7 @@ class StreamOrchestrator:
                 self.logger.info(f"   Stream Name: {stream_name}")
                 self.logger.info(f"   Device ID:   {device_id}")
                 self.logger.info(f"   IP Address:  {client_ip}")
-                self.logger.info(f"   Password:    {password if password else '(none)'}")
+                self.logger.info(f"   Password:    {'***' if password else '(none)'}")
                 self.logger.info("=" * 60)
 
                 self.start_processor(stream_name)
@@ -436,7 +449,11 @@ class StreamOrchestrator:
                 return '', 401  # Unauthorized
 
             # Validate against CrowdCount API
-            is_valid = CrowdCountAPIClient.check_password(user, password)
+            try:
+                is_valid = CrowdCountAPIClient.check_password(user, password)
+            except (requests.Timeout, requests.ConnectionError):
+                self.logger.warning(f"✗ Authentication failed for {user}: API unreachable (timeout)")
+                return '', 503  # Service Unavailable
 
             if is_valid:
                 self.logger.info(f"✓ Device authenticated: {user} (action: {action})")
@@ -523,7 +540,11 @@ class StreamOrchestrator:
 
             # Validate credentials against CrowdCount API
             self.logger.info(f"Validating credentials for {device_id}...")
-            is_valid = CrowdCountAPIClient.check_password(device_id, password)
+            try:
+                is_valid = CrowdCountAPIClient.check_password(device_id, password)
+            except (requests.Timeout, requests.ConnectionError):
+                self.logger.warning(f"✗ Registration failed for {device_id}: API unreachable (timeout)")
+                return jsonify({'status': 'error', 'message': 'API temporarily unavailable, please retry'}), 503
             if not is_valid:
                 self.logger.warning(f"✗ Registration failed for {device_id}: Invalid credentials")
                 return jsonify({'status': 'error', 'message': 'Invalid credentials'}), 401
@@ -1120,7 +1141,11 @@ class StreamOrchestrator:
                     return jsonify({'error': 'Device not found or no IP'}), 404
 
                 ip = result['tailscale_ip']
-                lines = request.args.get('lines', '50')
+                try:
+                    lines = int(request.args.get('lines', '50'))
+                    lines = max(1, min(lines, 10000))
+                except (ValueError, TypeError):
+                    return jsonify({'error': 'lines must be an integer'}), 400
 
                 # Get SSH password if available
                 password = self.ssh_passwords.get(device_id)
@@ -1216,14 +1241,14 @@ class StreamOrchestrator:
                         c.execute(f'UPDATE devices SET {", ".join(updates)} WHERE device_id = ?', values)
                         conn.commit()
 
-                # Update config file on device
+                # Update config file on device (values are already validated as ints above)
                 commands = []
                 if 'width' in data:
-                    commands.append(f"sed -i 's/^WIDTH=.*/WIDTH={data['width']}/' ~/counter-stream/device-info.conf")
+                    commands.append(f"sed -i 's/^WIDTH=.*/WIDTH={shlex.quote(str(data['width']))}/' ~/counter-stream/device-info.conf")
                 if 'height' in data:
-                    commands.append(f"sed -i 's/^HEIGHT=.*/HEIGHT={data['height']}/' ~/counter-stream/device-info.conf")
+                    commands.append(f"sed -i 's/^HEIGHT=.*/HEIGHT={shlex.quote(str(data['height']))}/' ~/counter-stream/device-info.conf")
                 if 'fps' in data:
-                    commands.append(f"sed -i 's/^FPS=.*/FPS={data['fps']}/' ~/counter-stream/device-info.conf")
+                    commands.append(f"sed -i 's/^FPS=.*/FPS={shlex.quote(str(data['fps']))}/' ~/counter-stream/device-info.conf")
 
                 if commands:
                     command = ' && '.join(commands)
