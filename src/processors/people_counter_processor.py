@@ -1057,6 +1057,15 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             self.logger.info("Inference backoff: attempting periodic retry")
 
         try:
+            # Drain any stale results before sending new request.
+            # If a previous get() timed out, the late response is sitting in the queue.
+            # Clearing it ensures we always read the response for THIS request.
+            try:
+                while True:
+                    self.inference_result_queue.get_nowait()
+            except queue_module.Empty:
+                pass
+
             # Send detection request to inference server
             request = self._InferenceRequest(
                 type=self._RequestType.DETECT,
@@ -1320,6 +1329,15 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             self._last_inference_retry_time = now
 
         try:
+            # Drain any stale results before sending REID request.
+            # Protects against rare race where a stale response arrives after
+            # DETECT's drain but before DETECT's get() consumed it.
+            try:
+                while True:
+                    self.inference_result_queue.get_nowait()
+            except queue_module.Empty:
+                pass
+
             request = self._InferenceRequest(
                 type=self._RequestType.REID,
                 camera_id=self.stream_name,
