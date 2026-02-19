@@ -86,6 +86,7 @@ class Detection:
     class_name: str
     track_id: Optional[int] = None  # ByteTrack assigned ID
     appearance_features: Optional[np.ndarray] = None  # ReID embedding
+    is_predicted: bool = False  # True for extrapolated positions (adaptive frame skipping)
 
     def __hash__(self):
         """Make Detection hashable for set operations"""
@@ -176,28 +177,33 @@ class PersonTracker:
         self.detections.append(detection)
         self.positions.append(detection.center)
         self.last_update_time = time.time()
-        self.peak_confidence = max(self.peak_confidence, detection.confidence)
-        self.detection_count += 1
 
-        # Calculate velocity
-        if len(self.positions) >= 2:
-            dx = self.positions[-1][0] - self.positions[-2][0]
-            dy = self.positions[-1][1] - self.positions[-2][1]
-            dt = detection.timestamp - self.detections[-2].timestamp if len(self.detections) >= 2 else 0.033
-            if dt > 0:
-                vx = dx / dt
-                vy = dy / dt
-                self.velocities.append((vx, vy))
+        # Only update confidence, count, and velocity from real YOLO detections
+        # Predicted detections use extrapolated positions — updating velocity from them
+        # would create a tautological feedback loop
+        if not detection.is_predicted:
+            self.peak_confidence = max(self.peak_confidence, detection.confidence)
+            self.detection_count += 1
 
-        # Update ReID appearance features
-        if detection.appearance_features is not None:
-            self.appearance_history.append(detection.appearance_features)
-            # Update running mean of appearance (re-normalize to maintain L2 norm)
-            if len(self.appearance_history) > 0:
-                self.mean_appearance = np.mean(list(self.appearance_history), axis=0)
-                norm = np.linalg.norm(self.mean_appearance)
-                if norm > 0:
-                    self.mean_appearance = self.mean_appearance / norm
+            # Calculate velocity
+            if len(self.positions) >= 2:
+                dx = self.positions[-1][0] - self.positions[-2][0]
+                dy = self.positions[-1][1] - self.positions[-2][1]
+                dt = detection.timestamp - self.detections[-2].timestamp if len(self.detections) >= 2 else 0.033
+                if dt > 0:
+                    vx = dx / dt
+                    vy = dy / dt
+                    self.velocities.append((vx, vy))
+
+            # Update ReID appearance features
+            if detection.appearance_features is not None:
+                self.appearance_history.append(detection.appearance_features)
+                # Update running mean of appearance (re-normalize to maintain L2 norm)
+                if len(self.appearance_history) > 0:
+                    self.mean_appearance = np.mean(list(self.appearance_history), axis=0)
+                    norm = np.linalg.norm(self.mean_appearance)
+                    if norm > 0:
+                        self.mean_appearance = self.mean_appearance / norm
 
     def update_appearance(self, features: np.ndarray):
         """Update appearance features separately"""
@@ -679,6 +685,10 @@ class PeopleCounterProcessor(BaseStreamProcessor):
         # CLAHE preprocessor for night mode (initialized in on_start)
         self.clahe = None
         self.clahe_engaged = False  # Hysteresis state: whether CLAHE is currently active
+
+        # Adaptive detection frame skipping
+        self._last_detection_frame = 0       # Frame number of last YOLO run
+        self._adaptive_detection = True      # Enable/disable adaptive skipping
 
         # Tracking
         self.trackers: Dict[int, PersonTracker] = {}
@@ -1600,23 +1610,38 @@ class PeopleCounterProcessor(BaseStreamProcessor):
         height, width = frame.shape[:2]
         current_time = time.time()
 
-        # PHASE 1: Fast matching using ByteTrack IDs only (no ReID yet)
+        # PHASE 0: Handle predicted detections (adaptive frame skipping)
+        # Predicted detections already have track_ids — skip ByteTrack/ReID matching
+        # and go straight to tracker update + crossing check
         matched_trackers = set()
-        unmatched_detections = []
+        has_predicted = any(d.is_predicted for d in detections)
 
-        for detection in detections:
-            # Quick check: does ByteTrack ID match an existing tracker?
-            if detection.track_id is not None and detection.track_id in self.trackers:
-                track_id = detection.track_id
-                # Update existing tracker
-                self.trackers[track_id].update(detection)
-                matched_trackers.add(track_id)
+        if has_predicted:
+            for detection in detections:
+                if detection.is_predicted and detection.track_id in self.trackers:
+                    self.trackers[detection.track_id].update(detection)
+                    matched_trackers.add(detection.track_id)
+                    self._check_and_handle_crossing(detection.track_id, detection, width, current_time, frame)
+            # Skip all remaining phases — no real detections to match
+            # Still need to clean up stale trackers (fall through to cleanup below)
+            unmatched_detections = []
+        else:
+            # PHASE 1: Fast matching using ByteTrack IDs only (no ReID yet)
+            unmatched_detections = []
 
-                # Check for crossing with trajectory validation
-                self._check_and_handle_crossing(track_id, detection, width, current_time, frame)
-            else:
-                # No ByteTrack match - will need ReID
-                unmatched_detections.append(detection)
+            for detection in detections:
+                # Quick check: does ByteTrack ID match an existing tracker?
+                if detection.track_id is not None and detection.track_id in self.trackers:
+                    track_id = detection.track_id
+                    # Update existing tracker
+                    self.trackers[track_id].update(detection)
+                    matched_trackers.add(track_id)
+
+                    # Check for crossing with trajectory validation
+                    self._check_and_handle_crossing(track_id, detection, width, current_time, frame)
+                else:
+                    # No ByteTrack match - will need ReID
+                    unmatched_detections.append(detection)
 
         # PHASE 2: Extract ReID features ONLY for unmatched detections (performance optimization)
         reid_available = (
@@ -2036,6 +2061,9 @@ class PeopleCounterProcessor(BaseStreamProcessor):
         mode_text = "ByteTrack" if self.doorway_config['use_bytetrack'] else "Basic"
         if self.doorway_config['use_reid']:
             mode_text += "+ReID"
+        if self._adaptive_detection:
+            interval = self._get_detection_interval()
+            mode_text += f" [{15 // interval}fps]"
 
         cv2.putText(vis_frame, f"PEOPLE COUNTER [{mode_text}]",
                    (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
@@ -2052,14 +2080,82 @@ class PeopleCounterProcessor(BaseStreamProcessor):
 
         return vis_frame
 
+    def _get_detection_interval(self) -> int:
+        """Get adaptive YOLO detection interval based on scene state.
+
+        Returns how many frames to skip between YOLO runs:
+        - 2 (7.5fps) when someone is in the danger zone (active crossing)
+        - 3 (5fps) when people are visible but not crossing
+        - 5 (3fps) when scene is empty
+        """
+        if not self._adaptive_detection:
+            return 1  # Run every frame when disabled
+
+        # Check if any tracker is in the danger zone
+        for tracker in self.trackers.values():
+            if tracker.in_danger_zone:
+                return 2
+
+        # People visible but not in danger zone
+        if self.trackers:
+            return 3
+
+        # Empty scene
+        return 5
+
+    def _create_predicted_detections(self) -> List[Detection]:
+        """Create predicted detections by extrapolating tracker positions.
+
+        Used on non-detection frames to maintain tracker state and crossing checks
+        without running YOLO inference. Predicted detections are flagged with
+        is_predicted=True so velocity calculations only use real YOLO data.
+        """
+        predicted = []
+        current_time = time.time()
+
+        for track_id, tracker in self.trackers.items():
+            if not tracker.positions:
+                continue
+
+            # Use the existing get_predicted_position method
+            pred_x, pred_y = tracker.get_predicted_position(current_time)
+
+            # Use last known bbox dimensions
+            last_det = tracker.detections[-1] if tracker.detections else None
+            if last_det is None:
+                continue
+
+            _, _, w, h = last_det.bbox
+            bbox = (pred_x - w // 2, pred_y - h // 2, w, h)
+
+            predicted.append(Detection(
+                center=(pred_x, pred_y),
+                bbox=bbox,
+                confidence=last_det.confidence,
+                timestamp=current_time,
+                class_id=0,
+                class_name='person',
+                track_id=track_id,
+                is_predicted=True,
+            ))
+
+        return predicted
+
     def process_frame(self, frame: np.ndarray, frame_number: int, timestamp: float) -> Optional[np.ndarray]:
         """Process a single frame - main processing logic"""
         # Note: Buffer draining disabled - OpenCV read() blocks on live RTSP streams
         # The base processor already sets CAP_PROP_BUFFERSIZE=1 for low latency
         # frame = self._drain_frame_buffer(frame)
 
-        # Extract detections using YOLO
-        detections = self.extract_detections(frame)
+        # Adaptive frame skipping: only run YOLO on detection frames
+        interval = self._get_detection_interval()
+        run_detection = (frame_number - self._last_detection_frame) >= interval
+
+        if run_detection:
+            detections = self.extract_detections(frame)
+            self._last_detection_frame = frame_number
+        else:
+            detections = self._create_predicted_detections()
 
         # Update trackers and check for crossings
         self.update_trackers(frame, detections)
