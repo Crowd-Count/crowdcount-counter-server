@@ -17,7 +17,6 @@ from dataclasses import dataclass, field
 from typing import Optional, List, Tuple, Dict
 from enum import Enum
 from pathlib import Path
-from uuid import uuid4
 import numpy as np
 
 # Get project root directory (crowdcount-counter-server/)
@@ -56,8 +55,6 @@ class InferenceRequest:
     slot_name: Optional[str] = None
     # Timestamp for staleness checking
     created_at: float = field(default_factory=time.time)
-    # Unique ID for request-response correlation
-    request_id: str = field(default_factory=lambda: uuid4().hex[:12])
 
 
 @dataclass
@@ -81,8 +78,6 @@ class InferenceResponse:
     features: Optional[List[Optional[np.ndarray]]] = None
     # Error info
     error: Optional[str] = None
-    # Correlation ID from the originating request
-    request_id: Optional[str] = None
 
 
 class InferenceServer:
@@ -243,15 +238,27 @@ class InferenceServer:
                     response = InferenceResponse(
                         type=request.type,
                         camera_id=request.camera_id,
-                        error=f"Unknown request type: {request.type}",
-                        request_id=request.request_id,
+                        error=f"Unknown request type: {request.type}"
                     )
 
                 # Send response back to camera worker
                 try:
                     result_queue.put_nowait(response)
-                except Exception as e:
-                    self.logger.error(f"Failed to deliver result for camera {request.camera_id}: {e}")
+                except Exception:
+                    # Queue full — drain all stale items then put fresh response
+                    drained = 0
+                    try:
+                        while True:
+                            result_queue.get_nowait()
+                            drained += 1
+                    except Exception:
+                        pass
+                    try:
+                        result_queue.put_nowait(response)
+                    except Exception:
+                        self.logger.warning(f"Result queue full for camera {request.camera_id}")
+                    if drained > 0:
+                        self.logger.debug(f"Drained {drained} stale results for camera {request.camera_id}")
 
                 self.requests_processed += 1
 
@@ -326,7 +333,6 @@ class InferenceServer:
                 type=RequestType.DETECT,
                 camera_id=request.camera_id,
                 detections=detections,
-                request_id=request.request_id,
             )
 
         except Exception as e:
@@ -336,7 +342,6 @@ class InferenceServer:
                 camera_id=request.camera_id,
                 detections=[],
                 error=str(e),
-                request_id=request.request_id,
             )
 
     def _handle_reid(self, request: InferenceRequest) -> InferenceResponse:
@@ -348,7 +353,6 @@ class InferenceServer:
                     camera_id=request.camera_id,
                     features=[None] * len(request.boxes) if request.boxes else [],
                     error="ReID extractor not available",
-                    request_id=request.request_id,
                 )
 
             features = self.reid_extractor.extract_batch(request.frame, request.boxes or [])
@@ -357,7 +361,6 @@ class InferenceServer:
                 type=RequestType.REID,
                 camera_id=request.camera_id,
                 features=features,
-                request_id=request.request_id,
             )
 
         except Exception as e:
@@ -367,6 +370,5 @@ class InferenceServer:
                 camera_id=request.camera_id,
                 features=[None] * len(request.boxes) if request.boxes else [],
                 error=str(e),
-                request_id=request.request_id,
             )
 

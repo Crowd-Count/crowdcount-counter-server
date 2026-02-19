@@ -1033,24 +1033,6 @@ class PeopleCounterProcessor(BaseStreamProcessor):
         else:
             return self._extract_detections_legacy(frame)
 
-    def _wait_for_response(self, request_id: str, timeout: float = 5.0):
-        """Pull from result queue until matching request_id found or timeout expires.
-
-        Uses deadline pattern so total wait never exceeds timeout even with
-        multiple discards.  Uses getattr for rolling-deploy safety (old server
-        responses may lack request_id).
-        """
-        deadline = time.time() + timeout
-        while True:
-            remaining = deadline - time.time()
-            if remaining <= 0:
-                raise queue_module.Empty("Timed out waiting for matching response")
-            response = self.inference_result_queue.get(timeout=remaining)
-            resp_id = getattr(response, 'request_id', None)
-            if resp_id is None or resp_id == request_id:
-                return response
-            # Mismatched (orphaned) response — discard and keep waiting
-
     def _extract_detections_centralized(self, frame) -> List[Detection]:
         """Extract detections via centralized inference server + local ByteTrack."""
         detections = []
@@ -1096,8 +1078,8 @@ class PeopleCounterProcessor(BaseStreamProcessor):
                 self._centralized_inference_failures += 1
                 return detections
 
-            # Wait for response matching this request
-            response = self._wait_for_response(request.request_id, timeout=5.0)
+            # Wait for response from inference server
+            response = self.inference_result_queue.get(timeout=5.0)
 
             # Success - reset failure counter
             self._centralized_inference_failures = 0
@@ -1362,7 +1344,7 @@ class PeopleCounterProcessor(BaseStreamProcessor):
                 self._centralized_inference_failures += 1
                 return [None] * len(boxes)
 
-            response = self._wait_for_response(request.request_id, timeout=5.0)
+            response = self.inference_result_queue.get(timeout=5.0)
 
             # Success - reset failure counter
             self._centralized_inference_failures = 0

@@ -1438,7 +1438,7 @@ class StreamOrchestrator:
             slot_assignments = {}
             for slot_idx in range(slots_for_gpu):
                 slot_name = f"slot_{slot_idx}"
-                result_queues[slot_name] = multiprocessing.Queue(maxsize=0)
+                result_queues[slot_name] = multiprocessing.Queue(maxsize=50)
                 slot_assignments[slot_name] = None  # Not assigned yet
             self._result_queue_pools[gpu_id] = result_queues
             self._slot_assignments[gpu_id] = slot_assignments
