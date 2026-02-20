@@ -129,6 +129,8 @@ class PersonTracker:
         self.velocities = deque(maxlen=15)
         self.creation_time = time.time()
         self.last_update_time = time.time()
+        self.last_real_position = None      # Center from last YOLO detection (not predicted)
+        self.last_real_time = None          # Timestamp from last YOLO detection
 
         # Multiple crossing state tracking
         self.total_crossings = 0
@@ -185,15 +187,20 @@ class PersonTracker:
             self.peak_confidence = max(self.peak_confidence, detection.confidence)
             self.detection_count += 1
 
-            # Calculate velocity
-            if len(self.positions) >= 2:
-                dx = self.positions[-1][0] - self.positions[-2][0]
-                dy = self.positions[-1][1] - self.positions[-2][1]
-                dt = detection.timestamp - self.detections[-2].timestamp if len(self.detections) >= 2 else 0.033
+            # Calculate velocity using real-to-real position delta
+            # (avoids using drifted predicted positions as the delta base)
+            if self.last_real_position is not None:
+                dx = detection.center[0] - self.last_real_position[0]
+                dy = detection.center[1] - self.last_real_position[1]
+                dt = detection.timestamp - self.last_real_time if self.last_real_time else 0.033
                 if dt > 0:
                     vx = dx / dt
                     vy = dy / dt
                     self.velocities.append((vx, vy))
+
+            # Update anchor position for predictions
+            self.last_real_position = detection.center
+            self.last_real_time = detection.timestamp
 
             # Update ReID appearance features
             if detection.appearance_features is not None:
@@ -571,24 +578,20 @@ class PersonTracker:
         Returns:
             Predicted (x, y) position tuple
         """
-        if not self.positions:
-            return (0, 0)
-
-        last_pos = self.positions[-1]
+        # Anchor predictions to last real YOLO detection to prevent compounding drift
+        if self.last_real_position is None:
+            return self.positions[-1] if self.positions else (0, 0)
 
         if current_time is None:
             current_time = time.time()
 
-        time_delta = current_time - self.last_update_time
+        time_delta = min(current_time - self.last_real_time, 1.0)
 
-        # Don't extrapolate too far into the future (max 1 second)
-        time_delta = min(time_delta, 1.0)
-
-        # Get velocity and predict new position
+        # Get velocity and predict new position from the real anchor
         vx, vy = self.get_smooth_velocity()
 
-        predicted_x = last_pos[0] + vx * time_delta
-        predicted_y = last_pos[1] + vy * time_delta
+        predicted_x = self.last_real_position[0] + vx * time_delta
+        predicted_y = self.last_real_position[1] + vy * time_delta
 
         return (int(predicted_x), int(predicted_y))
 
@@ -713,12 +716,6 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             timeout=5
         )
 
-        # Attach persistent backlog for failed API counts
-        from api.count_backlog import CountBacklog
-        from config.server_config import BACKLOG_DB_PATH
-        backlog = CountBacklog(str(BACKLOG_DB_PATH))
-        self.api_client.set_backlog(backlog)
-
         # Fetch direction flip setting and set up periodic refresh
         self.direction_flipped = self.api_client.get_direction_flipped()
         self.direction_refresh_timer = None
@@ -726,6 +723,13 @@ class PeopleCounterProcessor(BaseStreamProcessor):
 
     def on_start(self):
         """Initialize models or connect to centralized inference server when processor starts"""
+        # Attach persistent backlog for failed API counts (must be here, not __init__,
+        # because threading.Lock and sqlite3.Connection are not picklable across processes)
+        from api.count_backlog import CountBacklog
+        from config.server_config import BACKLOG_DB_PATH
+        backlog = CountBacklog(str(BACKLOG_DB_PATH))
+        self.api_client.set_backlog(backlog)
+
         # Start periodic refresh of direction_flipped setting (every 60 seconds)
         self._schedule_direction_refresh()
 
@@ -1574,7 +1578,12 @@ class PeopleCounterProcessor(BaseStreamProcessor):
 
         for track_id, tracker in self.trackers.items():
             # Only consider trackers that haven't been updated recently (lost tracks)
-            if tracker.time_since_update() < 0.5:
+            # Use last_real_time so ghost trackers fed by predictions don't appear active
+            if tracker.last_real_time is not None:
+                real_staleness = time.time() - tracker.last_real_time
+            else:
+                real_staleness = tracker.time_since_update()
+            if real_staleness < 0.5:
                 continue  # Still being tracked, skip
 
             if tracker.mean_appearance is None:
@@ -1902,7 +1911,14 @@ class PeopleCounterProcessor(BaseStreamProcessor):
         # Remove stale trackers
         trackers_to_remove = []
         for track_id, tracker in self.trackers.items():
-            if tracker.time_since_update() > self.doorway_config['tracker_timeout']:
+            # Use last_real_time (last actual YOLO detection) instead of
+            # time_since_update() which includes predicted updates — predictions
+            # were resetting the timer, keeping ghost trackers alive forever.
+            if tracker.last_real_time is not None:
+                real_staleness = current_time - tracker.last_real_time
+            else:
+                real_staleness = tracker.time_since_update()
+            if real_staleness > self.doorway_config['tracker_timeout']:
                 trackers_to_remove.append(track_id)
 
                 # Save checkpoint from expiring tracker for cross-track recovery
@@ -2115,6 +2131,11 @@ class PeopleCounterProcessor(BaseStreamProcessor):
 
         for track_id, tracker in self.trackers.items():
             if not tracker.positions:
+                continue
+
+            # Don't predict for trackers with no real YOLO detection in >1.0s —
+            # they're ghosts that would otherwise generate noise until cleanup.
+            if tracker.last_real_time is not None and (current_time - tracker.last_real_time) > 1.0:
                 continue
 
             # Use the existing get_predicted_position method
