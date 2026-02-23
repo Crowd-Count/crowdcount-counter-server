@@ -651,10 +651,10 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             'min_path_length': 50,      # Minimum pixels traveled
             'max_tracking_distance': 0.156,  # Proportion of frame width (~100px at 640w)
             'tracker_timeout': 1.5,     # TUNED: Reduced from 3.0 to let false tracks expire faster
-            'yolo_conf_threshold': 0.53,  # V5 F1-optimal confidence threshold
+            'yolo_conf_threshold': 0.45,  # Lowered to match prod for better recall
             'yolo_iou_threshold': 0.3,   # TUNED: Lowered from 0.45 to separate overlapping people
             'min_crossing_interval': 0.5,  # TUNED: Increased from 0.3 to prevent double counts
-            'min_peak_confidence': 0.60,  # Above YOLO conf — final quality gate before counting a crossing
+            'min_peak_confidence': 0.53,  # Lowered to match prod — final quality gate before counting a crossing
             'reid_similarity_threshold': 0.6,  # TUNED: Increased for deep ReID (more discriminative)
             'use_bytetrack': True,       # NEW: Enable ByteTrack
             'use_reid': True,            # NEW: Enable ReID features
@@ -754,6 +754,7 @@ class PeopleCounterProcessor(BaseStreamProcessor):
         # Consecutive inference failure counter for fast backoff
         self._centralized_inference_failures = 0
         self._last_inference_retry_time = 0.0
+        self._last_queue_full_log = 0  # Rate-limit "queue full" warnings
 
         print(f"[{self.stream_name}] Centralized inference mode (CPU-only worker)", flush=True)
         self.logger.info("Using centralized inference server (no local GPU)")
@@ -1088,7 +1089,10 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             try:
                 self.inference_request_queue.put(request, timeout=2.0)
             except queue_module.Full:
-                self.logger.warning("Inference request queue full - skipping detection")
+                now = time.time()
+                if now - self._last_queue_full_log > 30:
+                    self.logger.warning("Inference request queue full - skipping detection (suppressing for 30s)")
+                    self._last_queue_full_log = now
                 self._centralized_inference_failures += 1
                 return detections
 
@@ -1349,7 +1353,10 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             try:
                 self.inference_request_queue.put(request, timeout=2.0)
             except queue_module.Full:
-                self.logger.warning("Inference request queue full - skipping ReID")
+                now = time.time()
+                if now - self._last_queue_full_log > 30:
+                    self.logger.warning("Inference request queue full - skipping ReID (suppressing for 30s)")
+                    self._last_queue_full_log = now
                 self._centralized_inference_failures += 1
                 return [None] * len(boxes)
 
@@ -1372,12 +1379,10 @@ class PeopleCounterProcessor(BaseStreamProcessor):
         """Check for crossing and handle API calls if crossing detected."""
         tracker = self.trackers[track_id]
 
-        # Skip crossing check if track hasn't met minimum confidence threshold
-        # This filters out shadows, reflections, and other low-confidence artifacts
-        min_conf = self.doorway_config.get('min_peak_confidence', 0.40)
-        if tracker.peak_confidence < min_conf:
-            return  # Track hasn't proven to be a real person yet
-
+        # Always run zone tracking and checkpoint creation regardless of confidence.
+        # A person detected at low confidence (e.g. 0.48 during occlusion) still deserves
+        # a checkpoint — when they reappear at higher confidence, checkpoint recovery can
+        # count the crossing. The checkpoint recovery path has its own ReID similarity gate.
         crossing_dir = tracker.check_crossing(
             frame_width,
             self.doorway_config['doorway_center'],
@@ -1389,11 +1394,19 @@ class PeopleCounterProcessor(BaseStreamProcessor):
         # METHOD 5: Create checkpoint when tracker enters danger zone
         if tracker.needs_checkpoint and frame is not None:
             tracker.needs_checkpoint = False
-            if self.doorway_config['use_reid'] and self.reid_extractor:
+            if self.doorway_config['use_reid'] and (self.reid_extractor is not None or self.use_centralized_inference):
                 x, y, w, h = detection.bbox
                 embedding = self._extract_appearance_features(frame, x, y, x + w, y + h)
                 if embedding is not None:
                     tracker.create_checkpoint(embedding, detection.center, detection.confidence)
+                    if tracker.mean_appearance is None:
+                        tracker.update_appearance(embedding)
+
+        # Gate actual crossing counting on minimum confidence —
+        # filters out shadows, reflections, and other low-confidence artifacts
+        min_conf = self.doorway_config.get('min_peak_confidence', 0.40)
+        if tracker.peak_confidence < min_conf:
+            return  # Track hasn't proven to be a real person yet
 
         if crossing_dir and crossing_dir != CrossingDirection.NONE:
             # A validated crossing occurred!
@@ -1433,6 +1446,32 @@ class PeopleCounterProcessor(BaseStreamProcessor):
                            f"Track #{track_id} (detections: {self.trackers[track_id].detection_count}) | "
                            f"L->R: {self.crossings[CrossingDirection.LEFT_TO_RIGHT]} | "
                            f"R->L: {self.crossings[CrossingDirection.RIGHT_TO_LEFT]}")
+
+    @staticmethod
+    def _calculate_bbox_iou(bbox1, bbox2) -> float:
+        """Calculate IoU between two bboxes in (x, y, w, h) format."""
+        x1, y1, w1, h1 = bbox1
+        x2, y2, w2, h2 = bbox2
+
+        # Convert to (x1, y1, x2, y2)
+        ax1, ay1, ax2, ay2 = x1, y1, x1 + w1, y1 + h1
+        bx1, by1, bx2, by2 = x2, y2, x2 + w2, y2 + h2
+
+        # Intersection
+        ix1 = max(ax1, bx1)
+        iy1 = max(ay1, by1)
+        ix2 = min(ax2, bx2)
+        iy2 = min(ay2, by2)
+
+        if ix2 <= ix1 or iy2 <= iy1:
+            return 0.0
+
+        intersection = (ix2 - ix1) * (iy2 - iy1)
+        area1 = w1 * h1
+        area2 = w2 * h2
+        union = area1 + area2 - intersection
+
+        return intersection / union if union > 0 else 0.0
 
     def _match_by_position_and_reid(self, detection: Detection, frame_width: int = 640) -> Optional[int]:
         """
@@ -1652,11 +1691,35 @@ class PeopleCounterProcessor(BaseStreamProcessor):
                     # No ByteTrack match - will need ReID
                     unmatched_detections.append(detection)
 
-        # PHASE 2: Extract ReID features ONLY for unmatched detections (performance optimization)
+        # PHASE 1.5: Extract ReID for matched trackers near danger zone
+        # Phase 1 matched trackers never get appearance features, which breaks
+        # checkpoint save and ReID recovery. Extract for danger zone trackers.
         reid_available = (
             self.doorway_config['use_reid'] and
             (self.reid_extractor is not None or self.use_centralized_inference)
         )
+        if matched_trackers and reid_available:
+            phase1_reid_trackers = []
+            phase1_reid_boxes = []
+            for track_id in matched_trackers:
+                tracker = self.trackers[track_id]
+                if (tracker.in_danger_zone or tracker.checkpoint is not None) and \
+                   len(tracker.appearance_history) < 3:
+                    det = tracker.detections[-1]
+                    if not det.is_predicted:
+                        x, y, w, h = det.bbox
+                        phase1_reid_trackers.append(track_id)
+                        phase1_reid_boxes.append((x, y, x + w, y + h))
+            if phase1_reid_boxes:
+                if self.use_centralized_inference:
+                    phase1_features = self._extract_appearance_batch_centralized(frame, phase1_reid_boxes)
+                else:
+                    phase1_features = self.reid_extractor.extract_batch(frame, phase1_reid_boxes)
+                for i, track_id in enumerate(phase1_reid_trackers):
+                    if phase1_features[i] is not None:
+                        self.trackers[track_id].update_appearance(phase1_features[i])
+
+        # PHASE 2: Extract ReID features ONLY for unmatched detections (performance optimization)
         if unmatched_detections and reid_available:
             # Collect bounding boxes for batch extraction
             reid_boxes = []
@@ -1780,6 +1843,60 @@ class PeopleCounterProcessor(BaseStreamProcessor):
                                 f"Checkpoint transferred: track #{new_id} from #{best_cp_id} "
                                 f"(similarity={best_cp_sim:.2f}, entry_side={checkpoint.entry_side})")
 
+        # Preemptive checkpoint creation for overlapping trackers.
+        # In group crossings, by the time someone enters the danger zone they may
+        # already be occluded. Create checkpoints early when bboxes overlap so
+        # checkpoint recovery can kick in if the track is lost.
+        if frame is not None and self.doorway_config['use_reid'] and (self.reid_extractor is not None or self.use_centralized_inference):
+            tracker_items = [(tid, t) for tid, t in self.trackers.items()
+                             if t.detections and t.checkpoint is None]
+            for i in range(len(tracker_items)):
+                tid_a, tr_a = tracker_items[i]
+                bbox_a = tr_a.detections[-1].bbox
+                for j in range(i + 1, len(tracker_items)):
+                    tid_b, tr_b = tracker_items[j]
+                    bbox_b = tr_b.detections[-1].bbox
+                    iou = self._calculate_bbox_iou(bbox_a, bbox_b)
+                    if iou > 0.15:
+                        # Create preemptive checkpoints for both overlapping trackers
+                        for tid, tr in [(tid_a, tr_a), (tid_b, tr_b)]:
+                            if tr.checkpoint is not None:
+                                continue  # Other tracker in the pair may have just gotten one
+                            det = tr.detections[-1]
+                            x, y, w, h = det.bbox
+                            embedding = self._extract_appearance_features(frame, x, y, x + w, y + h)
+                            if embedding is not None:
+                                # Use current_zone for entry_side since we may not have
+                                # entered the danger zone yet (no previous_zone transition)
+                                zone = tr.current_zone
+                                if zone in (DangerZone.LEFT_ZONE, DangerZone.RIGHT_ZONE):
+                                    entry_side = 'left' if zone == DangerZone.LEFT_ZONE else 'right'
+                                elif zone == DangerZone.DANGER_ZONE:
+                                    # Already in danger zone — use velocity to infer entry side
+                                    vx, _ = tr.get_smooth_velocity()
+                                    entry_side = 'left' if vx > 0 else 'right'
+                                else:
+                                    # Zone unknown — use position relative to center
+                                    entry_side = 'left' if det.center[0] < width / 2 else 'right'
+                                vx, _ = tr.get_smooth_velocity()
+                                expected_exit = 'right' if vx > 0 else 'left' if vx < 0 else (
+                                    'right' if entry_side == 'left' else 'left')
+                                tr.checkpoint = ReIDCheckpoint(
+                                    embedding=embedding,
+                                    entry_side=entry_side,
+                                    entry_time=time.time(),
+                                    entry_position=det.center,
+                                    expected_exit_side=expected_exit,
+                                    confidence=det.confidence,
+                                    velocity_x=vx
+                                )
+                                tr.search_active = True
+                                if tr.mean_appearance is None:
+                                    tr.update_appearance(embedding)
+                                self.logger.debug(
+                                    f"Preemptive checkpoint: track #{tid} overlaps #{tid_a if tid == tid_b else tid_b} "
+                                    f"(IoU={iou:.2f}, entry_side={entry_side})")
+
         # Check for crossings on unmatched trackers using interpolation
         # This catches crossings that may have occurred during dropped frames
         interp_crossing_this_frame = False
@@ -1797,9 +1914,10 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             # Only interpolate if there's a significant time gap (dropped frames)
             # but not too stale (likely lost track)
             # Also require minimum peak confidence to avoid counting shadows/reflections
-            # Require 5+ positions to filter out short-lived fragmented tracks
+            # Require 3+ positions (lowered from 5 — with frame skipping, short-lived
+            # occluded tracks may only accumulate 2-3 positions before being lost)
             min_conf = self.doorway_config.get('min_peak_confidence', 0.40)
-            if 0.1 < time_gap < 1.0 and len(tracker.positions) >= 5 and tracker.peak_confidence >= min_conf:
+            if 0.1 < time_gap < 1.0 and len(tracker.positions) >= 3 and tracker.peak_confidence >= min_conf:
                 # Get interpolated positions through the gap
                 interpolated = tracker.interpolate_positions(current_time, num_steps=5)
 
@@ -1918,21 +2036,27 @@ class PeopleCounterProcessor(BaseStreamProcessor):
                 real_staleness = current_time - tracker.last_real_time
             else:
                 real_staleness = tracker.time_since_update()
-            if real_staleness > self.doorway_config['tracker_timeout']:
+            # Checkpointed trackers were heading toward a crossing when lost —
+            # extend their timeout to 3.0s to survive longer occlusions in groups.
+            # The checkpoint itself has its own 5.0s timeout.
+            timeout = 3.0 if tracker.checkpoint is not None else self.doorway_config['tracker_timeout']
+            if real_staleness > timeout:
                 trackers_to_remove.append(track_id)
 
                 # Save checkpoint from expiring tracker for cross-track recovery
                 # Don't save recovered checkpoints back — prevents recycling loop
                 # where fragmented tracks endlessly pass the same checkpoint around
-                if (tracker.checkpoint and tracker.mean_appearance is not None
-                        and not getattr(tracker, 'checkpoint_is_recovered', False)):
+                if (tracker.checkpoint and not getattr(tracker, 'checkpoint_is_recovered', False)):
+                    save_embedding = (tracker.mean_appearance.copy() if tracker.mean_appearance is not None
+                                      else tracker.checkpoint.embedding.copy())
+                    embedding_source = 'mean_appearance' if tracker.mean_appearance is not None else 'checkpoint'
                     self.active_checkpoints[track_id] = {
                         'checkpoint': tracker.checkpoint,
-                        'embedding': tracker.mean_appearance.copy(),
+                        'embedding': save_embedding,
                         'saved_time': current_time,
                     }
                     self.logger.debug(f"Saved checkpoint from expiring track #{track_id} "
-                                    f"(entry_side={tracker.checkpoint.entry_side})")
+                                    f"(entry_side={tracker.checkpoint.entry_side}, embedding={embedding_source})")
 
                 # Return ID to pool for reuse (only for non-ByteTrack IDs)
                 if track_id not in self.track_id_pool and track_id < 1000:
