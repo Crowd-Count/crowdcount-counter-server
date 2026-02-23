@@ -734,6 +734,7 @@ class PeopleCounterProcessor(BaseStreamProcessor):
         # Consecutive inference failure counter for fast backoff
         self._centralized_inference_failures = 0
         self._last_inference_retry_time = 0.0
+        self._last_queue_full_log = 0  # Rate-limit "queue full" warnings
 
         print(f"[{self.stream_name}] Centralized inference mode (CPU-only worker)", flush=True)
         self.logger.info("Using centralized inference server (no local GPU)")
@@ -1033,6 +1034,23 @@ class PeopleCounterProcessor(BaseStreamProcessor):
         else:
             return self._extract_detections_legacy(frame)
 
+    def _wait_for_response(self, request_id, timeout=5.0):
+        """Wait for a response matching a specific request_id, discarding mismatched ones.
+
+        Eliminates the drain-before-request race condition by using correlation IDs.
+        Stale or mismatched responses are silently discarded.
+        """
+        deadline = time.time() + timeout
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                raise queue_module.Empty()
+            response = self.inference_result_queue.get(timeout=remaining)
+            resp_id = getattr(response, 'request_id', None)
+            if resp_id is None or resp_id == request_id:
+                return response
+            # Stale/mismatched — discard and keep waiting
+
     def _extract_detections_centralized(self, frame) -> List[Detection]:
         """Extract detections via centralized inference server + local ByteTrack."""
         detections = []
@@ -1054,15 +1072,6 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             self.logger.info("Inference backoff: attempting periodic retry")
 
         try:
-            # Drain any stale results before sending new request.
-            # If a previous get() timed out, the late response is sitting in the queue.
-            # Clearing it ensures we always read the response for THIS request.
-            try:
-                while True:
-                    self.inference_result_queue.get_nowait()
-            except queue_module.Empty:
-                pass
-
             # Send detection request to inference server
             request = self._InferenceRequest(
                 type=self._RequestType.DETECT,
@@ -1074,15 +1083,19 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             try:
                 self.inference_request_queue.put(request, timeout=2.0)
             except queue_module.Full:
-                self.logger.warning("Inference request queue full - skipping detection")
+                now = time.time()
+                if now - self._last_queue_full_log > 30:
+                    self.logger.warning("Inference request queue full - skipping detection (suppressing for 30s)")
+                    self._last_queue_full_log = now
                 self._centralized_inference_failures += 1
                 return detections
 
-            # Wait for response from inference server
-            response = self.inference_result_queue.get(timeout=5.0)
+            # Wait for correlated response (discards stale/mismatched responses)
+            response = self._wait_for_response(request.request_id, timeout=5.0)
 
-            # Success - reset failure counter
-            self._centralized_inference_failures = 0
+            # Only reset failure counter on genuine success (not error/stale responses)
+            if not response.error:
+                self._centralized_inference_failures = 0
 
             if response.error:
                 self.logger.warning(f"Inference server error: {response.error}")
@@ -1322,15 +1335,6 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             self._last_inference_retry_time = now
 
         try:
-            # Drain any stale results before sending REID request.
-            # Protects against rare race where a stale response arrives after
-            # DETECT's drain but before DETECT's get() consumed it.
-            try:
-                while True:
-                    self.inference_result_queue.get_nowait()
-            except queue_module.Empty:
-                pass
-
             request = self._InferenceRequest(
                 type=self._RequestType.REID,
                 camera_id=self.stream_name,
@@ -1340,14 +1344,19 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             try:
                 self.inference_request_queue.put(request, timeout=2.0)
             except queue_module.Full:
-                self.logger.warning("Inference request queue full - skipping ReID")
+                now = time.time()
+                if now - self._last_queue_full_log > 30:
+                    self.logger.warning("Inference request queue full - skipping ReID (suppressing for 30s)")
+                    self._last_queue_full_log = now
                 self._centralized_inference_failures += 1
                 return [None] * len(boxes)
 
-            response = self.inference_result_queue.get(timeout=5.0)
+            # Wait for correlated response (discards stale/mismatched responses)
+            response = self._wait_for_response(request.request_id, timeout=5.0)
 
-            # Success - reset failure counter
-            self._centralized_inference_failures = 0
+            # Only reset failure counter on genuine success (not error/stale responses)
+            if not response.error:
+                self._centralized_inference_failures = 0
 
             if response.error:
                 self.logger.warning(f"ReID server error: {response.error}")

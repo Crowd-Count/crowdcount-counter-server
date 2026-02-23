@@ -295,6 +295,7 @@ class StreamOrchestrator:
             max_workers=10,
             thread_name_prefix="StatusUpdate"
         )
+        self._stopping = False  # Guard against signal handler re-entry
 
         # Thread safety lock for shared state (RLock allows nested acquisition)
         self._state_lock = threading.RLock()
@@ -934,6 +935,9 @@ class StreamOrchestrator:
 
                     except queue.Empty:
                         continue
+                    except ValueError:
+                        # Queue was closed (processor restarted) — stop serving this feed
+                        break
                     except Exception as e:
                         self.logger.error(f"Error in video feed for {stream_name}: {e}")
                         break
@@ -1438,7 +1442,7 @@ class StreamOrchestrator:
             slot_assignments = {}
             for slot_idx in range(slots_for_gpu):
                 slot_name = f"slot_{slot_idx}"
-                result_queues[slot_name] = multiprocessing.Queue(maxsize=50)
+                result_queues[slot_name] = multiprocessing.Queue(maxsize=0)
                 slot_assignments[slot_name] = None  # Not assigned yet
             self._result_queue_pools[gpu_id] = result_queues
             self._slot_assignments[gpu_id] = slot_assignments
@@ -1719,7 +1723,7 @@ class StreamOrchestrator:
                 self.frame_queues[stream_name] = frame_queue
 
             # Update device status to online
-            self._status_update_executor.submit(api_client.update_status, 'online')
+            self._submit_status_update(api_client, 'online', stream_name)
 
             # Set up centralized inference queues if servers are running
             inference_request_queue = None
@@ -1751,7 +1755,11 @@ class StreamOrchestrator:
                             slot_name=slot_name,
                         ), timeout=5.0)
                     except queue.Full:
-                        self.logger.error(f"Inference queue full - cannot register {stream_name}. Inference server may be dead.")
+                        self.logger.error(
+                            f"Inference queue full - cannot register {stream_name}. "
+                            f"Inference server may be dead. FALLING BACK TO LEGACY MODE: "
+                            f"processor will load its own YOLO+ReID models on GPU (high memory usage)"
+                        )
                         # Release the GPU slot we just assigned
                         with self._state_lock:
                             self.camera_gpu_assignments.pop(stream_name, None)
@@ -1763,7 +1771,10 @@ class StreamOrchestrator:
                     else:
                         self.logger.info(f"Camera {stream_name} using centralized inference on GPU {gpu_id} (slot {slot_name})")
                 else:
-                    self.logger.warning(f"Failed to assign {stream_name} to GPU - will use legacy mode")
+                    self.logger.warning(
+                        f"Failed to assign {stream_name} to GPU - FALLING BACK TO LEGACY MODE: "
+                        f"processor will load its own YOLO+ReID models on GPU (high memory usage)"
+                    )
 
             # Create processor instance with device info, frame queue, and inference queues
             # Use try/except to handle processor classes that don't accept all kwargs
@@ -1858,7 +1869,7 @@ class StreamOrchestrator:
             with self._state_lock:
                 api_client = self.api_clients.pop(stream_name, None)
             if api_client:
-                self._status_update_executor.submit(api_client.update_status, 'offline')
+                self._submit_status_update(api_client, 'offline', stream_name)
 
             with self._state_lock:
                 # Clean up processor entry (use pop to avoid KeyError)
@@ -1890,6 +1901,20 @@ class StreamOrchestrator:
                 _cleanup_queue(frame_queue)
             # Keep device info for reconnection (don't delete credentials)
 
+    def _submit_status_update(self, api_client, status: str, stream_name: str = ''):
+        """Submit a status update with a done-callback that logs failures."""
+        def _on_done(future, _stream=stream_name, _status=status):
+            try:
+                future.result()
+            except Exception as e:
+                self.logger.error(f"Status update to '{_status}' FAILED for {_stream}: {e}")
+        try:
+            fut = self._status_update_executor.submit(api_client.update_status, status)
+            fut.add_done_callback(_on_done)
+        except RuntimeError:
+            # Executor already shut down
+            self.logger.warning(f"Cannot submit status update to '{status}' for {stream_name} - executor shut down")
+
     def _handle_stream_interruption(self, stream_name: str):
         """
         Handle stream interruption with reconnect grace period.
@@ -1905,6 +1930,11 @@ class StreamOrchestrator:
 
             # Preserve API client for later offline update
             api_client = self.api_clients.pop(stream_name, None)
+
+            # Guard against orphan entries: if no api_client and no processor, already cleaned up
+            if api_client is None and stream_name not in self.processors:
+                self.logger.debug(f"Stream {stream_name} interruption ignored - already cleaned up")
+                return
 
             # Add to pending reconnect — processor will die on its own
             self.pending_reconnect[stream_name] = {
@@ -1978,7 +2008,7 @@ class StreamOrchestrator:
 
         # Mark offline outside the lock
         for api_client in streams_to_mark_offline:
-            self._status_update_executor.submit(api_client.update_status, 'offline')
+            self._submit_status_update(api_client, 'offline')
 
         with self._state_lock:
             for stream_name in streams_to_remove:
@@ -2122,7 +2152,7 @@ class StreamOrchestrator:
                             )
                             # Mark device offline since we can't process its stream
                             if api_client:
-                                self._status_update_executor.submit(api_client.update_status, 'offline')
+                                self._submit_status_update(api_client, 'offline', stream_name)
 
                 # Clean up stale _starting_processors entries (stuck for > 30s)
                 with self._state_lock:
@@ -2189,6 +2219,10 @@ class StreamOrchestrator:
                                 if proc.is_alive()
                             }
                             pending_streams = set(self.pending_reconnect.keys())
+                            cooldown_streams = {
+                                name for name, info in self._restart_failures.items()
+                                if info.get('count', 0) >= 3 and time.time() - info.get('last_failure', 0) < 300
+                            }
 
                         for path_info in all_paths:
                             path_name = path_info.get('name', '')
@@ -2196,8 +2230,8 @@ class StreamOrchestrator:
                                 continue
                             if not path_info.get('ready', False):
                                 continue
-                            # Skip if we have a healthy processor or it's pending reconnect
-                            if path_name in healthy_streams or path_name in pending_streams:
+                            # Skip if we have a healthy processor, pending reconnect, or in restart cooldown
+                            if path_name in healthy_streams or path_name in pending_streams or path_name in cooldown_streams:
                                 continue
                             self.logger.warning(
                                 f"Stale session detected: path {path_name} is ready in MediaMTX "
@@ -2281,14 +2315,21 @@ class StreamOrchestrator:
 
         # Set all devices offline (using executor for consistency)
         for stream_name, api_client in list(self.api_clients.items()):
-            self._status_update_executor.submit(api_client.update_status, 'offline')
+            self._submit_status_update(api_client, 'offline', stream_name)
 
-        # Shutdown status update executor and wait for pending updates
-        self._status_update_executor.shutdown(wait=True, cancel_futures=False)
+        # Also mark pending_reconnect devices offline
+        for stream_name, info in list(self.pending_reconnect.items()):
+            api_client = info.get('api_client')
+            if api_client:
+                self._submit_status_update(api_client, 'offline', stream_name)
 
-        # Stop all processors
+        # Stop all processors BEFORE shutting down executor
+        # (stop_processor's finally block may submit to executor)
         for stream_name in list(self.processors.keys()):
             self.stop_processor(stream_name)
+
+        # NOW shutdown executor after all processors are stopped
+        self._status_update_executor.shutdown(wait=True, cancel_futures=False)
 
         # Stop inference servers
         self.stop_inference_servers()
@@ -2309,6 +2350,9 @@ class StreamOrchestrator:
 
         # Setup signal handlers
         def signal_handler(sig, frame):
+            if self._stopping:
+                return
+            self._stopping = True
             self.logger.info("\nReceived shutdown signal")
             self.stop()
             sys.exit(0)
