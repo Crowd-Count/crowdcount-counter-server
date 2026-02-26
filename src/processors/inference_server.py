@@ -13,11 +13,15 @@ Architecture:
 import time
 import logging
 import multiprocessing
+import itertools
 from dataclasses import dataclass, field
 from typing import Optional, List, Tuple, Dict
 from enum import Enum
 from pathlib import Path
 import numpy as np
+
+# Lightweight monotonic counter for request IDs (one per process, no locking needed)
+_request_id_counter = itertools.count()
 
 # Get project root directory (crowdcount-counter-server/)
 PROJECT_ROOT = Path(__file__).parent.parent.parent
@@ -55,6 +59,8 @@ class InferenceRequest:
     slot_name: Optional[str] = None
     # Timestamp for staleness checking
     created_at: float = field(default_factory=time.time)
+    # Unique ID for request/response correlation
+    request_id: str = field(default_factory=lambda: str(next(_request_id_counter)))
 
 
 @dataclass
@@ -78,6 +84,8 @@ class InferenceResponse:
     features: Optional[List[Optional[np.ndarray]]] = None
     # Error info
     error: Optional[str] = None
+    # Correlation ID echoed from request
+    request_id: Optional[str] = None
 
 
 class InferenceServer:
@@ -131,6 +139,8 @@ class InferenceServer:
         # Stats
         self.requests_processed = 0
         self.start_time = None
+        self._stale_drops = 0
+        self._last_stale_log_time = 0.0
 
         # Logger
         self.logger = logging.getLogger(f"InferenceServer-GPU{gpu_id}")
@@ -152,39 +162,48 @@ class InferenceServer:
         from ultralytics import YOLO
         from .deep_reid import create_reid_extractor
 
-        self.running = True
         self.start_time = time.time()
 
-        # Set CUDA device for this process
-        device_str = f'cuda:{self.gpu_id}'
-        torch.cuda.set_device(self.gpu_id)
-        self.logger.info(f"Initializing on {device_str} ({torch.cuda.get_device_name(self.gpu_id)})")
+        # Set CUDA device and load models — wrapped so a crash (CUDA OOM,
+        # corrupted weights) is logged immediately instead of dying silently.
+        try:
+            device_str = f'cuda:{self.gpu_id}'
+            torch.cuda.set_device(self.gpu_id)
+            self.logger.info(f"Initializing on {device_str} ({torch.cuda.get_device_name(self.gpu_id)})")
 
-        # Load YOLO model
-        self.logger.info(f"Loading YOLO model: {self.model_path}")
-        self.model = YOLO(self.model_path)
-        self.model.to(device_str)
-        model_device = next(self.model.model.parameters()).device
-        self.logger.info(f"YOLO model loaded on device: {model_device}")
+            # Load YOLO model
+            self.logger.info(f"Loading YOLO model: {self.model_path}")
+            self.model = YOLO(self.model_path)
+            self.model.to(device_str)
+            model_device = next(self.model.model.parameters()).device
+            self.logger.info(f"YOLO model loaded on device: {model_device}")
 
-        # Get class names
-        if hasattr(self.model, 'names'):
-            self.class_names = self.model.names
+            # Get class names
+            if hasattr(self.model, 'names'):
+                self.class_names = self.model.names
 
-        # Load ReID model
-        if self.reid_model_name:
-            self.logger.info(f"Loading ReID model: {self.reid_model_name}")
-            self.reid_extractor = create_reid_extractor(
-                model_name=self.reid_model_name,
-                device=device_str,
-                verbose=True
-            )
-            self.logger.info(f"ReID model loaded (feature dim: {self.reid_extractor.feature_dim})")
+            # Load ReID model
+            if self.reid_model_name:
+                self.logger.info(f"Loading ReID model: {self.reid_model_name}")
+                self.reid_extractor = create_reid_extractor(
+                    model_name=self.reid_model_name,
+                    device=device_str,
+                    verbose=True
+                )
+                self.logger.info(f"ReID model loaded (feature dim: {self.reid_extractor.feature_dim})")
+        except Exception as e:
+            self.logger.error(f"FATAL: Model loading failed — {e}")
+            import traceback
+            self.logger.error(traceback.format_exc())
+            self.running = False
+            return
 
+        self.running = True
         self.logger.info("Inference server ready, waiting for requests...")
 
         # Main processing loop
         last_stats_time = time.time()
+        last_registration_log_time = time.time()
         while self.running:
             try:
                 # Block waiting for request with timeout so we can check self.running
@@ -202,20 +221,32 @@ class InferenceServer:
                     break
 
                 if request.type == RequestType.REGISTER:
-                    # Map camera_id to its pre-allocated result queue slot
+                    # Check if this is a re-registration to the same slot
+                    existing_slot = self.camera_to_slot.get(request.camera_id)
                     self.camera_to_slot[request.camera_id] = request.slot_name
-                    self.logger.info(f"Registered camera {request.camera_id} -> slot {request.slot_name}")
+                    msg = f"InferenceServer-GPU{self.gpu_id}: REGISTERED {request.camera_id} -> {request.slot_name}"
+                    if existing_slot == request.slot_name:
+                        # Re-registration to same slot (self-healing retry) — debug only
+                        self.logger.debug(msg)
+                    else:
+                        # New registration or slot change — log prominently
+                        self.logger.info(msg)
+                        print(msg, flush=True)
                     continue
 
                 if request.type == RequestType.UNREGISTER:
                     self.camera_to_slot.pop(request.camera_id, None)
-                    self.logger.info(f"Unregistered camera {request.camera_id}")
+                    msg = f"InferenceServer-GPU{self.gpu_id}: UNREGISTERED {request.camera_id}"
+                    self.logger.info(msg)
+                    print(msg, flush=True)
                     continue
 
                 # Look up result queue for this camera via slot mapping
                 slot_name = self.camera_to_slot.get(request.camera_id)
                 if slot_name is None:
-                    self.logger.warning(f"Camera {request.camera_id} not registered, dropping request")
+                    msg = f"InferenceServer-GPU{self.gpu_id}: DROPPED request from {request.camera_id} (not registered). Registered: {list(self.camera_to_slot.keys())}"
+                    self.logger.warning(msg)
+                    print(msg, flush=True)
                     continue
                 result_queue = self.result_queues.get(slot_name)
                 if result_queue is None:
@@ -228,6 +259,22 @@ class InferenceServer:
                 if request.type in (RequestType.DETECT, RequestType.REID):
                     age = time.time() - request.created_at
                     if age > 3.0:
+                        # Send error response so the camera doesn't wait the full timeout
+                        try:
+                            result_queue.put_nowait(InferenceResponse(
+                                type=request.type,
+                                camera_id=request.camera_id,
+                                error="stale",
+                                request_id=request.request_id,
+                            ))
+                        except Exception:
+                            pass  # Queue full — camera will timeout anyway
+                        self._stale_drops += 1
+                        now = time.time()
+                        if now - self._last_stale_log_time >= 10.0:
+                            self.logger.warning(f"Dropped {self._stale_drops} stale requests in last 10s (latest age: {age:.1f}s)")
+                            self._stale_drops = 0
+                            self._last_stale_log_time = now
                         continue
 
                 if request.type == RequestType.DETECT:
@@ -238,27 +285,16 @@ class InferenceServer:
                     response = InferenceResponse(
                         type=request.type,
                         camera_id=request.camera_id,
-                        error=f"Unknown request type: {request.type}"
+                        error=f"Unknown request type: {request.type}",
+                        request_id=request.request_id,
                     )
+                response.request_id = request.request_id
 
                 # Send response back to camera worker
                 try:
                     result_queue.put_nowait(response)
-                except Exception:
-                    # Queue full — drain all stale items then put fresh response
-                    drained = 0
-                    try:
-                        while True:
-                            result_queue.get_nowait()
-                            drained += 1
-                    except Exception:
-                        pass
-                    try:
-                        result_queue.put_nowait(response)
-                    except Exception:
-                        self.logger.warning(f"Result queue full for camera {request.camera_id}")
-                    if drained > 0:
-                        self.logger.debug(f"Drained {drained} stale results for camera {request.camera_id}")
+                except Exception as e:
+                    self.logger.error(f"Failed to deliver result for camera {request.camera_id}: {e}")
 
                 self.requests_processed += 1
 
@@ -278,10 +314,27 @@ class InferenceServer:
                     )
                     last_stats_time = now
 
+                # Periodic registration summary (every 60s)
+                if now - last_registration_log_time >= 60.0:
+                    registered = list(self.camera_to_slot.keys())
+                    self.logger.info(f"Registered cameras ({len(registered)}): {registered}")
+                    last_registration_log_time = now
+
             except Exception as e:
                 self.logger.error(f"Error processing request: {e}")
                 import traceback
                 self.logger.error(traceback.format_exc())
+                # Send error response so camera worker doesn't timeout silently
+                try:
+                    if 'request' in locals() and 'result_queue' in locals() and result_queue is not None:
+                        result_queue.put_nowait(InferenceResponse(
+                            type=request.type,
+                            camera_id=request.camera_id,
+                            error=f"inference_server_error: {e}",
+                            request_id=request.request_id,
+                        ))
+                except Exception:
+                    pass  # Best-effort
 
         # Cleanup
         elapsed = time.time() - self.start_time if self.start_time else 0

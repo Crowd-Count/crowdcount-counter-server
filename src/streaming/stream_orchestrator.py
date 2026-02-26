@@ -351,7 +351,7 @@ class StreamOrchestrator:
 
                 if needs_restart:
                     self.logger.info(f"Stream {stream_name}: new publisher ready but old processor alive - restarting processor")
-                    self.stop_processor(stream_name)
+                    self.stop_processor(stream_name, reason="stream_ready_restart")
 
                 # Get client IP (Tailscale IP)
                 client_ip = request.remote_addr
@@ -555,7 +555,7 @@ class StreamOrchestrator:
             # This handles unclean disconnects where the old RTSP session lingers
             if stream_name in self.processors:
                 self.logger.info(f"Stopping stale processor for {stream_name} during re-registration")
-                self.stop_processor(stream_name)
+                self.stop_processor(stream_name, reason="register_device_cleanup")
 
             kicked = self.mediamtx.kick_path_publishers(stream_name)
             if kicked:
@@ -1587,7 +1587,7 @@ class StreamOrchestrator:
         self.logger.info(f"Restarting {len(cameras_on_gpu)} processors on GPU {gpu_id}")
         for cam_name in cameras_on_gpu:
             try:
-                self.stop_processor(cam_name)
+                self.stop_processor(cam_name, reason="inference_server_restart")
                 self.start_processor(cam_name)
             except Exception as e:
                 self.logger.error(f"Error restarting processor {cam_name} after GPU {gpu_id} recovery: {e}")
@@ -1689,11 +1689,10 @@ class StreamOrchestrator:
                 return
 
             # Mark as starting to prevent duplicate attempts
-            if not needs_stop:
-                self._starting_processors[stream_name] = time.time()
+            self._starting_processors[stream_name] = time.time()
 
         if needs_stop:
-            self.stop_processor(stream_name)
+            self.stop_processor(stream_name, reason="start_processor_replacing_dead")
 
         # Create RTSP URL
         rtsp_url = f"rtsp://{RTSP_HOST}:{RTSP_PORT}/{stream_name}"
@@ -1788,6 +1787,7 @@ class StreamOrchestrator:
                 if inference_request_queue is not None:
                     processor_kwargs['inference_request_queue'] = inference_request_queue
                     processor_kwargs['inference_result_queue'] = inference_result_queue
+                    processor_kwargs['inference_slot_name'] = slot_name
                 processor = self.processor_class(stream_name, rtsp_url, **processor_kwargs)
             except TypeError:
                 # Fallback for processor classes that don't accept all kwargs
@@ -1830,12 +1830,13 @@ class StreamOrchestrator:
             if frame_queue:
                 _cleanup_queue(frame_queue)
 
-    def stop_processor(self, stream_name: str):
+    def stop_processor(self, stream_name: str, reason: str = "unknown"):
         """
         Stop a processor for a stream
 
         Args:
             stream_name: Name of the stream
+            reason: Why the processor is being stopped (for diagnostic logging)
         """
         with self._state_lock:
             if stream_name not in self.processors:
@@ -1843,7 +1844,7 @@ class StreamOrchestrator:
                 return
             proc = self.processors[stream_name]
 
-        self.logger.info(f"Stopping processor for {stream_name}")
+        self.logger.info(f"Stopping processor for {stream_name} (reason: {reason})")
 
         try:
             # Terminate process
@@ -1865,10 +1866,10 @@ class StreamOrchestrator:
             self.logger.error(f"Error stopping processor for {stream_name}: {e}")
 
         finally:
-            # Update device status to offline
+            # Update device status to offline (skip during shutdown - stop() already handled it)
             with self._state_lock:
                 api_client = self.api_clients.pop(stream_name, None)
-            if api_client:
+            if api_client and not self._stopping:
                 self._submit_status_update(api_client, 'offline', stream_name)
 
             with self._state_lock:
@@ -1905,7 +1906,11 @@ class StreamOrchestrator:
         """Submit a status update with a done-callback that logs failures."""
         def _on_done(future, _stream=stream_name, _status=status):
             try:
-                future.result()
+                success = future.result()
+                if not success:
+                    self.logger.error(
+                        f"Status update to '{_status}' FAILED for {_stream} (API returned False)"
+                    )
             except Exception as e:
                 self.logger.error(f"Status update to '{_status}' FAILED for {_stream}: {e}")
         try:
@@ -1944,15 +1949,28 @@ class StreamOrchestrator:
 
         self.logger.info(f"Stream {stream_name} added to reconnect queue (timeout: {STREAM_RECONNECT_TIMEOUT}s) - processor will exit naturally")
 
-    def _cleanup_dead_processor(self, stream_name: str):
+    def _cleanup_dead_processor(self, stream_name: str, detected_proc=None):
         """
         Clean up a dead processor's resources without marking the device offline.
         Used by monitor_streams when a dead processor is in pending_reconnect.
         Releases GPU slot, cleans frame queue, sends UNREGISTER.
+
+        Args:
+            detected_proc: The specific process object detected as dead/stuck.
+                          If provided, cleanup is skipped only if a DIFFERENT process
+                          has replaced it (allowing stuck but alive processes to be cleaned up).
         """
         with self._state_lock:
+            # Guard: if a new processor was started since we decided to clean up, bail out
+            current_proc = self.processors.get(stream_name)
+            if current_proc is not None and (detected_proc is None or current_proc is not detected_proc) and current_proc.is_alive():
+                self.logger.info(f"Skipping dead processor cleanup for {stream_name} - new processor already running")
+                return
+            if stream_name in self._starting_processors:
+                self.logger.info(f"Skipping dead processor cleanup for {stream_name} - new processor is being started")
+                return
             # Clean up processor entry
-            self.processors.pop(stream_name, None)
+            proc = self.processors.pop(stream_name, None)
             self._processor_heartbeats.pop(stream_name, None)
             # Pop frame queue for cleanup outside lock (join_thread can block)
             frame_queue = self.frame_queues.pop(stream_name, None)
@@ -1973,6 +1991,19 @@ class StreamOrchestrator:
                     except Exception as e:
                         self.logger.warning(f"Could not send UNREGISTER for {stream_name}: {e}")
 
+        # Terminate stuck processor if still alive (outside lock to avoid blocking)
+        if proc is not None and proc.is_alive():
+            self.logger.info(f"Terminating stuck processor for {stream_name}")
+            try:
+                proc.terminate()
+                proc.join(timeout=5)
+                if proc.is_alive():
+                    self.logger.warning(f"Stuck processor for {stream_name} did not terminate, killing")
+                    proc.kill()
+                    proc.join(timeout=2)
+            except Exception as e:
+                self.logger.warning(f"Error terminating stuck processor for {stream_name}: {e}")
+
         # Clean up frame queue OUTSIDE lock (join_thread can block)
         if frame_queue:
             _cleanup_queue(frame_queue)
@@ -1982,37 +2013,29 @@ class StreamOrchestrator:
         """Check pending streams - mark offline if timeout expired, restart if reconnected."""
         current_time = time.time()
         active_streams = self.mediamtx.get_active_streams()
-        streams_to_remove = []
         streams_to_restart = []
-        streams_to_mark_offline = []
+        offline_clients = []
 
         with self._state_lock:
-            pending_copy = list(self.pending_reconnect.items())
+            for stream_name, info in list(self.pending_reconnect.items()):
+                elapsed = current_time - info['stop_time']
 
-        for stream_name, info in pending_copy:
-            elapsed = current_time - info['stop_time']
+                # Stream came back - restart processor
+                if stream_name in active_streams:
+                    self.logger.info(f"Stream {stream_name} reappeared after {elapsed:.1f}s - restarting processor")
+                    self.pending_reconnect.pop(stream_name, None)
+                    streams_to_restart.append(stream_name)
 
-            # Stream came back - restart processor
-            if stream_name in active_streams:
-                self.logger.info(f"Stream {stream_name} reappeared after {elapsed:.1f}s - restarting processor")
-                streams_to_restart.append(stream_name)
-                streams_to_remove.append(stream_name)
+                # Timeout expired - mark offline
+                elif elapsed > STREAM_RECONNECT_TIMEOUT:
+                    self.logger.warning(f"Stream {stream_name} reconnect timeout ({STREAM_RECONNECT_TIMEOUT}s) - marking offline")
+                    popped = self.pending_reconnect.pop(stream_name, None)
+                    api_client = popped.get('api_client') if popped else None
+                    if api_client:
+                        offline_clients.append((api_client, stream_name))
 
-            # Timeout expired - mark offline
-            elif elapsed > STREAM_RECONNECT_TIMEOUT:
-                self.logger.warning(f"Stream {stream_name} reconnect timeout ({STREAM_RECONNECT_TIMEOUT}s) - marking offline")
-                # Now mark offline
-                if info.get('api_client'):
-                    streams_to_mark_offline.append(info['api_client'])
-                streams_to_remove.append(stream_name)
-
-        # Mark offline outside the lock
-        for api_client in streams_to_mark_offline:
-            self._submit_status_update(api_client, 'offline')
-
-        with self._state_lock:
-            for stream_name in streams_to_remove:
-                self.pending_reconnect.pop(stream_name, None)
+        for api_client, stream_name in offline_clients:
+            self._submit_status_update(api_client, 'offline', stream_name)
 
         # Restart processors outside the lock (start_processor acquires its own lock)
         # Don't restore old API client - start_processor creates fresh one with current credentials
@@ -2039,6 +2062,20 @@ class StreamOrchestrator:
                     self.logger.info(f"Resource stats: FDs={fd_count}, threads={threading.active_count()}, processors={proc_count}")
                     if fd_count > 50000:
                         self.logger.warning(f"HIGH FD COUNT: {fd_count}")
+
+                # Periodic status re-sync: re-send 'online' for all active processors
+                # Self-heals from failed initial status updates
+                if _monitor_iteration % 20 == 0 and _monitor_iteration > 0:
+                    with self._state_lock:
+                        active_clients = [
+                            (name, client)
+                            for name, client in self.api_clients.items()
+                            if name in self.processors and self.processors[name].is_alive()
+                        ]
+                    if active_clients:
+                        self.logger.debug(f"Status re-sync: refreshing 'online' for {len(active_clients)} device(s)")
+                        for stream_name, api_client in active_clients:
+                            self._submit_status_update(api_client, 'online', stream_name)
 
                 # Check MediaMTX health
                 mediamtx_healthy = self.mediamtx.is_healthy()
@@ -2087,13 +2124,13 @@ class StreamOrchestrator:
                             self.logger.error(f"Failed to restart inference server on GPU {gpu_id}: {e}")
 
                 # Check processor health
-                dead_processors = []
+                dead_processors = []  # List of (stream_name, proc) tuples
                 with self._state_lock:
                     processors_copy = list(self.processors.items())
                 for stream_name, proc in processors_copy:
                     if not proc.is_alive():
                         self.logger.warning(f"Processor for {stream_name} died unexpectedly")
-                        dead_processors.append(stream_name)
+                        dead_processors.append((stream_name, proc))
                     elif stream_name in self._processor_heartbeats:
                         hb = self._processor_heartbeats[stream_name]
                         if hb.value > 0 and time.time() - hb.value > 60:
@@ -2101,19 +2138,23 @@ class StreamOrchestrator:
                                 f"Processor for {stream_name} stuck — no heartbeat for "
                                 f"{time.time() - hb.value:.1f}s, restarting"
                             )
-                            dead_processors.append(stream_name)
+                            dead_processors.append((stream_name, proc))
 
                 # Clean up dead processors
-                for stream_name in dead_processors:
-                    # If this stream is in pending_reconnect, use lightweight cleanup
-                    # (don't mark offline — the grace period handles that)
+                for stream_name, detected_proc in dead_processors:
+                    # Re-check: skip if a DIFFERENT processor was started since our snapshot
                     with self._state_lock:
+                        current_proc = self.processors.get(stream_name)
+                        if current_proc is not None and current_proc is not detected_proc:
+                            continue  # A different (new) processor replaced the stuck one
+                        if stream_name in self._starting_processors:
+                            continue
                         in_pending = stream_name in self.pending_reconnect
                     if in_pending:
-                        self._cleanup_dead_processor(stream_name)
+                        self._cleanup_dead_processor(stream_name, detected_proc=detected_proc)
                         continue
 
-                    self.stop_processor(stream_name)
+                    self.stop_processor(stream_name, reason="monitor_dead_processor")
 
                     # Check if stream is still active, restart processor (with limit)
                     active_streams = self.mediamtx.get_active_streams()
@@ -2224,11 +2265,17 @@ class StreamOrchestrator:
                                 if info.get('count', 0) >= 3 and time.time() - info.get('last_failure', 0) < 300
                             }
 
+                            starting_streams = set(self._starting_processors.keys())
+
                         for path_info in all_paths:
                             path_name = path_info.get('name', '')
                             if not path_name:
                                 continue
                             if not path_info.get('ready', False):
+                                continue
+                            # Skip if processor is currently being started
+                            if path_name in starting_streams:
+                                self.logger.info(f"Stale sweep: skipping {path_name} (processor starting)")
                                 continue
                             # Skip if we have a healthy processor, pending reconnect, or in restart cooldown
                             if path_name in healthy_streams or path_name in pending_streams or path_name in cooldown_streams:
@@ -2326,7 +2373,7 @@ class StreamOrchestrator:
         # Stop all processors BEFORE shutting down executor
         # (stop_processor's finally block may submit to executor)
         for stream_name in list(self.processors.keys()):
-            self.stop_processor(stream_name)
+            self.stop_processor(stream_name, reason="orchestrator_shutdown")
 
         # NOW shutdown executor after all processors are stopped
         self._status_update_executor.shutdown(wait=True, cancel_futures=False)

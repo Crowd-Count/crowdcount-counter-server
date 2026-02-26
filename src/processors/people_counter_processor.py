@@ -623,10 +623,11 @@ class PeopleCounterProcessor(BaseStreamProcessor):
 
     def __init__(self, stream_name: str, rtsp_url: str, device_info: Optional[dict] = None,
                  frame_queue=None, inference_request_queue=None, inference_result_queue=None,
-                 processor_heartbeat=None):
+                 processor_heartbeat=None, inference_slot_name=None):
         super().__init__(stream_name, rtsp_url, device_info, frame_queue,
                          inference_request_queue, inference_result_queue,
-                         processor_heartbeat=processor_heartbeat)
+                         processor_heartbeat=processor_heartbeat,
+                         inference_slot_name=inference_slot_name)
 
         # YOLO model setup
         self.model = None
@@ -735,6 +736,7 @@ class PeopleCounterProcessor(BaseStreamProcessor):
         self._centralized_inference_failures = 0
         self._last_inference_retry_time = 0.0
         self._last_queue_full_log = 0  # Rate-limit "queue full" warnings
+        self._last_inference_error_log = 0  # Rate-limit inference timeout errors
 
         print(f"[{self.stream_name}] Centralized inference mode (CPU-only worker)", flush=True)
         self.logger.info("Using centralized inference server (no local GPU)")
@@ -1051,6 +1053,30 @@ class PeopleCounterProcessor(BaseStreamProcessor):
                 return response
             # Stale/mismatched — discard and keep waiting
 
+    def _get_inference_suppression_interval(self) -> int:
+        """Get log suppression interval based on consecutive failure count.
+        Scales up to reduce log spam during sustained outages."""
+        failures = self._centralized_inference_failures
+        if failures < 50:
+            return 30
+        elif failures < 200:
+            return 60
+        elif failures < 500:
+            return 120
+        else:
+            return 300
+
+    def _get_inference_retry_interval(self) -> float:
+        """Get backoff retry interval based on consecutive failure count.
+        Scales up to reduce REGISTER spam during sustained outages."""
+        failures = self._centralized_inference_failures
+        if failures < 30:
+            return 10.0
+        elif failures < 100:
+            return 30.0
+        else:
+            return 60.0
+
     def _extract_detections_centralized(self, frame) -> List[Detection]:
         """Extract detections via centralized inference server + local ByteTrack."""
         detections = []
@@ -1066,10 +1092,22 @@ class PeopleCounterProcessor(BaseStreamProcessor):
                     self.inference_result_queue.get_nowait()
             except queue_module.Empty:
                 pass
-            if now - self._last_inference_retry_time < 10.0:
+            retry_interval = self._get_inference_retry_interval()
+            if now - self._last_inference_retry_time < retry_interval:
                 return detections  # Still in backoff window
             self._last_inference_retry_time = now
-            self.logger.info("Inference backoff: attempting periodic retry")
+            self.logger.info(f"Inference backoff: attempting periodic retry (interval: {retry_interval:.0f}s)")
+            # Self-healing: re-send REGISTER in case inference server lost our mapping
+            if self.inference_slot_name:
+                try:
+                    self.inference_request_queue.put(self._InferenceRequest(
+                        type=self._RequestType.REGISTER,
+                        camera_id=self.stream_name,
+                        slot_name=self.inference_slot_name,
+                    ), timeout=1.0)
+                    self.logger.info("Re-sent REGISTER to inference server (self-healing)")
+                except Exception:
+                    pass
 
         try:
             # Send detection request to inference server
@@ -1095,6 +1133,10 @@ class PeopleCounterProcessor(BaseStreamProcessor):
 
             # Only reset failure counter on genuine success (not error/stale responses)
             if not response.error:
+                if self._centralized_inference_failures > 0:
+                    self.logger.info(
+                        f"Inference recovered after {self._centralized_inference_failures} consecutive failures"
+                    )
                 self._centralized_inference_failures = 0
 
             if response.error:
@@ -1120,6 +1162,16 @@ class PeopleCounterProcessor(BaseStreamProcessor):
                     )
                     detections.append(detection)
 
+        except queue_module.Empty:
+            # Inference server not responding — expected during restarts/hangs
+            self._centralized_inference_failures += 1
+            now = time.time()
+            suppression_interval = self._get_inference_suppression_interval()
+            if now - self._last_inference_error_log > suppression_interval:
+                self.logger.warning(
+                    f"Inference response timeout ({self._centralized_inference_failures} consecutive failures, suppressing for {suppression_interval}s)"
+                )
+                self._last_inference_error_log = now
         except Exception as e:
             self._centralized_inference_failures += 1
             self.logger.error(f"Centralized detection error: {e}")
@@ -1330,7 +1382,8 @@ class PeopleCounterProcessor(BaseStreamProcessor):
                     self.inference_result_queue.get_nowait()
             except queue_module.Empty:
                 pass
-            if now - self._last_inference_retry_time < 10.0:
+            retry_interval = self._get_inference_retry_interval()
+            if now - self._last_inference_retry_time < retry_interval:
                 return [None] * len(boxes)
             self._last_inference_retry_time = now
 
@@ -1356,6 +1409,10 @@ class PeopleCounterProcessor(BaseStreamProcessor):
 
             # Only reset failure counter on genuine success (not error/stale responses)
             if not response.error:
+                if self._centralized_inference_failures > 0:
+                    self.logger.info(
+                        f"Inference recovered after {self._centralized_inference_failures} consecutive failures"
+                    )
                 self._centralized_inference_failures = 0
 
             if response.error:
@@ -1363,6 +1420,16 @@ class PeopleCounterProcessor(BaseStreamProcessor):
 
             return response.features if response.features else [None] * len(boxes)
 
+        except queue_module.Empty:
+            self._centralized_inference_failures += 1
+            now = time.time()
+            suppression_interval = self._get_inference_suppression_interval()
+            if now - self._last_inference_error_log > suppression_interval:
+                self.logger.warning(
+                    f"Inference ReID timeout ({self._centralized_inference_failures} consecutive failures, suppressing for {suppression_interval}s)"
+                )
+                self._last_inference_error_log = now
+            return [None] * len(boxes)
         except Exception as e:
             self._centralized_inference_failures += 1
             self.logger.error(f"Centralized ReID error: {e}")

@@ -26,7 +26,7 @@ class BaseStreamProcessor(ABC):
 
     def __init__(self, stream_name: str, rtsp_url: str, device_info: Optional[dict] = None,
                  frame_queue=None, inference_request_queue=None, inference_result_queue=None,
-                 processor_heartbeat=None):
+                 processor_heartbeat=None, inference_slot_name=None):
         """
         Initialize the stream processor
 
@@ -37,6 +37,7 @@ class BaseStreamProcessor(ABC):
             frame_queue: Optional multiprocessing.Queue for sending processed frames for live viewing
             inference_request_queue: Optional queue for sending inference requests to centralized GPU server
             inference_result_queue: Optional queue for receiving inference results from GPU server
+            inference_slot_name: Optional slot name for self-healing re-registration with inference server
         """
         self.stream_name = stream_name
         self.rtsp_url = rtsp_url
@@ -50,6 +51,9 @@ class BaseStreamProcessor(ABC):
         # Centralized inference queues (None = legacy per-process GPU mode)
         self.inference_request_queue = inference_request_queue
         self.inference_result_queue = inference_result_queue
+
+        # Slot name for self-healing re-registration with inference server
+        self.inference_slot_name = inference_slot_name
 
         # Heartbeat for stuck-processor detection by orchestrator
         self.processor_heartbeat = processor_heartbeat
