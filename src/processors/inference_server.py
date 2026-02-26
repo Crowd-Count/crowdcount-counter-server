@@ -92,6 +92,7 @@ class InferenceServer:
         request_queue: multiprocessing.Queue,
         result_queues: Dict[str, multiprocessing.Queue],
         config: dict,
+        heartbeat: Optional[multiprocessing.Value] = None,
     ):
         """
         Initialize inference server configuration.
@@ -105,6 +106,9 @@ class InferenceServer:
                           Created before spawn and inherited by the child process.
                           Keys are slot names like "slot_0", "slot_1", etc.
             config: Configuration dict with inference parameters
+            heartbeat: Shared multiprocessing.Value('d') for liveness monitoring.
+                      Updated after each main loop iteration so the orchestrator can
+                      detect stuck inference (CUDA hang, OOM) even when is_alive() is True.
         """
         self.gpu_id = gpu_id
         self.model_path = model_path
@@ -112,6 +116,7 @@ class InferenceServer:
         self.request_queue = request_queue
         self.result_queues = result_queues  # Pre-allocated pool, inherited at spawn
         self.config = config
+        self.heartbeat = heartbeat
         self.running = False
         # Maps camera_id to slot name, populated dynamically as cameras register
         self.camera_to_slot: Dict[str, str] = {}
@@ -178,13 +183,16 @@ class InferenceServer:
 
         # Main processing loop
         last_stats_time = time.time()
+        last_registration_log_time = time.time()
         while self.running:
             try:
                 # Block waiting for request with timeout so we can check self.running
                 try:
                     request = self.request_queue.get(timeout=1.0)
                 except Exception:
-                    # Queue.get timeout - just loop and check self.running
+                    # Queue.get timeout - update heartbeat to prove loop is alive even when idle
+                    if self.heartbeat is not None:
+                        self.heartbeat.value = time.time()
                     continue
 
                 if request.type == RequestType.SHUTDOWN:
@@ -193,20 +201,32 @@ class InferenceServer:
                     break
 
                 if request.type == RequestType.REGISTER:
-                    # Map camera_id to its pre-allocated result queue slot
+                    # Check if this is a re-registration to the same slot
+                    existing_slot = self.camera_to_slot.get(request.camera_id)
                     self.camera_to_slot[request.camera_id] = request.slot_name
-                    self.logger.info(f"Registered camera {request.camera_id} -> slot {request.slot_name}")
+                    msg = f"InferenceServer-GPU{self.gpu_id}: REGISTERED {request.camera_id} -> {request.slot_name}"
+                    if existing_slot == request.slot_name:
+                        # Re-registration to same slot (self-healing retry) — debug only
+                        self.logger.debug(msg)
+                    else:
+                        # New registration or slot change — log prominently
+                        self.logger.info(msg)
+                        print(msg, flush=True)
                     continue
 
                 if request.type == RequestType.UNREGISTER:
                     self.camera_to_slot.pop(request.camera_id, None)
-                    self.logger.info(f"Unregistered camera {request.camera_id}")
+                    msg = f"InferenceServer-GPU{self.gpu_id}: UNREGISTERED {request.camera_id}"
+                    self.logger.info(msg)
+                    print(msg, flush=True)
                     continue
 
                 # Look up result queue for this camera via slot mapping
                 slot_name = self.camera_to_slot.get(request.camera_id)
                 if slot_name is None:
-                    self.logger.warning(f"Camera {request.camera_id} not registered, dropping request")
+                    msg = f"InferenceServer-GPU{self.gpu_id}: DROPPED request from {request.camera_id} (not registered). Registered: {list(self.camera_to_slot.keys())}"
+                    self.logger.warning(msg)
+                    print(msg, flush=True)
                     continue
                 result_queue = self.result_queues.get(slot_name)
                 if result_queue is None:
@@ -237,6 +257,10 @@ class InferenceServer:
 
                 self.requests_processed += 1
 
+                # Update heartbeat after each processed request
+                if self.heartbeat is not None:
+                    self.heartbeat.value = time.time()
+
                 # Log stats periodically
                 now = time.time()
                 if now - last_stats_time >= 10.0:
@@ -249,10 +273,26 @@ class InferenceServer:
                     )
                     last_stats_time = now
 
+                # Periodic registration summary (every 60s)
+                if now - last_registration_log_time >= 60.0:
+                    registered = list(self.camera_to_slot.keys())
+                    self.logger.info(f"Registered cameras ({len(registered)}): {registered}")
+                    last_registration_log_time = now
+
             except Exception as e:
                 self.logger.error(f"Error processing request: {e}")
                 import traceback
                 self.logger.error(traceback.format_exc())
+                # Send error response so camera worker doesn't timeout silently
+                try:
+                    if 'request' in locals() and 'result_queue' in locals() and result_queue is not None:
+                        result_queue.put_nowait(InferenceResponse(
+                            type=request.type,
+                            camera_id=request.camera_id,
+                            error=f"inference_server_error: {e}",
+                        ))
+                except Exception:
+                    pass  # Best-effort
 
         # Cleanup
         elapsed = time.time() - self.start_time if self.start_time else 0

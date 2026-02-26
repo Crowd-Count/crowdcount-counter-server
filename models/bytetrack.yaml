@@ -4,12 +4,12 @@
 tracker_type: bytetrack
 
 # Detection thresholds
-track_high_thresh: 0.53    # High confidence threshold for first association (aligned with YOLO conf)
+track_high_thresh: 0.45    # High confidence threshold for first association (aligned with YOLO conf)
 track_low_thresh: 0.20     # Low confidence threshold for second association (below YOLO floor, sane fallback)
-new_track_thresh: 0.60     # Threshold for creating new tracks (above YOLO conf to prevent spurious tracks)
+new_track_thresh: 0.45     # Threshold for creating new tracks (aligned with YOLO conf so all detections can create tracks)
 
 # Track buffer and matching
-track_buffer: 30           # Frames to keep lost tracks (~2 sec at 15fps)
+track_buffer: 15           # Frames to keep lost tracks (~2 sec at 7.5fps effective detection rate)
 match_thresh: 0.75         # IoU threshold for matching (relaxed for reacquisition through doorway)
 
 # Motion model (Kalman filter)

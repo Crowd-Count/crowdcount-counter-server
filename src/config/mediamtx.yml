@@ -11,11 +11,11 @@ logFile: data/mediamtx.log
 
 # API server for monitoring and management
 api: true
-apiAddress: 0.0.0.0:9997
+apiAddress: 0.0.0.0:9998
 
 # Metrics for monitoring
 metrics: true
-metricsAddress: 0.0.0.0:9998
+metricsAddress: 0.0.0.0:10000
 
 # External authentication - DISABLED
 # Security model: Tailscale VPN provides network-level isolation
@@ -46,19 +46,19 @@ udpMaxPayloadSize: 1472
 rtspDisable: false
 protocols: [tcp]
 encryption: "no"
-rtspAddress: :8554
-rtspsAddress: :8555
-rtpAddress: :8000
-rtcpAddress: :8001
+rtspAddress: :8555
+rtspsAddress: :8556
+rtpAddress: :8002
+rtcpAddress: :8003
 
 # RTMP Server Configuration (for camera publishing)
 rtmpDisable: false
-rtmpAddress: :1935
+rtmpAddress: :1936
 rtmpEncryption: "no"
 
 # HLS (for browser viewing)
 hlsDisable: false
-hlsAddress: :8888
+hlsAddress: :8889
 hlsEncryption: false
 hlsAllowOrigin: '*'
 hlsVariant: lowLatency
@@ -68,7 +68,7 @@ hlsPartDuration: 200ms
 
 # WebRTC (for low-latency browser viewing)
 webrtcDisable: false
-webrtcAddress: :8889
+webrtcAddress: :8891
 webrtcICEServers: []
 webrtcAllowOrigin: '*'
 
@@ -83,11 +83,11 @@ paths:
     overridePublisher: yes
 
     # Run a command when a stream is ready (used to notify our orchestrator)
-    runOnReady: 'curl -X POST http://127.0.0.1:5000/stream/ready -H "Content-Type: application/json" -d "{\"stream\":\"$MTX_PATH\"}"'
+    runOnReady: 'curl -X POST http://127.0.0.1:5001/stream/ready -H "Content-Type: application/json" -d "{\"stream\":\"$MTX_PATH\"}"'
     runOnReadyRestart: false
 
     # Run a command when a stream is not ready anymore
-    runOnNotReady: 'curl -X POST http://127.0.0.1:5000/stream/stopped -H "Content-Type: application/json" -d "{\"stream\":\"$MTX_PATH\"}"'
+    runOnNotReady: 'curl -X POST http://127.0.0.1:5001/stream/stopped -H "Content-Type: application/json" -d "{\"stream\":\"$MTX_PATH\"}"'
 
     # Recording (disabled by default)
     record: false

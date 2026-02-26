@@ -632,10 +632,11 @@ class PeopleCounterProcessor(BaseStreamProcessor):
 
     def __init__(self, stream_name: str, rtsp_url: str, device_info: Optional[dict] = None,
                  frame_queue=None, inference_request_queue=None, inference_result_queue=None,
-                 processor_heartbeat=None):
+                 processor_heartbeat=None, inference_slot_name=None):
         super().__init__(stream_name, rtsp_url, device_info, frame_queue,
                          inference_request_queue, inference_result_queue,
-                         processor_heartbeat=processor_heartbeat)
+                         processor_heartbeat=processor_heartbeat,
+                         inference_slot_name=inference_slot_name)
 
         # YOLO model setup
         self.model = None
@@ -755,6 +756,7 @@ class PeopleCounterProcessor(BaseStreamProcessor):
         self._centralized_inference_failures = 0
         self._last_inference_retry_time = 0.0
         self._last_queue_full_log = 0  # Rate-limit "queue full" warnings
+        self._last_inference_error_log = 0  # Rate-limit inference timeout errors
 
         print(f"[{self.stream_name}] Centralized inference mode (CPU-only worker)", flush=True)
         self.logger.info("Using centralized inference server (no local GPU)")
@@ -865,7 +867,7 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             args.match_thresh = bt_config.get('match_thresh', 0.75)
             args.fuse_score = bt_config.get('fuse_score', True)
 
-            self.byte_tracker = BYTETracker(args, frame_rate=15)
+            self.byte_tracker = BYTETracker(args, frame_rate=8)
             print(f"[{self.stream_name}] Standalone ByteTrack initialized", flush=True)
             self.logger.info("Standalone ByteTrack tracker initialized")
 
@@ -1054,6 +1056,30 @@ class PeopleCounterProcessor(BaseStreamProcessor):
         else:
             return self._extract_detections_legacy(frame)
 
+    def _get_inference_suppression_interval(self) -> int:
+        """Get log suppression interval based on consecutive failure count.
+        Scales up to reduce log spam during sustained outages."""
+        failures = self._centralized_inference_failures
+        if failures < 50:
+            return 30
+        elif failures < 200:
+            return 60
+        elif failures < 500:
+            return 120
+        else:
+            return 300
+
+    def _get_inference_retry_interval(self) -> float:
+        """Get backoff retry interval based on consecutive failure count.
+        Scales up to reduce REGISTER spam during sustained outages."""
+        failures = self._centralized_inference_failures
+        if failures < 30:
+            return 10.0
+        elif failures < 100:
+            return 30.0
+        else:
+            return 60.0
+
     def _extract_detections_centralized(self, frame) -> List[Detection]:
         """Extract detections via centralized inference server + local ByteTrack."""
         detections = []
@@ -1062,7 +1088,8 @@ class PeopleCounterProcessor(BaseStreamProcessor):
         # to avoid wasting time on get() timeout while allowing recovery
         if self._centralized_inference_failures >= 5:
             now = time.time()
-            if now - self._last_inference_retry_time < 10.0:
+            retry_interval = self._get_inference_retry_interval()
+            if now - self._last_inference_retry_time < retry_interval:
                 return detections  # Still in backoff window
             # Drain stale results so retry reads a fresh response
             drained = 0
@@ -1075,7 +1102,18 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             if drained > 0:
                 self.logger.info(f"Drained {drained} stale inference results before retry")
             self._last_inference_retry_time = now
-            self.logger.info("Inference backoff: attempting periodic retry")
+            self.logger.info(f"Inference backoff: attempting periodic retry (interval: {retry_interval:.0f}s)")
+            # Self-healing: re-send REGISTER in case inference server lost our mapping
+            if self.inference_slot_name:
+                try:
+                    self.inference_request_queue.put(self._InferenceRequest(
+                        type=self._RequestType.REGISTER,
+                        camera_id=self.stream_name,
+                        slot_name=self.inference_slot_name,
+                    ), timeout=1.0)
+                    self.logger.info("Re-sent REGISTER to inference server (self-healing)")
+                except Exception:
+                    pass
 
         try:
             # Send detection request to inference server
@@ -1100,6 +1138,10 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             response = self.inference_result_queue.get(timeout=5.0)
 
             # Success - reset failure counter
+            if self._centralized_inference_failures > 0:
+                self.logger.info(
+                    f"Inference recovered after {self._centralized_inference_failures} consecutive failures"
+                )
             self._centralized_inference_failures = 0
 
             if response.error:
@@ -1125,6 +1167,16 @@ class PeopleCounterProcessor(BaseStreamProcessor):
                     )
                     detections.append(detection)
 
+        except queue_module.Empty:
+            # Inference server not responding — expected during restarts/hangs
+            self._centralized_inference_failures += 1
+            now = time.time()
+            suppression_interval = self._get_inference_suppression_interval()
+            if now - self._last_inference_error_log > suppression_interval:
+                self.logger.warning(
+                    f"Inference response timeout ({self._centralized_inference_failures} consecutive failures, suppressing for {suppression_interval}s)"
+                )
+                self._last_inference_error_log = now
         except Exception as e:
             self._centralized_inference_failures += 1
             self.logger.error(f"Centralized detection error: {e}")
@@ -1329,7 +1381,8 @@ class PeopleCounterProcessor(BaseStreamProcessor):
         # Share failure counter with detection — both use the same inference server
         if self._centralized_inference_failures >= 5:
             now = time.time()
-            if now - self._last_inference_retry_time < 10.0:
+            retry_interval = self._get_inference_retry_interval()
+            if now - self._last_inference_retry_time < retry_interval:
                 return [None] * len(boxes)
             # Drain stale results so retry reads a fresh response
             drained = 0
@@ -1363,6 +1416,10 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             response = self.inference_result_queue.get(timeout=5.0)
 
             # Success - reset failure counter
+            if self._centralized_inference_failures > 0:
+                self.logger.info(
+                    f"Inference recovered after {self._centralized_inference_failures} consecutive failures"
+                )
             self._centralized_inference_failures = 0
 
             if response.error:
@@ -1370,6 +1427,16 @@ class PeopleCounterProcessor(BaseStreamProcessor):
 
             return response.features if response.features else [None] * len(boxes)
 
+        except queue_module.Empty:
+            self._centralized_inference_failures += 1
+            now = time.time()
+            suppression_interval = self._get_inference_suppression_interval()
+            if now - self._last_inference_error_log > suppression_interval:
+                self.logger.warning(
+                    f"Inference ReID timeout ({self._centralized_inference_failures} consecutive failures, suppressing for {suppression_interval}s)"
+                )
+                self._last_inference_error_log = now
+            return [None] * len(boxes)
         except Exception as e:
             self._centralized_inference_failures += 1
             self.logger.error(f"Centralized ReID error: {e}")
@@ -2238,7 +2305,7 @@ class PeopleCounterProcessor(BaseStreamProcessor):
 
         # People visible but not in danger zone
         if self.trackers:
-            return 3
+            return 2
 
         # Empty scene
         return 5
