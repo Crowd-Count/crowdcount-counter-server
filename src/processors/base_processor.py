@@ -398,7 +398,7 @@ class BaseStreamProcessor(ABC):
         # Main processing loop
         frame_number = 0
         consecutive_failures = 0
-        max_consecutive_failures = 30  # Exit quickly (~2s) — let orchestrator handle reconnection
+        max_consecutive_failures = 10  # Exit quickly (~1s) — let orchestrator handle reconnection
 
         try:
             while self.running:

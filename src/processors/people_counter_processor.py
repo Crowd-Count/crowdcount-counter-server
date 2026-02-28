@@ -1847,6 +1847,18 @@ class PeopleCounterProcessor(BaseStreamProcessor):
                     best_cp_sim = self.doorway_config.get('relink_similarity_threshold', 0.55)
 
                     for cp_id, cp_data in self.active_checkpoints.items():
+                        # Distance sanity check: new detection must be within reasonable
+                        # distance of where the person was last tracked (entering danger zone).
+                        # Without this, frame-edge entrants can falsely match to distant checkpoints.
+                        cp_pos = cp_data['checkpoint'].entry_position
+                        dist = math.sqrt(
+                            (detection.center[0] - cp_pos[0])**2 +
+                            (detection.center[1] - cp_pos[1])**2
+                        )
+                        max_recovery_dist = self.doorway_config['max_tracking_distance'] * width * 2.5
+                        if dist > max_recovery_dist:
+                            continue
+
                         sim = float(np.dot(cp_data['embedding'], detection.appearance_features))
                         sim = max(0.0, min(1.0, sim))
                         if sim > best_cp_sim:

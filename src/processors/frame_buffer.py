@@ -60,7 +60,7 @@ class FrameJitterBuffer:
     DEFAULT_BUFFER_SECONDS = 2.5
     DEFAULT_TARGET_FPS = VIDEO_FPS
     MIN_PREFILL_RATIO = 0.5  # Wait for 50% buffer fill before starting emission
-    MAX_DUPLICATE_SECONDS = 15.0  # Signal stream failure after 15s of frame duplication (allow network hiccups to recover)
+    MAX_DUPLICATE_SECONDS = 5.0  # Signal stream failure after 5s of frame duplication (allow network hiccups to recover)
 
     def __init__(
         self,
