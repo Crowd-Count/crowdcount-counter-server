@@ -43,8 +43,8 @@ MAX_PROCESSORS = 35  # Maximum number of concurrent stream processors (GPU 1: 25
 PROCESSOR_RESTART_DELAY = 5  # Seconds to wait before restarting a failed processor
 
 # Stream settings
-STREAM_RECONNECT_TIMEOUT = 45  # Seconds to wait for stream reconnection before stopping processor (increased for stability)
-STREAM_HEALTH_CHECK_INTERVAL = 15  # Seconds between stream health checks (increased to reduce overhead)
+STREAM_RECONNECT_TIMEOUT = 15  # Seconds to wait for stream reconnection before marking offline
+STREAM_HEALTH_CHECK_INTERVAL = 5  # Seconds between stream health checks
 
 # Logging
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
@@ -87,6 +87,10 @@ GPU_PRIORITY_ORDER = [int(x) for x in os.getenv("GPU_PRIORITY_ORDER", "1,0").spl
 
 # Inference queue settings
 INFERENCE_QUEUE_MAXSIZE = int(os.getenv("INFERENCE_QUEUE_MAXSIZE", "100"))
+
+# Batched inference settings (collect multiple frames into one GPU call)
+INFERENCE_BATCH_SIZE = int(os.getenv("INFERENCE_BATCH_SIZE", "8"))
+INFERENCE_BATCH_WAIT_MS = int(os.getenv("INFERENCE_BATCH_WAIT_MS", "30"))
 
 # YOLO inference image size for centralized inference (smaller = faster)
 INFERENCE_IMGSZ = int(os.getenv("INFERENCE_IMGSZ", "480"))

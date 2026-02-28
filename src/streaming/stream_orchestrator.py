@@ -51,6 +51,8 @@ from config.server_config import (
     GPU_PRIORITY_ORDER,
     INFERENCE_QUEUE_MAXSIZE,
     INFERENCE_IMGSZ,
+    INFERENCE_BATCH_SIZE,
+    INFERENCE_BATCH_WAIT_MS,
     DEVICE_API_KEY,
     CORS_ORIGINS,
 )
@@ -1460,6 +1462,8 @@ class StreamOrchestrator:
                 result_queues=result_queues,
                 config={
                     'imgsz': INFERENCE_IMGSZ,
+                    'batch_size': INFERENCE_BATCH_SIZE,
+                    'batch_wait_ms': INFERENCE_BATCH_WAIT_MS,
                 },
                 heartbeat=heartbeat,
             )
@@ -1560,6 +1564,8 @@ class StreamOrchestrator:
             result_queues=self._result_queue_pools[gpu_id],
             config={
                 'imgsz': INFERENCE_IMGSZ,
+                'batch_size': INFERENCE_BATCH_SIZE,
+                'batch_wait_ms': INFERENCE_BATCH_WAIT_MS,
             },
             heartbeat=heartbeat,
         )
