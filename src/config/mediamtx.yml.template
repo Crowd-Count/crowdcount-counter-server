@@ -77,6 +77,31 @@ recordPath: ./data/recordings/%path/%Y-%m-%d_%H-%M-%S-%f
 
 # Path configurations (streams)
 paths:
+  # Mirror streams: pull from prod MediaMTX for dev testing
+  mirror-G7193:
+    source: rtsp://127.0.0.1:8554/G7193
+    sourceOnDemand: no
+    runOnReady: 'curl -X POST http://127.0.0.1:${ORCHESTRATOR_PORT}/stream/ready -H "Content-Type: application/json" -d "{\"stream\":\"$MTX_PATH\"}"'
+    runOnReadyRestart: false
+    runOnNotReady: 'curl -X POST http://127.0.0.1:${ORCHESTRATOR_PORT}/stream/stopped -H "Content-Type: application/json" -d "{\"stream\":\"$MTX_PATH\"}"'
+    record: false
+
+  mirror-V2313:
+    source: rtsp://127.0.0.1:8554/V2313
+    sourceOnDemand: no
+    runOnReady: 'curl -X POST http://127.0.0.1:${ORCHESTRATOR_PORT}/stream/ready -H "Content-Type: application/json" -d "{\"stream\":\"$MTX_PATH\"}"'
+    runOnReadyRestart: false
+    runOnNotReady: 'curl -X POST http://127.0.0.1:${ORCHESTRATOR_PORT}/stream/stopped -H "Content-Type: application/json" -d "{\"stream\":\"$MTX_PATH\"}"'
+    record: false
+
+  mirror-I8739:
+    source: rtsp://127.0.0.1:8554/I8739
+    sourceOnDemand: no
+    runOnReady: 'curl -X POST http://127.0.0.1:${ORCHESTRATOR_PORT}/stream/ready -H "Content-Type: application/json" -d "{\"stream\":\"$MTX_PATH\"}"'
+    runOnReadyRestart: false
+    runOnNotReady: 'curl -X POST http://127.0.0.1:${ORCHESTRATOR_PORT}/stream/stopped -H "Content-Type: application/json" -d "{\"stream\":\"$MTX_PATH\"}"'
+    record: false
+
   # Catch-all regex pattern to match any stream name
   ~^.*$:
     source: publisher

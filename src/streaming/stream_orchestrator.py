@@ -7,6 +7,7 @@ Automatically spawns a processor for each new stream
 import os
 import sys
 import time
+import json
 import logging
 import threading
 import signal
@@ -125,7 +126,9 @@ def _cleanup_queue(q):
             except queue.Empty:
                 break
         q.close()
-        q.join_thread()
+        joiner = threading.Thread(target=q.join_thread, daemon=True)
+        joiner.start()
+        joiner.join(timeout=5)
     except Exception:
         pass
 
@@ -136,6 +139,41 @@ def _get_fd_count():
         return len(os.listdir(f'/proc/{os.getpid()}/fd'))
     except Exception:
         return -1
+
+
+def _load_locations() -> dict:
+    """Load device_id -> location_name mapping from config/locations.json.
+
+    Returns an empty dict on file-not-found or JSON errors so callers
+    always get a safe value.  The file is read fresh on every call so
+    edits take effect without a restart.
+    """
+    try:
+        config_path = Path(__file__).parent.parent.parent / "config" / "locations.json"
+        with open(config_path, "r") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return data
+        return {}
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+
+def _load_mirror_streams() -> dict:
+    """Load mirror stream config from config/mirror_streams.json.
+
+    Returns a dict mapping mirror stream names to their config,
+    or empty dict on errors.
+    """
+    try:
+        config_path = Path(__file__).parent.parent.parent / "config" / "mirror_streams.json"
+        with open(config_path, "r") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return data
+        return {}
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
 
 
 def ssh_exec(ip: str, command: str, device_id: str = None, password: str = None) -> tuple:
@@ -274,6 +312,9 @@ class StreamOrchestrator:
         # Maps stream_name -> timestamp when start began (for stale entry cleanup)
         self._starting_processors: Dict[str, float] = {}
 
+        # Track when each processor was started (for uptime display)
+        self._processor_start_times: Dict[str, float] = {}
+
         # Centralized inference server state
         self.inference_servers: Dict[int, multiprocessing.Process] = {}  # gpu_id -> Process
         self.inference_request_queues: Dict[int, multiprocessing.Queue] = {}  # gpu_id -> shared input queue
@@ -293,12 +334,20 @@ class StreamOrchestrator:
         self.monitor_thread = None
         self._backlog = None  # CountBacklog instance, initialized in start()
 
+        # Monitor thread watchdog: heartbeat stamped each monitor loop iteration
+        self._monitor_heartbeat = 0.0
+        self._monitor_heartbeat_lock = threading.Lock()
+
         # Thread pool for fire-and-forget status updates (prevents thread accumulation)
         self._status_update_executor = ThreadPoolExecutor(
             max_workers=10,
             thread_name_prefix="StatusUpdate"
         )
         self._stopping = False  # Guard against signal handler re-entry
+
+        # Mirror streams: set of stream names that are mirrors of prod streams
+        # Loaded at startup from config/mirror_streams.json
+        self._mirror_streams: set = set()
 
         # Thread safety lock for shared state (RLock allows nested acquisition)
         self._state_lock = threading.RLock()
@@ -313,6 +362,19 @@ class StreamOrchestrator:
 
         # Initialize database
         init_db()
+
+        # Load mirror stream config and pre-populate device_info
+        mirror_config = _load_mirror_streams()
+        for stream_name, config in mirror_config.items():
+            self._mirror_streams.add(stream_name)
+            self.device_info[stream_name] = {
+                'device_id': config['device_id'],
+                'password': '',  # Empty = API client disabled (no counting calls)
+                'timestamp': time.time(),
+                'is_mirror': True,
+            }
+        if self._mirror_streams:
+            self.logger.info(f"Loaded {len(self._mirror_streams)} mirror streams: {sorted(self._mirror_streams)}")
 
         # Flask app for receiving MediaMTX webhooks and device management
         self.app = Flask(__name__, static_folder=str(STATIC_DIR))
@@ -366,34 +428,38 @@ class StreamOrchestrator:
                             'timestamp': time.time()
                         }
 
-                # Update device status in database
-                try:
-                    with get_db() as conn:
-                        c = conn.cursor()
-                        c.execute('SELECT * FROM devices WHERE device_id = ?', (device_id,))
-                        existing = c.fetchone()
+                # Skip DB registration for mirror streams (they aren't real devices)
+                is_mirror = stream_name in self._mirror_streams
 
-                        if existing:
-                            # Update existing device
-                            c.execute('''
-                                UPDATE devices
-                                SET stream_name = ?, tailscale_ip = ?, last_seen = ?, status = 'online'
-                                WHERE device_id = ?
-                            ''', (stream_name, client_ip, datetime.now(), device_id))
-                        else:
-                            # Insert new device
-                            c.execute('''
-                                INSERT INTO devices (device_id, stream_name, tailscale_ip, last_seen, status)
-                                VALUES (?, ?, ?, ?, 'online')
-                            ''', (device_id, stream_name, client_ip, datetime.now()))
+                if not is_mirror:
+                    # Update device status in database
+                    try:
+                        with get_db() as conn:
+                            c = conn.cursor()
+                            c.execute('SELECT * FROM devices WHERE device_id = ?', (device_id,))
+                            existing = c.fetchone()
 
-                        conn.commit()
-                except Exception as e:
-                    self.logger.error(f"Error updating device status in database: {e}")
+                            if existing:
+                                # Update existing device
+                                c.execute('''
+                                    UPDATE devices
+                                    SET stream_name = ?, tailscale_ip = ?, last_seen = ?, status = 'online'
+                                    WHERE device_id = ?
+                                ''', (stream_name, client_ip, datetime.now(), device_id))
+                            else:
+                                # Insert new device
+                                c.execute('''
+                                    INSERT INTO devices (device_id, stream_name, tailscale_ip, last_seen, status)
+                                    VALUES (?, ?, ?, ?, 'online')
+                                ''', (device_id, stream_name, client_ip, datetime.now()))
+
+                            conn.commit()
+                    except Exception as e:
+                        self.logger.error(f"Error updating device status in database: {e}")
 
                 # Detailed logging for testing
                 self.logger.info("=" * 60)
-                self.logger.info(f"🔗 NEW DEVICE CONNECTED")
+                self.logger.info(f"{'MIRROR' if is_mirror else ''} DEVICE CONNECTED")
                 self.logger.info(f"   Stream Name: {stream_name}")
                 self.logger.info(f"   Device ID:   {device_id}")
                 self.logger.info(f"   IP Address:  {client_ip}")
@@ -606,13 +672,19 @@ class StreamOrchestrator:
         @self.app.route('/view/<stream_name>')
         def view_stream(stream_name):
             """Serve HTML viewer for a stream"""
+            locations = _load_locations()
+            with self._state_lock:
+                device_info = self.device_info.get(stream_name, {})
+            device_id = device_info.get('device_id', stream_name)
+            location_name = locations.get(device_id, '')
+
             html = """
             <!DOCTYPE html>
             <html lang="en">
             <head>
                 <meta charset="UTF-8">
                 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                <title>{{ stream_name }} - CrowdCount PROD</title>
+                <title>{{ location_name or stream_name }} - CrowdCount DEV</title>
                 <style>
                     :root {
                         --bg-primary: #0a0a0a;
@@ -624,6 +696,7 @@ class StreamOrchestrator:
                         --accent-hover: #2563eb;
                         --success: #22c55e;
                         --warning: #f59e0b;
+                        --error: #ef4444;
                         --border: #2a2a2a;
                     }
                     * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -644,7 +717,7 @@ class StreamOrchestrator:
                         font-weight: 700;
                         letter-spacing: 2px;
                         z-index: 1000;
-                        background: var(--success);
+                        background: var(--warning);
                         color: #000;
                     }
                     .app {
@@ -715,6 +788,18 @@ class StreamOrchestrator:
                         color: var(--text-primary);
                         font-family: 'SF Mono', Monaco, monospace;
                     }
+                    .status-badge.healthy {
+                        background: rgba(34, 197, 94, 0.15);
+                        color: var(--success);
+                    }
+                    .status-badge.warning {
+                        background: rgba(245, 158, 11, 0.15);
+                        color: var(--warning);
+                    }
+                    .status-badge.error {
+                        background: rgba(239, 68, 68, 0.15);
+                        color: var(--error);
+                    }
                     .status-dot {
                         width: 8px;
                         height: 8px;
@@ -741,11 +826,11 @@ class StreamOrchestrator:
                 </style>
             </head>
             <body>
-                <div class="env-banner">PRODUCTION</div>
+                <div class="env-banner">DEVELOPMENT</div>
                 <div class="app">
                     <header class="header">
-                        <h1>Stream Viewer</h1>
-                        <p class="stream-id">{{ stream_name }}</p>
+                        <h1>{{ location_name or 'Stream Viewer' }}</h1>
+                        <p class="stream-id">{{ device_id }}{% if device_id != stream_name %} &middot; {{ stream_name }}{% endif %}</p>
                     </header>
                     <div class="controls">
                         <button id="toggleBtn" class="btn active" onclick="toggleOverlay()">
@@ -762,6 +847,12 @@ class StreamOrchestrator:
                         </span>
                         <span id="inputFpsBadge" class="status-badge fps">IN: -- FPS</span>
                         <span id="streamFpsBadge" class="status-badge fps">OUT: -- FPS</span>
+                        <span id="resolutionBadge" class="status-badge fps" style="display:none"></span>
+                        <span id="uptimeBadge" class="status-badge fps" style="display:none"></span>
+                        <span id="healthBadge" class="status-badge healthy">
+                            <span class="status-dot"></span>
+                            --
+                        </span>
                     </div>
                     <div class="video-container">
                         <img id="streamImg" src="/video_feed/{{ stream_name }}?overlay=true" alt="Live Stream">
@@ -774,20 +865,59 @@ class StreamOrchestrator:
                     let overlayEnabled = true;
                     const streamName = '{{ stream_name }}';
 
-                    // Update FPS display
+                    function formatUptime(seconds) {
+                        if (!seconds || seconds <= 0) return '--';
+                        const h = Math.floor(seconds / 3600);
+                        const m = Math.floor((seconds % 3600) / 60);
+                        const s = seconds % 60;
+                        if (h > 0) return h + 'h ' + m + 'm';
+                        if (m > 0) return m + 'm ' + s + 's';
+                        return s + 's';
+                    }
+
                     async function updateFps() {
                         try {
                             const response = await fetch('/api/stream/' + streamName + '/stats');
                             const data = await response.json();
                             document.getElementById('inputFpsBadge').textContent = 'IN: ' + data.input_fps.toFixed(1) + ' FPS';
                             document.getElementById('streamFpsBadge').textContent = 'OUT: ' + data.stream_fps.toFixed(1) + ' FPS';
+
+                            // Resolution badge
+                            const resBadge = document.getElementById('resolutionBadge');
+                            if (data.resolution) {
+                                resBadge.textContent = data.resolution;
+                                resBadge.style.display = '';
+                            }
+
+                            // Uptime badge
+                            const uptBadge = document.getElementById('uptimeBadge');
+                            if (data.uptime_seconds > 0) {
+                                uptBadge.textContent = 'Up: ' + formatUptime(data.uptime_seconds);
+                                uptBadge.style.display = '';
+                            }
+
+                            // Health badge
+                            const healthBadge = document.getElementById('healthBadge');
+                            const fps = data.input_fps || 0;
+                            if (!data.active || fps === 0) {
+                                healthBadge.innerHTML = '<span class="status-dot"></span> Offline';
+                                healthBadge.className = 'status-badge error';
+                            } else if (fps < 5) {
+                                healthBadge.innerHTML = '<span class="status-dot"></span> Degraded';
+                                healthBadge.className = 'status-badge warning';
+                            } else {
+                                healthBadge.innerHTML = '<span class="status-dot"></span> Healthy';
+                                healthBadge.className = 'status-badge healthy';
+                            }
                         } catch (e) {
                             document.getElementById('inputFpsBadge').textContent = 'IN: -- FPS';
                             document.getElementById('streamFpsBadge').textContent = 'OUT: -- FPS';
+                            const healthBadge = document.getElementById('healthBadge');
+                            healthBadge.innerHTML = '<span class="status-dot"></span> Offline';
+                            healthBadge.className = 'status-badge error';
                         }
                     }
 
-                    // Start FPS polling
                     setInterval(updateFps, 1000);
                     updateFps();
 
@@ -817,7 +947,7 @@ class StreamOrchestrator:
             </body>
             </html>
             """
-            return render_template_string(html, stream_name=stream_name)
+            return render_template_string(html, stream_name=stream_name, device_id=device_id, location_name=location_name)
 
         @self.app.route('/video_feed/<stream_name>')
         def video_feed(stream_name):
@@ -934,22 +1064,154 @@ class StreamOrchestrator:
 
         @self.app.route('/api/stream/<stream_name>/stats')
         def stream_stats(stream_name):
-            """Get stream statistics including FPS"""
+            """Get stream statistics including FPS, location, resolution, uptime"""
+            locations = _load_locations()
             with self._state_lock:
+                device_info = self.device_info.get(stream_name, {})
+                device_id = device_info.get('device_id', stream_name)
+                location_name = locations.get(device_id, '')
+                is_active = stream_name in self.processors
+                start_time = self._processor_start_times.get(stream_name)
+                uptime_seconds = round(time.time() - start_time) if start_time else 0
+
                 if stream_name in self.stream_stats:
                     stats = self.stream_stats[stream_name]
-                    return jsonify({
+                    result = {
                         'stream_name': stream_name,
                         'input_fps': round(stats.get('input_fps', 0), 1),
                         'stream_fps': round(stats.get('stream_fps', 0), 1),
-                        'active': stream_name in self.processors
+                        'active': is_active,
+                        'device_id': device_id,
+                        'location_name': location_name,
+                        'uptime_seconds': uptime_seconds,
+                    }
+                else:
+                    result = {
+                        'stream_name': stream_name,
+                        'input_fps': 0,
+                        'stream_fps': 0,
+                        'active': is_active,
+                        'device_id': device_id,
+                        'location_name': location_name,
+                        'uptime_seconds': uptime_seconds,
+                    }
+
+            # Fetch resolution from DB (outside state lock)
+            resolution = ''
+            try:
+                with get_db() as conn:
+                    c = conn.cursor()
+                    c.execute('SELECT width, height FROM devices WHERE device_id = ?', (device_id,))
+                    row = c.fetchone()
+                    if row:
+                        resolution = f"{row['width']}x{row['height']}"
+            except Exception:
+                pass
+            result['resolution'] = resolution
+            return jsonify(result)
+
+        @self.app.route('/api/dashboard', methods=['GET'])
+        def dashboard_data():
+            """Get all registered devices with live processor status for the dashboard."""
+            try:
+                update_device_status()
+                locations = _load_locations()
+
+                with get_db() as conn:
+                    c = conn.cursor()
+                    c.execute('SELECT * FROM devices ORDER BY device_id')
+                    devices_raw = [dict(row) for row in c.fetchall()]
+
+                with self._state_lock:
+                    active_streams = set(self.processors.keys())
+                    stats_copy = {k: dict(v) for k, v in self.stream_stats.items()}
+                    device_info_copy = {k: dict(v) for k, v in self.device_info.items()}
+
+                # Build set of device_ids owned by mirrors so DB rows don't duplicate them
+                mirror_device_ids = set()
+                with self._state_lock:
+                    for mirror_name in self._mirror_streams:
+                        mid = self.device_info.get(mirror_name, {}).get('device_id')
+                        if mid:
+                            mirror_device_ids.add(mid)
+
+                devices = []
+                for dev in devices_raw:
+                    device_id = dev['device_id']
+                    stream_name = dev.get('stream_name', '')
+
+                    # Skip DB entries that overlap with mirror streams (injected separately below)
+                    if stream_name in self._mirror_streams or device_id in self._mirror_streams or device_id in mirror_device_ids:
+                        continue
+
+                    is_active = stream_name in active_streams
+
+                    # Only show DB devices if actively running; offline entries come from locations.json
+                    if not is_active:
+                        continue
+
+                    stats = stats_copy.get(stream_name, {})
+
+                    devices.append({
+                        'device_id': device_id,
+                        'stream_name': stream_name,
+                        'status': dev.get('status', 'offline'),
+                        'is_active': is_active,
+                        'location_name': locations.get(device_id, ''),
+                        'input_fps': round(stats.get('input_fps', 0), 1) if is_active else 0,
+                        'stream_fps': round(stats.get('stream_fps', 0), 1) if is_active else 0,
+                        'last_seen': dev.get('last_seen', ''),
+                        'tailscale_ip': dev.get('tailscale_ip', ''),
                     })
+
+                # Add all mirror streams (online if processor running, offline if not)
+                with self._state_lock:
+                    for mirror_name in self._mirror_streams:
+                        mirror_device_id = self.device_info.get(mirror_name, {}).get('device_id', mirror_name)
+                        is_active = mirror_name in self.processors
+                        mirror_stats = stats_copy.get(mirror_name, {})
+                        devices.append({
+                            'device_id': mirror_device_id,
+                            'stream_name': mirror_name,
+                            'status': 'online' if is_active else 'offline',
+                            'is_active': is_active,
+                            'is_mirror': True,
+                            'location_name': locations.get(mirror_device_id, ''),
+                            'input_fps': round(mirror_stats.get('input_fps', 0), 1) if is_active else 0,
+                            'stream_fps': round(mirror_stats.get('stream_fps', 0), 1) if is_active else 0,
+                            'last_seen': '',
+                            'tailscale_ip': '',
+                        })
+
+                # Add remaining devices from locations.json that aren't already listed
+                # (shows all known devices as offline placeholders on the dev dashboard)
+                seen_device_ids = {d['device_id'] for d in devices}
+                for loc_device_id, loc_name in locations.items():
+                    if loc_device_id not in seen_device_ids:
+                        devices.append({
+                            'device_id': loc_device_id,
+                            'stream_name': '',
+                            'status': 'offline',
+                            'is_active': False,
+                            'location_name': loc_name,
+                            'input_fps': 0,
+                            'stream_fps': 0,
+                            'last_seen': '',
+                            'tailscale_ip': '',
+                        })
+
+                # Sort: active first, then offline, alphabetical within each group
+                devices.sort(key=lambda d: (not d['is_active'], d['device_id']))
+                online_count = sum(1 for d in devices if d['is_active'])
+
                 return jsonify({
-                    'stream_name': stream_name,
-                    'input_fps': 0,
-                    'stream_fps': 0,
-                    'active': stream_name in self.processors
+                    'devices': devices,
+                    'online_count': online_count,
+                    'total_count': len(devices),
                 })
+            except Exception as e:
+                self.logger.error(f"Error in /api/dashboard: {e}")
+                return jsonify({'error': str(e), 'devices': [], 'online_count': 0, 'total_count': 0}), 500
 
         # Web Dashboard Routes
         @self.app.route('/')
@@ -1526,7 +1788,10 @@ class StreamOrchestrator:
                 heartbeat=heartbeat,
             )
 
-            proc = multiprocessing.Process(
+            # Use 'spawn' context to avoid inheriting parent's CUDA context
+            # (required for TensorRT — forked CUDA contexts cause illegal memory access)
+            ctx = multiprocessing.get_context('spawn')
+            proc = ctx.Process(
                 target=server.run,
                 name=f"InferenceServer-GPU{gpu_id}",
             )
@@ -1628,7 +1893,9 @@ class StreamOrchestrator:
             heartbeat=heartbeat,
         )
 
-        proc = multiprocessing.Process(
+        # Use 'spawn' context to avoid inheriting parent's CUDA context
+        ctx = multiprocessing.get_context('spawn')
+        proc = ctx.Process(
             target=server.run,
             name=f"InferenceServer-GPU{gpu_id}",
         )
@@ -1767,8 +2034,10 @@ class StreamOrchestrator:
 
         self.logger.info(f"Starting processor for stream: {stream_name}")
 
+        is_mirror = stream_name in self._mirror_streams
+
         try:
-            # Create API client for status updates
+            # Create API client for status updates (skip for mirrors)
             device_id = device_info.get('device_id', stream_name)
             password = device_info.get('password', '')
             api_client = CrowdCountAPIClient(
@@ -1782,11 +2051,13 @@ class StreamOrchestrator:
             frame_queue = multiprocessing.Queue(maxsize=15)  # 1 second buffer added
 
             with self._state_lock:
-                self.api_clients[stream_name] = api_client
+                if not is_mirror:
+                    self.api_clients[stream_name] = api_client
                 self.frame_queues[stream_name] = frame_queue
 
-            # Update device status to online
-            self._submit_status_update(api_client, 'online', stream_name)
+            # Update device status to online (skip for mirrors - no API calls)
+            if not is_mirror:
+                self._submit_status_update(api_client, 'online', stream_name)
 
             # Set up centralized inference queues if servers are running
             inference_request_queue = None
@@ -1864,6 +2135,7 @@ class StreamOrchestrator:
             with self._state_lock:
                 self.processors[stream_name] = proc
                 self._processor_heartbeats[stream_name] = processor_heartbeat
+                self._processor_start_times[stream_name] = time.time()
                 self._starting_processors.pop(stream_name, None)
             self.logger.info(f"Processor started for {stream_name} (PID: {proc.pid})")
 
@@ -1940,6 +2212,7 @@ class StreamOrchestrator:
                 # Clean up processor entry (use pop to avoid KeyError)
                 self.processors.pop(stream_name, None)
                 self._processor_heartbeats.pop(stream_name, None)
+                self._processor_start_times.pop(stream_name, None)
                 # Pop frame queue for cleanup outside lock (join_thread can block)
                 frame_queue = self.frame_queues.pop(stream_name, None)
                 # Clean up stream stats
@@ -2032,6 +2305,7 @@ class StreamOrchestrator:
             # Clean up processor entry
             proc = self.processors.pop(stream_name, None)
             self._processor_heartbeats.pop(stream_name, None)
+            self._processor_start_times.pop(stream_name, None)
             # Pop frame queue for cleanup outside lock (join_thread can block)
             frame_queue = self.frame_queues.pop(stream_name, None)
             # Clean up stream stats
@@ -2121,6 +2395,8 @@ class StreamOrchestrator:
         while self.running:
             try:
                 _monitor_iteration += 1
+                with self._monitor_heartbeat_lock:
+                    self._monitor_heartbeat = time.time()
 
                 # Periodic resource monitoring (every 10 iterations = ~150s with 15s interval)
                 if _monitor_iteration % 10 == 0:
@@ -2358,6 +2634,26 @@ class StreamOrchestrator:
 
         self.logger.info("Stream monitor stopped")
 
+    def _monitor_watchdog(self):
+        """Watchdog thread that restarts the monitor thread if it hangs."""
+        while self.running:
+            time.sleep(30)
+            with self._monitor_heartbeat_lock:
+                last_beat = self._monitor_heartbeat
+            if last_beat == 0.0:
+                continue  # Monitor hasn't started yet
+            stale_seconds = time.time() - last_beat
+            if stale_seconds > 90:
+                self.logger.critical(
+                    f"Monitor thread appears hung! No heartbeat for {stale_seconds:.0f}s. Restarting monitor thread."
+                )
+                # The old thread is stuck; start a fresh one
+                self.monitor_thread = threading.Thread(target=self.monitor_streams, daemon=True)
+                self.monitor_thread.start()
+                # Reset heartbeat so we don't immediately fire again
+                with self._monitor_heartbeat_lock:
+                    self._monitor_heartbeat = time.time()
+
     def start(self):
         """Start the orchestrator"""
         self.logger.info("=" * 60)
@@ -2377,6 +2673,10 @@ class StreamOrchestrator:
         # Start monitoring thread
         self.monitor_thread = threading.Thread(target=self.monitor_streams, daemon=True)
         self.monitor_thread.start()
+
+        # Start monitor watchdog thread
+        self._watchdog_thread = threading.Thread(target=self._monitor_watchdog, daemon=True)
+        self._watchdog_thread.start()
 
         # Initialize count backlog and start flush thread
         try:

@@ -1,0 +1,20 @@
+{
+    "mirror-G7193": {
+        "source_stream": "G7193",
+        "device_id": "G7193",
+        "prod_rtsp_host": "127.0.0.1",
+        "prod_rtsp_port": 8554
+    },
+    "mirror-V2313": {
+        "source_stream": "V2313",
+        "device_id": "V2313",
+        "prod_rtsp_host": "127.0.0.1",
+        "prod_rtsp_port": 8554
+    },
+    "mirror-I8739": {
+        "source_stream": "I8739",
+        "device_id": "I8739",
+        "prod_rtsp_host": "127.0.0.1",
+        "prod_rtsp_port": 8554
+    }
+}
