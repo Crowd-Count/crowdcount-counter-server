@@ -169,7 +169,6 @@ class PersonTracker:
 
         # METHOD 5.4: Velocity-gated crossing validation (reflection prevention)
         self.danger_zone_frame_count = 0                   # Frames spent in danger zone during current transit
-        self.approach_velocities: deque = deque(maxlen=30) # X-velocities while approaching
 
         # Add initial detection
         self.update(initial_detection)
@@ -283,10 +282,9 @@ class PersonTracker:
 
     def check_crossing(self, frame_width: int, doorway_center: float, doorway_width: float,
                        danger_buffer: float = None,
-                       velocity_config: Optional[dict] = None) -> Optional[CrossingDirection]:
+                       min_transit_frames: int = 1) -> Optional[CrossingDirection]:
         """
         METHOD 5: Explicit Occlusion Handling with ReID Relink
-        METHOD 5.4: Added velocity-gated crossing validation for reflection prevention
 
         Zones:
         - LEFT_ZONE: Safe zone on left side
@@ -298,7 +296,6 @@ class PersonTracker:
         2. Track normal crossing if track survives through zone
         3. If track lost, checkpoint enables ReID-based relinking
         4. Clear checkpoint on successful exit or timeout
-        5. (5.4) Validate velocity was toward crossing line before allowing crossing
         """
         if len(self.positions) < 2:
             return None
@@ -320,15 +317,6 @@ class PersonTracker:
         # Update in_danger_zone flag
         self.in_danger_zone = (new_zone == DangerZone.DANGER_ZONE)
 
-        # METHOD 5.4: Track velocity and danger zone frames for validation
-        if self.velocities:
-            vx = self.velocities[-1][0]  # Most recent X velocity
-            # Record approach velocity when in safe zones, but only if actually moving
-            # Idle/near-zero velocities dilute the approach ratio and cause valid crossings to be rejected
-            if new_zone in (DangerZone.LEFT_ZONE, DangerZone.RIGHT_ZONE):
-                if abs(vx) > 3.0:  # Ignore idle frames (noise threshold ~3 px/s)
-                    self.approach_velocities.append(vx)
-
         # Track frames in danger zone
         if new_zone == DangerZone.DANGER_ZONE:
             self.danger_zone_frame_count += 1
@@ -340,7 +328,6 @@ class PersonTracker:
         # Reset counters when entering danger zone from a safe zone
         if zone_changed and new_zone == DangerZone.DANGER_ZONE:
             self.danger_zone_frame_count = 1  # Start counting (we're in it now)
-            # Don't clear approach_velocities - we need the history from before entering
 
         # Update legacy side tracking
         if new_zone == DangerZone.LEFT_ZONE:
@@ -389,73 +376,46 @@ class PersonTracker:
                     entry_side = self.checkpoint.entry_side
                     exit_side = 'left' if self.current_zone == DangerZone.LEFT_ZONE else 'right'
 
-                    if entry_side != exit_side:
-                        # METHOD 5.4: Validate velocity before counting crossing
-                        velocity_valid = True
-                        if velocity_config and velocity_config.get('velocity_validation_enabled', False):
-                            velocity_valid = self.validate_velocity_for_crossing(
-                                entry_side=entry_side,
-                                min_approach_speed=velocity_config.get('velocity_min_approach_speed', 0.0234) * frame_width,
-                                min_approach_frames=velocity_config.get('velocity_min_approach_frames', 5),
-                                approach_ratio_threshold=velocity_config.get('velocity_approach_ratio_threshold', 0.5),
-                                min_transit_frames=velocity_config.get('velocity_min_transit_frames', 2),
-                                validation_window=velocity_config.get('velocity_validation_window', 20)
-                            )
-
-                        if velocity_valid:
-                            # Successful crossing through danger zone
-                            if entry_side == 'left' and exit_side == 'right':
-                                if current_time - self.last_crossing_time >= self.min_crossing_interval:
-                                    crossing_to_emit = CrossingDirection.LEFT_TO_RIGHT
-                                    self.total_crossings += 1
-                                    self.crossing_events.append((current_time, crossing_to_emit))
-                                    self.last_crossing_time = current_time
-                                    self.last_side = 'right'
-                            elif entry_side == 'right' and exit_side == 'left':
-                                if current_time - self.last_crossing_time >= self.min_crossing_interval:
-                                    crossing_to_emit = CrossingDirection.RIGHT_TO_LEFT
-                                    self.total_crossings += 1
-                                    self.crossing_events.append((current_time, crossing_to_emit))
-                                    self.last_crossing_time = current_time
-                                    self.last_side = 'left'
+                    if entry_side != exit_side and self.danger_zone_frame_count >= min_transit_frames:
+                        # Successful crossing through danger zone
+                        if entry_side == 'left' and exit_side == 'right':
+                            if current_time - self.last_crossing_time >= self.min_crossing_interval:
+                                crossing_to_emit = CrossingDirection.LEFT_TO_RIGHT
+                                self.total_crossings += 1
+                                self.crossing_events.append((current_time, crossing_to_emit))
+                                self.last_crossing_time = current_time
+                                self.last_side = 'right'
+                        elif entry_side == 'right' and exit_side == 'left':
+                            if current_time - self.last_crossing_time >= self.min_crossing_interval:
+                                crossing_to_emit = CrossingDirection.RIGHT_TO_LEFT
+                                self.total_crossings += 1
+                                self.crossing_events.append((current_time, crossing_to_emit))
+                                self.last_crossing_time = current_time
+                                self.last_side = 'left'
 
                     # Clear checkpoint after processing
                     self.clear_checkpoint()
 
                 else:
                     # No checkpoint - use simple side change detection
-                    if self.last_side and self.current_side and self.last_side != self.current_side:
-                        # METHOD 5.4: Validate velocity for non-checkpoint crossings too
-                        velocity_valid = True
-                        if velocity_config and velocity_config.get('velocity_validation_enabled', False):
-                            velocity_valid = self.validate_velocity_for_crossing(
-                                entry_side=self.last_side,
-                                min_approach_speed=velocity_config.get('velocity_min_approach_speed', 0.0234) * frame_width,
-                                min_approach_frames=velocity_config.get('velocity_min_approach_frames', 5),
-                                approach_ratio_threshold=velocity_config.get('velocity_approach_ratio_threshold', 0.5),
-                                min_transit_frames=velocity_config.get('velocity_min_transit_frames', 2),
-                                validation_window=velocity_config.get('velocity_validation_window', 20)
-                            )
+                    if self.last_side and self.current_side and self.last_side != self.current_side and self.danger_zone_frame_count >= min_transit_frames:
+                        if self.last_side == 'left' and self.current_side == 'right':
+                            if current_time - self.last_crossing_time >= self.min_crossing_interval:
+                                crossing_to_emit = CrossingDirection.LEFT_TO_RIGHT
+                                self.total_crossings += 1
+                                self.crossing_events.append((current_time, crossing_to_emit))
+                                self.last_crossing_time = current_time
+                                self.last_side = self.current_side
+                        elif self.last_side == 'right' and self.current_side == 'left':
+                            if current_time - self.last_crossing_time >= self.min_crossing_interval:
+                                crossing_to_emit = CrossingDirection.RIGHT_TO_LEFT
+                                self.total_crossings += 1
+                                self.crossing_events.append((current_time, crossing_to_emit))
+                                self.last_crossing_time = current_time
+                                self.last_side = self.current_side
 
-                        if velocity_valid:
-                            if self.last_side == 'left' and self.current_side == 'right':
-                                if current_time - self.last_crossing_time >= self.min_crossing_interval:
-                                    crossing_to_emit = CrossingDirection.LEFT_TO_RIGHT
-                                    self.total_crossings += 1
-                                    self.crossing_events.append((current_time, crossing_to_emit))
-                                    self.last_crossing_time = current_time
-                                    self.last_side = self.current_side
-                            elif self.last_side == 'right' and self.current_side == 'left':
-                                if current_time - self.last_crossing_time >= self.min_crossing_interval:
-                                    crossing_to_emit = CrossingDirection.RIGHT_TO_LEFT
-                                    self.total_crossings += 1
-                                    self.crossing_events.append((current_time, crossing_to_emit))
-                                    self.last_crossing_time = current_time
-                                    self.last_side = self.current_side
-
-                # METHOD 5.4: Reset velocity tracking after crossing attempt (valid or not)
+                # Reset danger zone frame count after crossing attempt
                 self.danger_zone_frame_count = 0
-                self.approach_velocities.clear()
 
             # Direct zone skip: LEFT_ZONE <-> RIGHT_ZONE without passing through DANGER_ZONE
             # This happens when the danger zone is narrow and the person's center jumps over it
@@ -475,8 +435,6 @@ class PersonTracker:
                             self.last_crossing_time = current_time
                             self.last_side = self.current_side
 
-                    self.approach_velocities.clear()
-
         return crossing_to_emit
 
     def _validate_crossing(self, frame_width: int, doorway_center: float) -> bool:
@@ -494,74 +452,6 @@ class PersonTracker:
         vy_avg = np.average([v[1] for v in self.velocities], weights=weights)
 
         return (vx_avg, vy_avg)
-
-    def validate_velocity_for_crossing(
-        self,
-        entry_side: str,
-        min_approach_speed: float = 15.0,
-        min_approach_frames: int = 5,
-        approach_ratio_threshold: float = 0.5,
-        min_transit_frames: int = 2,
-        validation_window: int = 20
-    ) -> bool:
-        """
-        METHOD 5.4: Validate that velocity history is consistent with a real crossing.
-
-        Reflections on glass doors have velocity AWAY from the crossing line,
-        while real people have velocity TOWARD the line before crossing.
-
-        Args:
-            entry_side: 'left' or 'right' - which side the track entered from
-            min_approach_speed: Minimum speed (pixels/sec) toward line to count as approaching
-            min_approach_frames: Minimum frames with valid approach velocity
-            approach_ratio_threshold: Minimum ratio of frames moving toward line
-            min_transit_frames: Minimum frames in danger zone (anti-teleport check)
-            validation_window: Number of recent velocities to analyze
-
-        Returns:
-            True if velocity pattern is consistent with real crossing, False otherwise
-        """
-        # Check 1: Did the track actually transit through the danger zone?
-        # Reflections or track swaps may "teleport" across without being in the zone
-        if self.danger_zone_frame_count < min_transit_frames:
-            return False
-
-        # Check 2: Analyze approach velocity history
-        # Need enough velocity samples to make a determination
-        if len(self.approach_velocities) < min_approach_frames:
-            # Not enough history - be permissive for tracks that started near the line
-            # but still require they spent time in the danger zone
-            return self.danger_zone_frame_count >= min_transit_frames
-
-        # Get recent approach velocities (X component only - horizontal movement)
-        recent_velocities = list(self.approach_velocities)[-validation_window:]
-
-        # Determine expected velocity direction based on entry side
-        # Left side entry: should be moving RIGHT (positive vx) toward center line
-        # Right side entry: should be moving LEFT (negative vx) toward center line
-        if entry_side == 'left':
-            # Count frames moving toward line (positive X velocity above speed threshold)
-            frames_toward = sum(1 for vx in recent_velocities if vx > min_approach_speed)
-            # Also count frames moving in the correct direction at any speed
-            frames_correct_direction = sum(1 for vx in recent_velocities if vx > 0)
-        else:  # entry_side == 'right'
-            # Count frames moving toward line (negative X velocity above speed threshold)
-            frames_toward = sum(1 for vx in recent_velocities if vx < -min_approach_speed)
-            frames_correct_direction = sum(1 for vx in recent_velocities if vx < 0)
-
-        # Check 3: Was the track consistently moving toward the line?
-        # Primary: strict check with speed threshold
-        approach_ratio = frames_toward / len(recent_velocities)
-        if approach_ratio >= approach_ratio_threshold:
-            return True
-
-        # Secondary: if most frames move in the correct direction (even slowly),
-        # accept the crossing - this prevents rejecting slow but legitimate crossings
-        direction_ratio = frames_correct_direction / len(recent_velocities)
-        if direction_ratio >= 0.6:
-            return True
-
-        return False
 
     def time_since_update(self) -> float:
         """Time since last update"""
@@ -665,13 +555,9 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             'checkpoint_timeout': 5.0,          # Max seconds to search for lost track
             'relink_similarity_threshold': 0.55,  # ReID match threshold for relinking (lower OK for occlusion)
             'lingering_timeout': 10.0,          # Extended timeout for slow-moving people
-            # METHOD 5.4: Velocity-gated crossing validation (reflection prevention)
-            'velocity_validation_enabled': True,        # Enable velocity-based crossing validation
-            'velocity_min_approach_speed': 0.0234,       # Proportion of frame width/sec (~15px/s at 640w)
-            'velocity_min_approach_frames': 3,          # Min frames with approach velocity before crossing (was 5 at 30fps)
-            'velocity_approach_ratio_threshold': 0.5,   # Min ratio of frames moving toward line (0.0-1.0)
-            'velocity_min_transit_frames': 1,           # Min frames detected in danger zone (anti-teleport, was 2 at 30fps)
-            'velocity_validation_window': 10,           # Frames to analyze for velocity validation (was 20 at 30fps)
+            # METHOD 5.4: Anti-teleport validation
+            'velocity_validation_enabled': True,        # Enable anti-teleport crossing validation
+            'velocity_min_transit_frames': 1,           # Min frames detected in danger zone (anti-teleport)
             # Night mode: CLAHE preprocessing for low-light enhancement
             'use_clahe': True,                  # Enable CLAHE preprocessing for night/low-light
             'clahe_clip_limit': 2.0,            # Contrast limit (1.5-3.0, higher = more contrast but more noise)
@@ -926,16 +812,11 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             self.logger.info(f"CLAHE initialized: clipLimit={clip_limit}, tileGridSize={tile_size}, engageThreshold={engage_threshold}, disengageThreshold={disengage_threshold}")
 
     def _log_velocity_settings(self):
-        """Log METHOD 5.4 velocity validation settings."""
+        """Log METHOD 5.4 anti-teleport validation settings."""
         if self.doorway_config.get('velocity_validation_enabled', False):
-            print(f"Velocity-gated crossing validation enabled (reflection prevention)", flush=True)
-            print(f"  - Min approach speed: {self.doorway_config['velocity_min_approach_speed']} (proportion of frame width/s)", flush=True)
-            print(f"  - Min approach frames: {self.doorway_config['velocity_min_approach_frames']}", flush=True)
-            print(f"  - Approach ratio threshold: {self.doorway_config['velocity_approach_ratio_threshold']}", flush=True)
+            print(f"Anti-teleport crossing validation enabled", flush=True)
             print(f"  - Min transit frames: {self.doorway_config['velocity_min_transit_frames']}", flush=True)
-            self.logger.info(f"Velocity validation enabled: min_speed={self.doorway_config['velocity_min_approach_speed']}, "
-                           f"min_frames={self.doorway_config['velocity_min_approach_frames']}, "
-                           f"ratio={self.doorway_config['velocity_approach_ratio_threshold']}")
+            self.logger.info(f"Anti-teleport validation enabled: min_transit_frames={self.doorway_config['velocity_min_transit_frames']}")
 
     def on_stop(self):
         """Cleanup when processor stops"""
@@ -1491,7 +1372,7 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             self.doorway_config['doorway_center'],
             self.doorway_config['doorway_width'],
             self.doorway_config['danger_zone_buffer'],  # METHOD 5: pass danger zone buffer
-            self.doorway_config  # METHOD 5.4: pass velocity config for reflection prevention
+            min_transit_frames=self.doorway_config.get('velocity_min_transit_frames', 1)
         )
 
         # METHOD 5: Create checkpoint when tracker enters danger zone
@@ -2044,7 +1925,7 @@ class PeopleCounterProcessor(BaseStreamProcessor):
                     'last_side': tracker.last_side,
                     'in_danger_zone': tracker.in_danger_zone,
                     'danger_zone_frame_count': tracker.danger_zone_frame_count,
-                    'approach_velocities': deque(tracker.approach_velocities, maxlen=30),
+
                     'needs_checkpoint': tracker.needs_checkpoint,
                     'side_history': deque(tracker.side_history, maxlen=10),
                     'consecutive_side_detections': tracker.consecutive_side_detections,
@@ -2066,7 +1947,7 @@ class PeopleCounterProcessor(BaseStreamProcessor):
                         self.doorway_config['doorway_center'],
                         self.doorway_config['doorway_width'],
                         self.doorway_config['danger_zone_buffer'],  # METHOD 5: pass danger zone buffer
-                        self.doorway_config  # METHOD 5.4: pass velocity config for reflection prevention
+                        min_transit_frames=self.doorway_config.get('velocity_min_transit_frames', 1)
                     )
 
                     # Restore original positions
@@ -2123,7 +2004,7 @@ class PeopleCounterProcessor(BaseStreamProcessor):
                 tracker.current_side = saved_state['current_side']
                 tracker.in_danger_zone = saved_state['in_danger_zone']
                 tracker.danger_zone_frame_count = saved_state['danger_zone_frame_count']
-                tracker.approach_velocities = saved_state['approach_velocities']
+
                 tracker.needs_checkpoint = saved_state['needs_checkpoint']
                 tracker.side_history = saved_state['side_history']
                 tracker.consecutive_side_detections = saved_state['consecutive_side_detections']
