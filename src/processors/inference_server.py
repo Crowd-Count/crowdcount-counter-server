@@ -16,6 +16,7 @@ Architecture:
 import time
 import logging
 import multiprocessing
+import shutil
 from dataclasses import dataclass
 from typing import Optional, List, Tuple, Dict
 from enum import Enum
@@ -149,6 +150,180 @@ class InferenceServer:
             self.logger.addHandler(handler)
             self.logger.setLevel(logging.INFO)
 
+    # -------------------------------------------------------------------------
+    # TensorRT engine management
+    # -------------------------------------------------------------------------
+
+    def _get_engine_dir(self) -> Path:
+        """Determine the directory for storing TensorRT engines.
+
+        Priority: explicit config dir > models/ dir (if writable) > data/engines/ fallback.
+        """
+        explicit_dir = self.config.get('tensorrt_engine_dir', '')
+        if explicit_dir:
+            d = Path(explicit_dir)
+            d.mkdir(parents=True, exist_ok=True)
+            return d
+
+        # Try models/ directory first
+        if MODELS_DIR.exists():
+            try:
+                test_file = MODELS_DIR / ".write_test"
+                test_file.touch()
+                test_file.unlink()
+                return MODELS_DIR
+            except OSError:
+                pass
+
+        # Fallback to data/engines/
+        fallback = PROJECT_ROOT / "data" / "engines"
+        fallback.mkdir(parents=True, exist_ok=True)
+        return fallback
+
+    def _resolve_model_path(self, device_str: str) -> str:
+        """Resolve the model path, preferring a TensorRT engine if available.
+
+        Checks if TensorRT is enabled, builds a GPU-specific engine filename,
+        and either returns the existing engine or triggers auto-export.
+        Falls back to the original .pt path on any failure.
+        """
+        import torch
+
+        if not self.config.get('tensorrt_enabled', True):
+            self.logger.info("TensorRT disabled by config, using PyTorch model")
+            return self.model_path
+
+        if not self.model_path.endswith('.pt'):
+            self.logger.info(f"Model is not a .pt file ({self.model_path}), skipping TensorRT")
+            return self.model_path
+
+        try:
+            # Get GPU compute capability
+            cap = torch.cuda.get_device_capability(self.gpu_id)
+            gpu_arch = f"sm{cap[0]}{cap[1]}"
+
+            max_batch = self.config.get('tensorrt_max_batch', self.batch_size)
+            imgsz = self.config.get('imgsz', 480)
+
+            # Build GPU-specific engine filename
+            model_stem = Path(self.model_path).stem
+            engine_name = f"{model_stem}_{gpu_arch}_b{max_batch}_fp16_imgsz{imgsz}.engine"
+
+            engine_dir = self._get_engine_dir()
+            engine_path = engine_dir / engine_name
+
+            if engine_path.exists():
+                self.logger.info(f"Found existing TensorRT engine: {engine_path}")
+                return str(engine_path)
+
+            self.logger.info(
+                f"No TensorRT engine found for {gpu_arch}, exporting: {engine_path}"
+            )
+            return self._export_tensorrt_engine(engine_path, device_str, max_batch, imgsz)
+
+        except Exception as e:
+            self.logger.error(f"TensorRT resolution failed, falling back to PyTorch: {e}")
+            import traceback
+            self.logger.error(traceback.format_exc())
+            return self.model_path
+
+    def _export_tensorrt_engine(
+        self, engine_path: Path, device_str: str, max_batch: int, imgsz: int
+    ) -> str:
+        """Export a TensorRT engine from the .pt weights.
+
+        Copies .pt to the writable engine dir (avoids read-only /app mount),
+        calls ultralytics export, renames the result to the GPU-specific name,
+        and cleans up temp files.
+
+        Returns the engine path on success, or falls back to .pt on failure.
+        """
+        from ultralytics import YOLO
+
+        try:
+            engine_dir = engine_path.parent
+            pt_name = Path(self.model_path).name
+
+            # Copy .pt to engine dir so ultralytics writes the .engine there
+            temp_pt = engine_dir / pt_name
+            if not temp_pt.exists() or str(temp_pt) != self.model_path:
+                shutil.copy2(self.model_path, temp_pt)
+
+            self.logger.info(
+                f"Exporting TensorRT engine (batch={max_batch}, imgsz={imgsz}, fp16=True)... "
+                f"This may take several minutes on first run."
+            )
+
+            export_model = YOLO(str(temp_pt))
+            exported_path = export_model.export(
+                format="engine",
+                dynamic=True,
+                half=True,
+                imgsz=imgsz,
+                batch=max_batch,
+                device=device_str,
+            )
+
+            # ultralytics returns the path to the exported engine
+            exported = Path(exported_path)
+            if not exported.exists():
+                raise FileNotFoundError(f"Export succeeded but file not found: {exported}")
+
+            # Rename to our GPU-specific name
+            if exported != engine_path:
+                shutil.move(str(exported), str(engine_path))
+
+            # Clean up temp .pt copy (only if we copied it)
+            if str(temp_pt) != self.model_path and temp_pt.exists():
+                temp_pt.unlink()
+
+            # Clean up any intermediate ONNX files
+            onnx_file = engine_dir / Path(self.model_path).with_suffix('.onnx').name
+            if onnx_file.exists():
+                onnx_file.unlink()
+                self.logger.info(f"Cleaned up intermediate ONNX: {onnx_file}")
+
+            self.logger.info(f"TensorRT engine exported successfully: {engine_path}")
+            return str(engine_path)
+
+        except Exception as e:
+            self.logger.error(f"TensorRT export failed, falling back to PyTorch: {e}")
+            import traceback
+            self.logger.error(traceback.format_exc())
+            return self.model_path
+
+    def _warmup_model(self, device_str: str):
+        """Run dummy inference passes to initialize TensorRT CUDA kernels.
+
+        Prevents latency spike on first real inference.
+        """
+        warmup_iters = self.config.get('tensorrt_warmup_iters', 3)
+        if warmup_iters <= 0:
+            return
+
+        imgsz = self.config.get('imgsz', 480)
+        self.logger.info(f"Warming up model with {warmup_iters} dummy inference passes...")
+
+        try:
+            dummy_frame = np.random.randint(0, 255, (imgsz, imgsz, 3), dtype=np.uint8)
+            for i in range(warmup_iters):
+                self.model.predict(
+                    dummy_frame,
+                    conf=0.25,
+                    iou=0.3,
+                    classes=[0],
+                    half=True,
+                    imgsz=imgsz,
+                    verbose=False,
+                )
+            self.logger.info("Model warmup complete")
+        except Exception as e:
+            self.logger.warning(f"Warmup failed (non-fatal): {e}")
+
+    # -------------------------------------------------------------------------
+    # Main inference loop
+    # -------------------------------------------------------------------------
+
     def run(self):
         """
         Main inference loop. Call this as the target of multiprocessing.Process.
@@ -166,12 +341,33 @@ class InferenceServer:
         torch.cuda.set_device(self.gpu_id)
         self.logger.info(f"Initializing on {device_str} ({torch.cuda.get_device_name(self.gpu_id)})")
 
+        # Resolve model path (TensorRT engine or PyTorch .pt)
+        resolved_path = self._resolve_model_path(device_str)
+        is_engine = resolved_path.endswith('.engine')
+
         # Load YOLO model
-        self.logger.info(f"Loading YOLO model: {self.model_path}")
-        self.model = YOLO(self.model_path)
-        self.model.to(device_str)
-        model_device = next(self.model.model.parameters()).device
-        self.logger.info(f"YOLO model loaded on device: {model_device}")
+        self.logger.info(f"Loading YOLO model: {resolved_path}")
+        try:
+            if is_engine:
+                self.model = YOLO(resolved_path, task='detect')
+            else:
+                self.model = YOLO(resolved_path)
+                self.model.to(device_str)
+        except Exception as e:
+            if is_engine:
+                self.logger.error(f"TensorRT engine load failed: {e}, falling back to PyTorch")
+                self.model = YOLO(self.model_path)
+                self.model.to(device_str)
+                is_engine = False
+            else:
+                raise
+
+        backend = "TensorRT" if is_engine else "PyTorch"
+        if is_engine:
+            self.logger.info(f"YOLO model loaded on {device_str} (backend: {backend})")
+        else:
+            model_device = next(self.model.model.parameters()).device
+            self.logger.info(f"YOLO model loaded on device: {model_device} (backend: {backend})")
 
         # Get class names
         if hasattr(self.model, 'names'):
@@ -187,9 +383,12 @@ class InferenceServer:
             )
             self.logger.info(f"ReID model loaded (feature dim: {self.reid_extractor.feature_dim})")
 
+        # Warmup model (initializes TensorRT CUDA kernels, prevents first-inference spike)
+        self._warmup_model(device_str)
+
         self.logger.info(
             f"Inference server ready (batch_size={self.batch_size}, "
-            f"batch_wait_ms={self.batch_wait_ms}), waiting for requests..."
+            f"batch_wait_ms={self.batch_wait_ms}, backend={backend}), waiting for requests..."
         )
 
         # Main processing loop
@@ -428,40 +627,54 @@ class InferenceServer:
                 self._send_error_response(request, slot_name, str(e))
 
     def _process_reid_batch(self, requests_and_slots):
-        """Process REID requests individually (each has different crops)."""
-        for request, slot_name in requests_and_slots:
-            response = self._handle_reid(request)
-            result_queue = self.result_queues.get(slot_name)
-            if result_queue:
-                try:
-                    result_queue.put_nowait(response)
-                except Exception as e:
-                    self.logger.error(f"Failed to deliver REID result for {request.camera_id}: {e}")
+        """Process REID requests with cross-camera batching for GPU efficiency.
 
-    def _handle_reid(self, request: InferenceRequest) -> InferenceResponse:
-        """Handle a ReID feature extraction request"""
-        try:
-            if self.reid_extractor is None:
-                return InferenceResponse(
+        Collects all crops from all cameras in the batch, runs ONE GPU forward
+        pass via extract_cross_camera_batch(), then distributes features back.
+        This reduces per-camera GPU call overhead from O(N) to O(1).
+        """
+        if self.reid_extractor is None:
+            for request, slot_name in requests_and_slots:
+                response = InferenceResponse(
                     type=RequestType.REID,
                     camera_id=request.camera_id,
                     features=[None] * len(request.boxes) if request.boxes else [],
                     error="ReID extractor not available",
                 )
+                result_queue = self.result_queues.get(slot_name)
+                if result_queue:
+                    try:
+                        result_queue.put_nowait(response)
+                    except Exception as e:
+                        self.logger.error(f"Failed to deliver REID result for {request.camera_id}: {e}")
+            return
 
-            features = self.reid_extractor.extract_batch(request.frame, request.boxes or [])
+        try:
+            # Collect all (frame, boxes) pairs for cross-camera batching
+            frame_boxes_pairs = [
+                (request.frame, request.boxes or [])
+                for request, _ in requests_and_slots
+            ]
 
-            return InferenceResponse(
-                type=RequestType.REID,
-                camera_id=request.camera_id,
-                features=features,
-            )
+            # ONE batched GPU call for all cameras' ReID crops
+            all_features = self.reid_extractor.extract_cross_camera_batch(frame_boxes_pairs)
+
+            # Distribute results to per-camera result queues
+            for (request, slot_name), features in zip(requests_and_slots, all_features):
+                response = InferenceResponse(
+                    type=RequestType.REID,
+                    camera_id=request.camera_id,
+                    features=features,
+                )
+                result_queue = self.result_queues.get(slot_name)
+                if result_queue:
+                    try:
+                        result_queue.put_nowait(response)
+                    except Exception as e:
+                        self.logger.error(f"Failed to deliver REID result for {request.camera_id}: {e}")
 
         except Exception as e:
-            self.logger.error(f"ReID error for {request.camera_id}: {e}")
-            return InferenceResponse(
-                type=RequestType.REID,
-                camera_id=request.camera_id,
-                features=[None] * len(request.boxes) if request.boxes else [],
-                error=str(e),
-            )
+            self.logger.error(f"Batch ReID error: {e}")
+            for request, slot_name in requests_and_slots:
+                self._send_error_response(request, slot_name, str(e))
+

@@ -88,11 +88,17 @@ GPU_PRIORITY_ORDER = [int(x) for x in os.getenv("GPU_PRIORITY_ORDER", "1,0").spl
 INFERENCE_QUEUE_MAXSIZE = int(os.getenv("INFERENCE_QUEUE_MAXSIZE", "100"))
 
 # Batched inference settings (collect multiple frames into one GPU call)
-INFERENCE_BATCH_SIZE = int(os.getenv("INFERENCE_BATCH_SIZE", "8"))
+INFERENCE_BATCH_SIZE = int(os.getenv("INFERENCE_BATCH_SIZE", "16"))
 INFERENCE_BATCH_WAIT_MS = int(os.getenv("INFERENCE_BATCH_WAIT_MS", "30"))
 
 # YOLO inference image size for centralized inference (smaller = faster)
 INFERENCE_IMGSZ = int(os.getenv("INFERENCE_IMGSZ", "480"))
+
+# TENSORRT SETTINGS
+TENSORRT_ENABLED = os.getenv("TENSORRT_ENABLED", "true").lower() == "true"
+TENSORRT_ENGINE_DIR = os.getenv("TENSORRT_ENGINE_DIR", "")  # Empty = auto-detect
+TENSORRT_MAX_BATCH = int(os.getenv("TENSORRT_MAX_BATCH", str(INFERENCE_BATCH_SIZE)))
+TENSORRT_WARMUP_ITERS = int(os.getenv("TENSORRT_WARMUP_ITERS", "3"))
 
 # =============================================================================
 # VIDEO SETTINGS - Change these values to adjust FPS and resolution globally

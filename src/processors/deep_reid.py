@@ -231,6 +231,78 @@ class DeepReIDExtractor:
 
         return results
 
+    @torch.no_grad()
+    def extract_cross_camera_batch(
+        self,
+        frame_boxes_pairs: List[Tuple[np.ndarray, List[Tuple[int, int, int, int]]]]
+    ) -> List[List[Optional[np.ndarray]]]:
+        """
+        Extract features for multiple cameras' boxes in ONE forward pass.
+
+        Collects all valid crops from all cameras, runs a single GPU inference,
+        then distributes features back. Much more efficient than calling
+        extract_batch() per camera when processing many cameras concurrently.
+
+        Args:
+            frame_boxes_pairs: List of (frame, boxes) tuples, one per camera.
+                Each frame is a BGR image, boxes is a list of (x1, y1, x2, y2).
+
+        Returns:
+            List of per-camera feature lists. Each inner list contains
+            feature vectors (or None for failed extractions) matching the input boxes.
+        """
+        if not frame_boxes_pairs:
+            return []
+
+        all_crops = []       # Preprocessed crop tensors
+        crop_map = []        # (camera_idx, box_idx) for each crop
+        box_counts = []      # Total boxes per camera (for building result arrays)
+
+        for cam_idx, (frame, boxes) in enumerate(frame_boxes_pairs):
+            box_counts.append(len(boxes))
+            if not boxes or frame is None:
+                continue
+
+            try:
+                h, w = frame.shape[:2]
+            except Exception:
+                continue  # Skip corrupt frames
+
+            for box_idx, (x1, y1, x2, y2) in enumerate(boxes):
+                x1, y1 = max(0, int(x1)), max(0, int(y1))
+                x2, y2 = min(w, int(x2)), min(h, int(y2))
+
+                box_width = x2 - x1
+                box_height = y2 - y1
+
+                if x2 > x1 and y2 > y1 and box_width >= 20 and box_height >= 40:
+                    crop = frame[y1:y2, x1:x2]
+                    if crop.size > 0:
+                        all_crops.append(self._preprocess(crop))
+                        crop_map.append((cam_idx, box_idx))
+
+        # Build result arrays (all None initially)
+        results = [[None] * count for count in box_counts]
+
+        if not all_crops:
+            return results
+
+        # ONE forward pass for all crops across all cameras
+        batch = torch.cat(all_crops, dim=0)
+        features = self.model(batch)
+        features = features.cpu().numpy()
+
+        # L2 normalize all feature vectors at once
+        norms = np.linalg.norm(features, axis=1, keepdims=True)
+        norms[norms == 0] = 1
+        features = features / norms
+
+        # Distribute features back to per-camera results
+        for (cam_idx, box_idx), feat in zip(crop_map, features):
+            results[cam_idx][box_idx] = feat
+
+        return results
+
     @staticmethod
     def cosine_similarity(feat1: np.ndarray, feat2: np.ndarray) -> float:
         """
@@ -325,6 +397,13 @@ class FallbackReIDExtractor:
     ) -> List[Optional[np.ndarray]]:
         """Extract features for multiple boxes (sequential for fallback)."""
         return [self.extract(frame, *box) for box in boxes]
+
+    def extract_cross_camera_batch(
+        self,
+        frame_boxes_pairs: List[Tuple[np.ndarray, List[Tuple[int, int, int, int]]]]
+    ) -> List[List[Optional[np.ndarray]]]:
+        """Extract features for multiple cameras' boxes (sequential for fallback)."""
+        return [self.extract_batch(frame, boxes) for frame, boxes in frame_boxes_pairs]
 
     @staticmethod
     def cosine_similarity(feat1: np.ndarray, feat2: np.ndarray) -> float:
