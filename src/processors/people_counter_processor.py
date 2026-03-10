@@ -631,8 +631,8 @@ class PeopleCounterProcessor(BaseStreamProcessor):
 
         # YOLO model setup
         self.model = None
-        self.model_path = str(MODELS_DIR / "crowdcount-v5.pt")  # V5 model trained on V5_data dataset
-        self.bytetrack_config = str(MODELS_DIR / "bytetrack.yaml")  # ByteTrack config for group tracking
+        self.model_path = str(MODELS_DIR / "crowdcount-v5_1.pt")  # V5.1 model trained on V5_1_data dataset
+        self.tracker_config = str(MODELS_DIR / "botsort.yaml")  # BoT-SORT config (XYWH Kalman, no ReID)
         self.class_names = {0: 'person'}  # Default
 
         # Doorway configuration - TUNED FOR GROUP DETECTION
@@ -643,10 +643,10 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             'min_path_length': 50,      # Minimum pixels traveled
             'max_tracking_distance': 0.156,  # Proportion of frame width (~100px at 640w)
             'tracker_timeout': 1.5,     # TUNED: Reduced from 3.0 to let false tracks expire faster
-            'yolo_conf_threshold': 0.45,  # Lowered from 0.53 for better recall
+            'yolo_conf_threshold': 0.35,  # Lowered from 0.45 for better recall
             'yolo_iou_threshold': 0.3,   # TUNED: Lowered from 0.45 to separate overlapping people
             'min_crossing_interval': 0.5,  # TUNED: Increased from 0.3 to prevent double counts
-            'min_peak_confidence': 0.53,  # Above YOLO conf — final quality gate before counting a crossing
+            'min_peak_confidence': 0.35,  # Aligned with YOLO conf — final quality gate before counting a crossing
             'reid_similarity_threshold': 0.6,  # TUNED: Increased for deep ReID (more discriminative)
             'use_bytetrack': True,       # NEW: Enable ByteTrack
             'use_reid': True,            # NEW: Enable ReID features
@@ -741,9 +741,9 @@ class PeopleCounterProcessor(BaseStreamProcessor):
         print(f"[{self.stream_name}] Centralized inference mode (CPU-only worker)", flush=True)
         self.logger.info("Using centralized inference server (no local GPU)")
 
-        # Initialize standalone ByteTrack tracker for local tracking
-        # We use model.predict() on the server side + local ByteTrack
-        self._init_standalone_bytetrack()
+        # Initialize standalone tracker for local tracking
+        # We use model.predict() on the server side + local tracker
+        self._init_standalone_tracker()
 
         # Initialize CLAHE for night mode preprocessing (runs on CPU)
         self._init_clahe()
@@ -751,7 +751,7 @@ class PeopleCounterProcessor(BaseStreamProcessor):
         # Log velocity validation settings
         self._log_velocity_settings()
 
-        print(f"[{self.stream_name}] Worker ready (ByteTrack + crossing logic on CPU)", flush=True)
+        print(f"[{self.stream_name}] Worker ready (tracker + crossing logic on CPU)", flush=True)
 
     def _on_start_legacy(self):
         """Initialize for legacy per-process GPU mode (original behavior)"""
@@ -769,7 +769,7 @@ class PeopleCounterProcessor(BaseStreamProcessor):
 
             print(f"Loading YOLO model: {self.model_path}", flush=True)
             print(f"Using device: {self.device}", flush=True)
-            print(f"ByteTrack config: {self.bytetrack_config}", flush=True)
+            print(f"Tracker config: {self.tracker_config}", flush=True)
             if cuda_available:
                 print(f"GPU: {torch.cuda.get_device_name(0)}", flush=True)
 
@@ -825,21 +825,23 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             self.logger.error(f"Failed to load YOLO model: {e}")
             raise
 
-    def _init_standalone_bytetrack(self):
-        """Initialize standalone ByteTrack tracker for centralized inference mode."""
+    def _init_standalone_tracker(self):
+        """Initialize standalone tracker (BoT-SORT or ByteTrack) for centralized inference mode."""
         try:
-            from ultralytics.trackers.byte_tracker import BYTETracker
             import yaml
+            import os
 
-            # Load ByteTrack config from yaml
-            with open(self.bytetrack_config, 'r') as f:
+            # Load tracker config from yaml
+            with open(self.tracker_config, 'r') as f:
                 bt_config = yaml.safe_load(f)
 
-            # Create a simple args object for BYTETracker
-            class ByteTrackArgs:
+            tracker_type = bt_config.get('tracker_type', 'bytetrack')
+
+            # Create args object with shared parameters
+            class TrackerArgs:
                 pass
 
-            args = ByteTrackArgs()
+            args = TrackerArgs()
             args.track_high_thresh = bt_config.get('track_high_thresh', 0.25)
             args.track_low_thresh = bt_config.get('track_low_thresh', 0.15)
             args.new_track_thresh = bt_config.get('new_track_thresh', 0.3)
@@ -847,12 +849,46 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             args.match_thresh = bt_config.get('match_thresh', 0.75)
             args.fuse_score = bt_config.get('fuse_score', True)
 
-            self.byte_tracker = BYTETracker(args, frame_rate=15)
-            print(f"[{self.stream_name}] Standalone ByteTrack initialized", flush=True)
-            self.logger.info("Standalone ByteTrack tracker initialized")
+            if tracker_type == 'botsort':
+                from ultralytics.trackers.bot_sort import BOTSORT
+
+                # BoT-SORT specific args
+                args.gmc_method = bt_config.get('gmc_method', 'none')
+                args.proximity_thresh = bt_config.get('proximity_thresh', 0.5)
+                args.appearance_thresh = bt_config.get('appearance_thresh', 0.25)
+                args.with_reid = bt_config.get('with_reid', False)
+                # Resolve model path relative to MODELS_DIR for reliability
+                model_name = bt_config.get('model', 'yolo11n-cls.pt')
+                model_path = MODELS_DIR / model_name
+                args.model = str(model_path) if model_path.exists() else model_name
+
+                # Force CPU for ReID model — processors are CPU-only workers
+                old_cuda = os.environ.get('CUDA_VISIBLE_DEVICES')
+                os.environ['CUDA_VISIBLE_DEVICES'] = ''
+
+                try:
+                    self.byte_tracker = BOTSORT(args, frame_rate=8)
+                finally:
+                    # Restore original CUDA_VISIBLE_DEVICES
+                    if old_cuda is not None:
+                        os.environ['CUDA_VISIBLE_DEVICES'] = old_cuda
+                    else:
+                        del os.environ['CUDA_VISIBLE_DEVICES']
+
+                reid_status = "with ReID" if args.with_reid else "without ReID"
+                print(f"[{self.stream_name}] Standalone BoT-SORT initialized {reid_status}", flush=True)
+                self.logger.info(f"Standalone BoT-SORT tracker initialized {reid_status} (model={args.model})")
+            else:
+                from ultralytics.trackers.byte_tracker import BYTETracker
+
+                self.byte_tracker = BYTETracker(args, frame_rate=8)
+                print(f"[{self.stream_name}] Standalone ByteTrack initialized", flush=True)
+                self.logger.info("Standalone ByteTrack tracker initialized")
 
         except Exception as e:
-            self.logger.error(f"Failed to initialize standalone ByteTrack: {e}")
+            self.logger.error(f"Failed to initialize standalone tracker: {e}")
+            import traceback
+            self.logger.error(traceback.format_exc())
             self.byte_tracker = None
 
     def _init_clahe(self):
@@ -1286,7 +1322,7 @@ class PeopleCounterProcessor(BaseStreamProcessor):
                     iou=self.doorway_config['yolo_iou_threshold'],
                     classes=[0],  # Only detect person class
                     persist=True,  # Persist tracks across frames
-                    tracker=self.bytetrack_config,  # Use our custom ByteTrack config
+                    tracker=self.tracker_config,  # Use our custom tracker config
                     verbose=False
                 )
             else:
