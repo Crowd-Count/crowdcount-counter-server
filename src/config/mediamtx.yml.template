@@ -102,6 +102,22 @@ paths:
     runOnNotReady: 'curl -X POST http://127.0.0.1:${ORCHESTRATOR_PORT}/stream/stopped -H "Content-Type: application/json" -d "{\"stream\":\"$MTX_PATH\"}"'
     record: false
 
+  mirror-R8100:
+    source: rtsp://127.0.0.1:8554/R8100
+    sourceOnDemand: no
+    runOnReady: 'curl -X POST http://127.0.0.1:${ORCHESTRATOR_PORT}/stream/ready -H "Content-Type: application/json" -d "{\"stream\":\"$MTX_PATH\"}"'
+    runOnReadyRestart: false
+    runOnNotReady: 'curl -X POST http://127.0.0.1:${ORCHESTRATOR_PORT}/stream/stopped -H "Content-Type: application/json" -d "{\"stream\":\"$MTX_PATH\"}"'
+    record: false
+
+  mirror-Q6992:
+    source: rtsp://127.0.0.1:8554/Q6992
+    sourceOnDemand: no
+    runOnReady: 'curl -X POST http://127.0.0.1:${ORCHESTRATOR_PORT}/stream/ready -H "Content-Type: application/json" -d "{\"stream\":\"$MTX_PATH\"}"'
+    runOnReadyRestart: false
+    runOnNotReady: 'curl -X POST http://127.0.0.1:${ORCHESTRATOR_PORT}/stream/stopped -H "Content-Type: application/json" -d "{\"stream\":\"$MTX_PATH\"}"'
+    record: false
+
   # Catch-all regex pattern to match any stream name
   ~^.*$:
     source: publisher

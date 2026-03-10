@@ -23,7 +23,7 @@ import sqlite3
 import paramiko
 import subprocess
 from datetime import datetime, timedelta
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait as futures_wait
 from contextlib import contextmanager
 
 # Add parent directory to path for imports
@@ -1749,7 +1749,7 @@ class StreamOrchestrator:
 
         # Get model paths from the processor class defaults
         models_dir = Path(__file__).parent.parent.parent / "models"
-        model_path = str(models_dir / "crowdcount-v5.pt")
+        model_path = str(models_dir / "crowdcount-v5_1.pt")
         reid_model_name = "osnet_x0_25"  # Default ReID model
 
         self.logger.info(f"Starting {num_gpus} inference server(s)...")
@@ -1879,7 +1879,7 @@ class StreamOrchestrator:
 
         # Get model paths
         models_dir = Path(__file__).parent.parent.parent / "models"
-        model_path = str(models_dir / "crowdcount-v5.pt")
+        model_path = str(models_dir / "crowdcount-v5_1.pt")
         reid_model_name = "osnet_x0_25"
 
         # Create new heartbeat for the restarted server
@@ -2294,6 +2294,71 @@ class StreamOrchestrator:
 
         self.logger.info(f"Stream {stream_name} added to reconnect queue (timeout: {STREAM_RECONNECT_TIMEOUT}s) - processor will exit naturally")
 
+    def _handle_dead_processor(self, stream_name: str, detected_proc, active_streams: list):
+        """
+        Handle a single dead processor: cleanup and conditional restart.
+        Called from monitor_streams via ThreadPoolExecutor for parallel processing.
+
+        Args:
+            stream_name: Name of the stream whose processor died
+            detected_proc: The dead process object detected by the monitor
+            active_streams: Pre-fetched list of active MediaMTX streams
+        """
+        try:
+            # Re-check: skip if a DIFFERENT processor was started since our snapshot
+            with self._state_lock:
+                current_proc = self.processors.get(stream_name)
+                if current_proc is not None and current_proc is not detected_proc:
+                    return  # A different (new) processor replaced the stuck one
+                if stream_name in self._starting_processors:
+                    return
+                in_pending = stream_name in self.pending_reconnect
+            if in_pending:
+                self._cleanup_dead_processor(stream_name, detected_proc=detected_proc)
+                return
+
+            self.stop_processor(stream_name, reason="monitor_dead_processor")
+
+            # Check if stream is still active, restart processor (with limit)
+            if stream_name in active_streams:
+                # Track restart failures to prevent infinite loops
+                with self._state_lock:
+                    if stream_name not in self._restart_failures:
+                        self._restart_failures[stream_name] = {'count': 0, 'last_failure': 0}
+
+                    failures = self._restart_failures[stream_name]
+                    max_restarts = 3
+
+                    # Reset failure count if last failure was more than 10 minutes ago
+                    if time.time() - failures['last_failure'] > 300:
+                        failures['count'] = 0
+
+                    should_restart = failures['count'] < max_restarts
+                    if should_restart:
+                        failures['count'] += 1
+                        failures['last_failure'] = time.time()
+                        restart_attempt = failures['count']
+
+                    # Get API client for offline notification if needed
+                    api_client = self.api_clients.get(stream_name) if not should_restart else None
+
+                if should_restart:
+                    self.logger.info(
+                        f"Stream {stream_name} is still active, restarting processor "
+                        f"(attempt {restart_attempt}/{max_restarts})"
+                    )
+                    self.start_processor(stream_name)
+                else:
+                    self.logger.warning(
+                        f"Stream {stream_name} has failed {max_restarts} consecutive restarts - "
+                        f"giving up until stream reconnects. Device may be sending no video data."
+                    )
+                    # Mark device offline since we can't process its stream
+                    if api_client:
+                        self._submit_status_update(api_client, 'offline', stream_name)
+        except Exception as e:
+            self.logger.error(f"Error handling dead processor for {stream_name}: {e}", exc_info=True)
+
     def _cleanup_dead_processor(self, stream_name: str, detected_proc=None):
         """
         Clean up a dead processor's resources without marking the device offline.
@@ -2482,60 +2547,32 @@ class StreamOrchestrator:
                             )
                             dead_processors.append((stream_name, proc))
 
-                # Clean up dead processors
-                for stream_name, detected_proc in dead_processors:
-                    # Re-check: skip if a DIFFERENT processor was started since our snapshot
-                    with self._state_lock:
-                        current_proc = self.processors.get(stream_name)
-                        if current_proc is not None and current_proc is not detected_proc:
-                            continue  # A different (new) processor replaced the stuck one
-                        if stream_name in self._starting_processors:
-                            continue
-                        in_pending = stream_name in self.pending_reconnect
-                    if in_pending:
-                        self._cleanup_dead_processor(stream_name, detected_proc=detected_proc)
-                        continue
-
-                    self.stop_processor(stream_name, reason="monitor_dead_processor")
-
-                    # Check if stream is still active, restart processor (with limit)
+                # Clean up dead processors in parallel
+                if dead_processors:
+                    # Fetch active streams ONCE (not per-stream)
                     active_streams = self.mediamtx.get_active_streams()
-                    if stream_name in active_streams:
-                        # Track restart failures to prevent infinite loops
-                        with self._state_lock:
-                            if stream_name not in self._restart_failures:
-                                self._restart_failures[stream_name] = {'count': 0, 'last_failure': 0}
 
-                            failures = self._restart_failures[stream_name]
-                            max_restarts = 3
-
-                            # Reset failure count if last failure was more than 10 minutes ago
-                            if time.time() - failures['last_failure'] > 300:
-                                failures['count'] = 0
-
-                            should_restart = failures['count'] < max_restarts
-                            if should_restart:
-                                failures['count'] += 1
-                                failures['last_failure'] = time.time()
-                                restart_attempt = failures['count']
-
-                            # Get API client for offline notification if needed
-                            api_client = self.api_clients.get(stream_name) if not should_restart else None
-
-                        if should_restart:
-                            self.logger.info(
-                                f"Stream {stream_name} is still active, restarting processor "
-                                f"(attempt {restart_attempt}/{max_restarts})"
+                    self.logger.info(f"Processing {len(dead_processors)} dead processors in parallel")
+                    max_workers = min(len(dead_processors), 8)
+                    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                        futures = {}
+                        for stream_name, detected_proc in dead_processors:
+                            future = executor.submit(
+                                self._handle_dead_processor, stream_name, detected_proc, active_streams
                             )
-                            self.start_processor(stream_name)
+                            futures[future] = stream_name
+
+                        # Wait with periodic heartbeat updates to prevent watchdog timeout
+                        deadline = time.time() + 60
+                        while time.time() < deadline:
+                            with self._monitor_heartbeat_lock:
+                                self._monitor_heartbeat = time.time()
+                            done, not_done = futures_wait(futures, timeout=5)
+                            if not not_done:
+                                break
                         else:
-                            self.logger.warning(
-                                f"Stream {stream_name} has failed {max_restarts} consecutive restarts - "
-                                f"giving up until stream reconnects. Device may be sending no video data."
-                            )
-                            # Mark device offline since we can't process its stream
-                            if api_client:
-                                self._submit_status_update(api_client, 'offline', stream_name)
+                            for f in not_done:
+                                self.logger.warning(f"Dead processor handling timed out for {futures[f]}")
 
                 # Clean up stale _starting_processors entries (stuck for > 30s)
                 with self._state_lock:

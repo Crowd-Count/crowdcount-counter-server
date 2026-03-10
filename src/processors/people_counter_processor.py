@@ -282,7 +282,8 @@ class PersonTracker:
 
     def check_crossing(self, frame_width: int, doorway_center: float, doorway_width: float,
                        danger_buffer: float = None,
-                       min_transit_frames: int = 1) -> Optional[CrossingDirection]:
+                       min_transit_frames: int = 1,
+                       frame_height: int = 480) -> Optional[CrossingDirection]:
         """
         METHOD 5: Explicit Occlusion Handling with ReID Relink
 
@@ -316,6 +317,38 @@ class PersonTracker:
 
         # Update in_danger_zone flag
         self.in_danger_zone = (new_zone == DangerZone.DANGER_ZONE)
+
+        # Vertical exit detection: person in danger zone moving toward frame top/bottom
+        # Catches people who cross the doorway then exit via stairs (up/down)
+        if (new_zone == DangerZone.DANGER_ZONE and
+            self.checkpoint is not None and
+            len(self.positions) >= 3 and
+            len(self.velocities) >= 2):
+
+            current_y = self.positions[-1][1]
+            edge_threshold = frame_height * 0.12  # Within 12% of top/bottom edge
+
+            recent_vy = [v[1] for v in list(self.velocities)[-3:]]
+            avg_vy = sum(recent_vy) / len(recent_vy)
+
+            exiting_top = (current_y < edge_threshold and avg_vy < -5.0)
+            exiting_bottom = (current_y > frame_height - edge_threshold and avg_vy > 5.0)
+
+            if exiting_top or exiting_bottom:
+                entry_side = self.checkpoint.entry_side
+                if entry_side and current_time - self.last_crossing_time >= self.min_crossing_interval:
+                    if entry_side == 'left':
+                        crossing_vertical = CrossingDirection.LEFT_TO_RIGHT
+                    else:
+                        crossing_vertical = CrossingDirection.RIGHT_TO_LEFT
+
+                    self.total_crossings += 1
+                    self.crossing_events.append((current_time, crossing_vertical))
+                    self.last_crossing_time = current_time
+                    self.last_side = 'right' if entry_side == 'left' else 'left'
+                    self.clear_checkpoint()
+                    self.danger_zone_frame_count = 0
+                    return crossing_vertical
 
         # Track frames in danger zone
         if new_zone == DangerZone.DANGER_ZONE:
@@ -530,7 +563,7 @@ class PeopleCounterProcessor(BaseStreamProcessor):
 
         # YOLO model setup
         self.model = None
-        self.model_path = str(MODELS_DIR / "crowdcount-v5.pt")  # V5 model trained on V5_data dataset
+        self.model_path = str(MODELS_DIR / "crowdcount-v5_1.pt")  # V5.1 model trained on V5_1_data dataset
         self.tracker_config = str(MODELS_DIR / "botsort.yaml")  # BoT-SORT config (superset of ByteTrack with ReID)
         self.class_names = {0: 'person'}  # Default
 
@@ -1359,7 +1392,7 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             self.logger.error(f"Centralized ReID error: {e}")
             return [None] * len(boxes)
 
-    def _check_and_handle_crossing(self, track_id: int, detection: Detection, frame_width: int, current_time: float, frame=None):
+    def _check_and_handle_crossing(self, track_id: int, detection: Detection, frame_width: int, current_time: float, frame=None, frame_height: int = 480):
         """Check for crossing and handle API calls if crossing detected."""
         tracker = self.trackers[track_id]
 
@@ -1372,7 +1405,8 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             self.doorway_config['doorway_center'],
             self.doorway_config['doorway_width'],
             self.doorway_config['danger_zone_buffer'],  # METHOD 5: pass danger zone buffer
-            min_transit_frames=self.doorway_config.get('velocity_min_transit_frames', 1)
+            min_transit_frames=self.doorway_config.get('velocity_min_transit_frames', 1),
+            frame_height=frame_height
         )
 
         # METHOD 5: Create checkpoint when tracker enters danger zone
@@ -1588,7 +1622,7 @@ class PeopleCounterProcessor(BaseStreamProcessor):
 
         return best_match_id
 
-    def _find_best_reid_match(self, detection: Detection, max_distance: float = 200) -> Optional[int]:
+    def _find_best_reid_match(self, detection: Detection, max_distance: float = 200, frame_width: int = 640) -> Optional[int]:
         """
         Find the best ReID match for a detection among lost/stale trackers.
         Used when ByteTrack loses a track (e.g., during occlusion in groups).
@@ -1619,7 +1653,20 @@ class PeopleCounterProcessor(BaseStreamProcessor):
                     (detection.center[0] - last_pos[0])**2 +
                     (detection.center[1] - last_pos[1])**2
                 )
-                if dist > max_distance:
+
+                # Scale max distance by time gap and velocity
+                if tracker.last_real_time is not None:
+                    time_gap = time.time() - tracker.last_real_time
+                else:
+                    time_gap = tracker.time_since_update()
+
+                vx, vy = tracker.get_smooth_velocity()
+                speed = math.sqrt(vx**2 + vy**2) if (vx or vy) else 0
+                effective_max = max_distance + speed * time_gap
+                # Cap at 60% of frame width to prevent cross-frame matches
+                effective_max = min(effective_max, 0.6 * frame_width)
+
+                if dist > effective_max:
                     continue
 
             # Calculate appearance similarity
@@ -1653,7 +1700,7 @@ class PeopleCounterProcessor(BaseStreamProcessor):
                 if detection.is_predicted and detection.track_id in self.trackers:
                     self.trackers[detection.track_id].update(detection)
                     matched_trackers.add(detection.track_id)
-                    self._check_and_handle_crossing(detection.track_id, detection, width, current_time, frame)
+                    self._check_and_handle_crossing(detection.track_id, detection, width, current_time, frame, frame_height=height)
             # Skip all remaining phases — no real detections to match
             # Still need to clean up stale trackers (fall through to cleanup below)
             unmatched_detections = []
@@ -1670,7 +1717,7 @@ class PeopleCounterProcessor(BaseStreamProcessor):
                     matched_trackers.add(track_id)
 
                     # Check for crossing with trajectory validation
-                    self._check_and_handle_crossing(track_id, detection, width, current_time, frame)
+                    self._check_and_handle_crossing(track_id, detection, width, current_time, frame, frame_height=height)
                 else:
                     # No ByteTrack match - will need ReID
                     unmatched_detections.append(detection)
@@ -1730,16 +1777,16 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             if track_id is not None:
                 self.trackers[track_id].update(detection)
                 matched_trackers.add(track_id)
-                self._check_and_handle_crossing(track_id, detection, width, current_time, frame)
+                self._check_and_handle_crossing(track_id, detection, width, current_time, frame, frame_height=height)
             else:
                 # Try ReID recovery for lost tracks
                 if self.doorway_config['use_reid']:
-                    reid_match = self._find_best_reid_match(detection)
+                    reid_match = self._find_best_reid_match(detection, frame_width=width)
                     if reid_match is not None:
                         self.trackers[reid_match].update(detection)
                         matched_trackers.add(reid_match)
                         self.logger.debug(f"ReID recovered track #{reid_match}")
-                        self._check_and_handle_crossing(reid_match, detection, width, current_time, frame)
+                        self._check_and_handle_crossing(reid_match, detection, width, current_time, frame, frame_height=height)
                         continue
                 still_unmatched.append(detection)
 
@@ -1947,7 +1994,8 @@ class PeopleCounterProcessor(BaseStreamProcessor):
                         self.doorway_config['doorway_center'],
                         self.doorway_config['doorway_width'],
                         self.doorway_config['danger_zone_buffer'],  # METHOD 5: pass danger zone buffer
-                        min_transit_frames=self.doorway_config.get('velocity_min_transit_frames', 1)
+                        min_transit_frames=self.doorway_config.get('velocity_min_transit_frames', 1),
+                        frame_height=height
                     )
 
                     # Restore original positions

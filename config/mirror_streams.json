@@ -16,5 +16,17 @@
         "device_id": "I8739",
         "prod_rtsp_host": "127.0.0.1",
         "prod_rtsp_port": 8554
+    },
+    "mirror-R8100": {
+        "source_stream": "R8100",
+        "device_id": "R8100",
+        "prod_rtsp_host": "127.0.0.1",
+        "prod_rtsp_port": 8554
+    },
+    "mirror-Q6992": {
+        "source_stream": "Q6992",
+        "device_id": "Q6992",
+        "prod_rtsp_host": "127.0.0.1",
+        "prod_rtsp_port": 8554
     }
 }
