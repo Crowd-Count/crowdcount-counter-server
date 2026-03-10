@@ -316,6 +316,96 @@ body {
     color: var(--error);
 }
 
+/* Stream Summary (status bar) */
+.stream-summary {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 14px;
+    font-weight: 600;
+}
+
+.summary-online {
+    color: var(--success);
+}
+
+.summary-sep,
+.summary-total {
+    color: var(--text-secondary);
+}
+
+/* Offline Card */
+.stream-card.offline {
+    opacity: 0.5;
+}
+
+.stream-card.offline:hover {
+    opacity: 0.65;
+    border-color: var(--border);
+    transform: none;
+}
+
+/* Status Indicator (dot + label column) */
+.status-indicator {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 4px;
+}
+
+.status-dot.offline {
+    background: var(--error);
+    box-shadow: 0 0 6px rgba(239, 68, 68, 0.4);
+}
+
+.offline-label {
+    font-size: 10px;
+    color: var(--error);
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+/* Mirror Badge */
+.mirror-badge {
+    font-size: 10px;
+    color: #22d3ee;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+/* Last Seen */
+.last-seen {
+    font-size: 12px;
+    color: var(--text-secondary);
+    margin-bottom: 12px;
+}
+
+/* Card FPS */
+.card-fps {
+    font-size: 12px;
+    font-family: 'SF Mono', Monaco, 'Cascadia Code', monospace;
+    color: var(--text-secondary);
+    margin-bottom: 12px;
+}
+
+/* Disabled Button */
+.btn-disabled {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    padding: 12px 24px;
+    font-size: 14px;
+    font-weight: 500;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--bg-secondary);
+    color: var(--text-secondary);
+    cursor: not-allowed;
+}
+
 /* Responsive */
 @media (max-width: 768px) {
     .app {

@@ -20,6 +20,7 @@
                 <div class="server-info" id="serverInfo">
                     <span class="loading-dot"></span> Connecting...
                 </div>
+                <div class="stream-summary" id="streamSummary"></div>
                 <div class="refresh-info">
                     <button class="btn-icon" onclick="refreshStreams()" title="Refresh">
                         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -44,7 +45,7 @@
     </div>
 
     <script>
-        let streams = [];
+        let devices = [];
         let refreshInterval;
         let countdownInterval;
         let countdown = 10;
@@ -71,10 +72,11 @@
 
         async function loadStreams() {
             try {
-                const response = await fetch('/status');
+                const response = await fetch('/api/dashboard');
                 const data = await response.json();
-                streams = data.active_streams || [];
-                renderStreams(data);
+                devices = data.devices || [];
+                renderSummary(data.online_count || 0, data.total_count || 0);
+                renderDevices();
             } catch (error) {
                 document.getElementById('streamsContainer').innerHTML = `
                     <div class="error-state">
@@ -85,18 +87,46 @@
             }
         }
 
-        function renderStreams(statusData) {
+        function renderSummary(online, total) {
+            const el = document.getElementById('streamSummary');
+            if (total === 0) {
+                el.innerHTML = '';
+                return;
+            }
+            el.innerHTML = `
+                <span class="summary-online">${online} online</span>
+                <span class="summary-sep">/</span>
+                <span class="summary-total">${total} total</span>
+            `;
+        }
+
+        function formatTimeAgo(dateStr) {
+            if (!dateStr) return '';
+            const then = new Date(dateStr);
+            const now = new Date();
+            const diffMs = now - then;
+            const diffS = Math.floor(diffMs / 1000);
+            if (diffS < 60) return diffS + 's ago';
+            const diffM = Math.floor(diffS / 60);
+            if (diffM < 60) return diffM + 'm ago';
+            const diffH = Math.floor(diffM / 60);
+            if (diffH < 24) return diffH + 'h ago';
+            const diffD = Math.floor(diffH / 24);
+            return diffD + 'd ago';
+        }
+
+        function renderDevices() {
             const container = document.getElementById('streamsContainer');
 
-            if (!streams || streams.length === 0) {
+            if (!devices || devices.length === 0) {
                 container.innerHTML = `
                     <div class="empty-state">
                         <svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
                             <rect x="2" y="3" width="20" height="14" rx="2"/>
                             <path d="M8 21h8M12 17v4"/>
                         </svg>
-                        <h2>No Active Streams</h2>
-                        <p>Streams will appear here when cameras connect</p>
+                        <h2>No Devices Registered</h2>
+                        <p>Devices will appear here when they register</p>
                     </div>
                 `;
                 return;
@@ -104,39 +134,77 @@
 
             container.innerHTML = `
                 <div class="streams-grid">
-                    ${streams.map(streamName => renderStreamCard(streamName, statusData)).join('')}
+                    ${devices.map(device => renderDeviceCard(device)).join('')}
                 </div>
             `;
         }
 
-        function renderStreamCard(streamName, statusData) {
-            const deviceInfo = statusData.device_info?.[streamName] || {};
-            const deviceId = deviceInfo.device_id || streamName;
+        function renderDeviceCard(device) {
+            const isActive = device.is_active;
+            const displayName = device.location_name || device.device_id;
+            const subtitle = device.location_name ? device.device_id : (device.stream_name || '');
+            const cardClass = isActive ? 'stream-card' : 'stream-card offline';
 
-            return `
-                <div class="stream-card">
-                    <div class="stream-header">
-                        <div class="stream-icon">
-                            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                                <path d="M23 7l-7 5 7 5V7z"/>
-                                <rect x="1" y="5" width="15" height="14" rx="2"/>
+            if (isActive) {
+                const fpsText = device.input_fps > 0 ? device.input_fps.toFixed(1) + ' FPS' : '';
+                return `
+                    <div class="${cardClass}">
+                        <div class="stream-header">
+                            <div class="stream-icon">
+                                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <path d="M23 7l-7 5 7 5V7z"/>
+                                    <rect x="1" y="5" width="15" height="14" rx="2"/>
+                                </svg>
+                            </div>
+                            <div class="stream-info">
+                                <h3 class="stream-name">${displayName}</h3>
+                                <span class="stream-id">${subtitle}</span>
+                            </div>
+                            <div class="status-indicator">
+                                <span class="status-dot active"></span>
+                            </div>
+                        </div>
+                        ${fpsText ? `<div class="card-fps">${fpsText}</div>` : ''}
+                        <button class="btn btn-primary btn-block" onclick="viewStream('${device.stream_name}')">
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <circle cx="12" cy="12" r="10"/>
+                                <polygon points="10,8 16,12 10,16" fill="currentColor"/>
                             </svg>
-                        </div>
-                        <div class="stream-info">
-                            <h3 class="stream-name">${deviceId}</h3>
-                            <span class="stream-id">${streamName}</span>
-                        </div>
-                        <span class="status-dot active"></span>
+                            View Stream
+                        </button>
                     </div>
-                    <button class="btn btn-primary btn-block" onclick="viewStream('${streamName}')">
-                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                            <circle cx="12" cy="12" r="10"/>
-                            <polygon points="10,8 16,12 10,16" fill="currentColor"/>
-                        </svg>
-                        View Stream
-                    </button>
-                </div>
-            `;
+                `;
+            } else {
+                const lastSeen = device.last_seen ? formatTimeAgo(device.last_seen) : '';
+                return `
+                    <div class="${cardClass}">
+                        <div class="stream-header">
+                            <div class="stream-icon">
+                                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <path d="M23 7l-7 5 7 5V7z"/>
+                                    <rect x="1" y="5" width="15" height="14" rx="2"/>
+                                </svg>
+                            </div>
+                            <div class="stream-info">
+                                <h3 class="stream-name">${displayName}</h3>
+                                <span class="stream-id">${subtitle}</span>
+                            </div>
+                            <div class="status-indicator">
+                                <span class="status-dot offline"></span>
+                                <span class="offline-label">Offline</span>
+                            </div>
+                        </div>
+                        ${lastSeen ? `<div class="last-seen">Last seen: ${lastSeen}</div>` : ''}
+                        <button class="btn btn-disabled btn-block" disabled>
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <circle cx="12" cy="12" r="10"/>
+                                <polygon points="10,8 16,12 10,16" fill="currentColor"/>
+                            </svg>
+                            View Stream
+                        </button>
+                    </div>
+                `;
+            }
         }
 
         function viewStream(streamName) {
