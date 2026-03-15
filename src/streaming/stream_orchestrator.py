@@ -1749,7 +1749,7 @@ class StreamOrchestrator:
 
         # Get model paths from the processor class defaults
         models_dir = Path(__file__).parent.parent.parent / "models"
-        model_path = str(models_dir / "crowdcount-v5_1.pt")
+        model_path = str(models_dir / "crowdcount-v6.pt")
         reid_model_name = "osnet_x0_25"  # Default ReID model
 
         self.logger.info(f"Starting {num_gpus} inference server(s)...")
@@ -1879,7 +1879,7 @@ class StreamOrchestrator:
 
         # Get model paths
         models_dir = Path(__file__).parent.parent.parent / "models"
-        model_path = str(models_dir / "crowdcount-v5_1.pt")
+        model_path = str(models_dir / "crowdcount-v6.pt")
         reid_model_name = "osnet_x0_25"
 
         # Create new heartbeat for the restarted server

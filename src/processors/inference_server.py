@@ -421,17 +421,21 @@ class InferenceServer:
                     elapsed = now - self.start_time
                     rps = self.requests_processed / elapsed if elapsed > 0 else 0
                     queue_size = self.request_queue.qsize() if hasattr(self.request_queue, 'qsize') else -1
-                    self.logger.info(
-                        f"Stats: {self.requests_processed} requests | "
+                    stats_msg = (
+                        f"InferenceServer-GPU{self.gpu_id}: Stats: {self.requests_processed} requests | "
                         f"{rps:.1f} req/s | queue depth: {queue_size} | "
                         f"last batch: {len(batch)}"
                     )
+                    self.logger.info(stats_msg)
+                    print(stats_msg, flush=True)
                     last_stats_time = now
 
                 # Periodic registration summary (every 60s)
                 if now - last_registration_log_time >= 60.0:
-                    registered = list(self.camera_to_slot.keys())
-                    self.logger.info(f"Registered cameras ({len(registered)}): {registered}")
+                    slot_mappings = dict(self.camera_to_slot)
+                    reg_msg = f"InferenceServer-GPU{self.gpu_id}: Registered cameras ({len(slot_mappings)}): {slot_mappings}"
+                    self.logger.info(reg_msg)
+                    print(reg_msg, flush=True)
                     last_registration_log_time = now
 
             except Exception as e:
@@ -491,6 +495,10 @@ class InferenceServer:
 
             # Validate camera is registered
             slot_name = self.camera_to_slot.get(request.camera_id)
+            if request.slot_name and request.slot_name != slot_name:
+                msg = f"SLOT MISMATCH: {request.camera_id} processor uses {request.slot_name} but server mapped to {slot_name}"
+                self.logger.error(msg)
+                print(msg, flush=True)
             if slot_name is None:
                 self._send_unregistered_error(request)
                 continue
@@ -618,7 +626,8 @@ class InferenceServer:
                     try:
                         result_queue.put_nowait(response)
                     except Exception as e:
-                        self.logger.error(f"Failed to deliver result for {request.camera_id}: {e}")
+                        self.logger.error(f"Failed to deliver result for {request.camera_id} (slot {slot_name}): {e}")
+                        print(f"InferenceServer-GPU{self.gpu_id}: DELIVERY FAILED {request.camera_id} slot={slot_name}: {e}", flush=True)
 
         except Exception as e:
             self.logger.error(f"Batch detection error: {e}")
