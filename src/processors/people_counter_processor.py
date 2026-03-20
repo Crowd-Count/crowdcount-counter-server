@@ -1713,8 +1713,28 @@ class PeopleCounterProcessor(BaseStreamProcessor):
                 # Quick check: does ByteTrack ID match an existing tracker?
                 if detection.track_id is not None and detection.track_id in self.trackers:
                     track_id = detection.track_id
+                    tracker = self.trackers[track_id]
+                    # Detect ByteTrack ID switch: if the detection is far from where
+                    # the tracker's velocity predicts it should be, this ID was likely
+                    # reassigned to a different person
+                    if tracker.positions:
+                        predicted = tracker.get_predicted_position(current_time)
+                        distance = abs(detection.center[0] - predicted[0])
+                        max_dist = self.doorway_config['max_tracking_distance'] * width
+                        if distance > max_dist:
+                            tracker.previous_zone = None
+                            tracker.current_zone = None
+                            tracker.danger_zone_frame_count = 0
+                            tracker.last_side = None
+                            tracker.current_side = None
+                            tracker.checkpoint = None
+                            tracker.search_active = False
+                            self.logger.debug(
+                                f"ByteTrack ID switch detected: track #{track_id} "
+                                f"jumped {distance/width*100:.1f}% from predicted pos, "
+                                f"resetting state")
                     # Update existing tracker
-                    self.trackers[track_id].update(detection)
+                    tracker.update(detection)
                     matched_trackers.add(track_id)
 
                     # Check for crossing with trajectory validation
@@ -1784,7 +1804,23 @@ class PeopleCounterProcessor(BaseStreamProcessor):
                 if self.doorway_config['use_reid']:
                     reid_match = self._find_best_reid_match(detection, frame_width=width)
                     if reid_match is not None:
-                        self.trackers[reid_match].update(detection)
+                        tracker = self.trackers[reid_match]
+                        # Detect position jump from ReID recovery
+                        if tracker.positions:
+                            predicted = tracker.get_predicted_position(current_time)
+                            distance = abs(detection.center[0] - predicted[0])
+                            max_dist = self.doorway_config['max_tracking_distance'] * width
+                            if distance > max_dist:
+                                # Significant jump from predicted position — reset zone state
+                                # to prevent the jump from being misinterpreted as a crossing
+                                tracker.previous_zone = None
+                                tracker.current_zone = None
+                                tracker.danger_zone_frame_count = 0
+                                tracker.last_side = None
+                                tracker.current_side = None
+                                tracker.checkpoint = None
+                                tracker.search_active = False
+                        tracker.update(detection)
                         matched_trackers.add(reid_match)
                         self.logger.debug(f"ReID recovered track #{reid_match}")
                         self._check_and_handle_crossing(reid_match, detection, width, current_time, frame, frame_height=height)
@@ -1835,57 +1871,19 @@ class PeopleCounterProcessor(BaseStreamProcessor):
                         checkpoint = recovered_cp['checkpoint']
                         tracker = self.trackers[new_id]
 
-                        # Determine which zone the person is currently in
-                        det_x = detection.center[0]
-                        current_zone = tracker._determine_zone(
-                            det_x, width,
-                            self.doorway_config['doorway_center'],
-                            self.doorway_config.get('danger_zone_buffer', 0.10))
-
-                        if current_zone in (DangerZone.LEFT_ZONE, DangerZone.RIGHT_ZONE):
-                            exit_side = 'left' if current_zone == DangerZone.LEFT_ZONE else 'right'
-
-                            if checkpoint.entry_side != exit_side:
-                                # Person entered from one side, now on the other — count crossing directly
-                                crossing_dir = (CrossingDirection.LEFT_TO_RIGHT
-                                               if checkpoint.entry_side == 'left'
-                                               else CrossingDirection.RIGHT_TO_LEFT)
-                                self.crossings[crossing_dir] += 1
-
-                                if self.direction_flipped:
-                                    api_method = (self.api_client.subtract_from_count
-                                                 if crossing_dir == CrossingDirection.LEFT_TO_RIGHT
-                                                 else self.api_client.add_to_count)
-                                else:
-                                    api_method = (self.api_client.add_to_count
-                                                 if crossing_dir == CrossingDirection.LEFT_TO_RIGHT
-                                                 else self.api_client.subtract_from_count)
-                                threading.Thread(target=api_method, args=(1,),
-                                                 kwargs={'crossing_timestamp': current_time}, daemon=True).start()
-
-                                tracker.last_crossing_time = current_time
-                                tracker.last_side = exit_side
-                                tracker.total_crossings += 1
-
-                                total = sum(self.crossings.values())
-                                self.logger.info(
-                                    f"CHECKPOINT CROSSING #{total}: {crossing_dir.value} | "
-                                    f"Track #{new_id} recovered from #{best_cp_id} "
-                                    f"(similarity={best_cp_sim:.2f}, entry_side={checkpoint.entry_side})")
-                            else:
-                                # Same side as entry — no crossing occurred
-                                tracker.last_side = exit_side
-                                self.logger.info(
-                                    f"Checkpoint recovered (same side): track #{new_id} from #{best_cp_id} "
-                                    f"(similarity={best_cp_sim:.2f}, side={exit_side})")
-                        else:
-                            # Still in danger zone — transfer checkpoint for zone-transition detection
-                            tracker.checkpoint = checkpoint
-                            tracker.search_active = True
-                            tracker.checkpoint_is_recovered = True
-                            self.logger.info(
-                                f"Checkpoint transferred: track #{new_id} from #{best_cp_id} "
-                                f"(similarity={best_cp_sim:.2f}, entry_side={checkpoint.entry_side})")
+                        # Transfer checkpoint to new tracker — let zone-transition logic
+                        # validate the crossing over multiple frames instead of counting
+                        # from a single detection (prevents noise-triggered false crossings)
+                        tracker.checkpoint = checkpoint
+                        tracker.search_active = True
+                        tracker.checkpoint_is_recovered = True
+                        # Set last_side to entry_side so zone-transition can detect the crossing
+                        # when the tracker is confirmed on the exit side
+                        if checkpoint.entry_side:
+                            tracker.last_side = checkpoint.entry_side
+                        self.logger.info(
+                            f"Checkpoint transferred: track #{new_id} from #{best_cp_id} "
+                            f"(similarity={best_cp_sim:.2f}, entry_side={checkpoint.entry_side})")
 
         # Preemptive checkpoint creation for overlapping trackers.
         # In group crossings, by the time someone enters the danger zone they may
@@ -2091,7 +2089,8 @@ class PeopleCounterProcessor(BaseStreamProcessor):
                 # Save checkpoint from expiring tracker for cross-track recovery
                 # Don't save recovered checkpoints back — prevents recycling loop
                 # where fragmented tracks endlessly pass the same checkpoint around
-                if (tracker.checkpoint and not getattr(tracker, 'checkpoint_is_recovered', False)):
+                if (tracker.checkpoint and not getattr(tracker, 'checkpoint_is_recovered', False)
+                        and tracker.last_crossing_time < tracker.checkpoint.entry_time):
                     save_embedding = (tracker.mean_appearance.copy() if tracker.mean_appearance is not None
                                       else tracker.checkpoint.embedding.copy())
                     embedding_source = 'mean_appearance' if tracker.mean_appearance is not None else 'checkpoint'
@@ -2199,6 +2198,9 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             for i in range(1, len(positions)):
                 pt1 = (int(positions[i-1][0]), int(positions[i-1][1]))
                 pt2 = (int(positions[i][0]), int(positions[i][1]))
+                # Skip zigzag segments from ID switches
+                if abs(positions[i][0] - positions[i-1][0]) > self.doorway_config['max_tracking_distance'] * width:
+                    continue
                 thickness = max(1, int(3 * (i / len(positions))))
                 cv2.line(vis_frame, pt1, pt2, track_color, thickness)
 
