@@ -1030,6 +1030,23 @@ class PeopleCounterProcessor(BaseStreamProcessor):
         else:
             return 60.0
 
+    def _wait_for_response(self, request_id, timeout=5.0):
+        """Wait for a response matching a specific request_id, discarding mismatched ones.
+
+        Eliminates the drain-before-request race condition by using correlation IDs.
+        Stale or mismatched responses are silently discarded.
+        """
+        deadline = time.time() + timeout
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                raise queue_module.Empty()
+            response = self.inference_result_queue.get(timeout=remaining)
+            resp_id = getattr(response, 'request_id', None)
+            if resp_id is None or resp_id == request_id:
+                return response
+            # Stale/mismatched — discard and keep waiting
+
     def _extract_detections_centralized(self, frame) -> List[Detection]:
         """Extract detections via centralized inference server + local ByteTrack."""
         detections = []
@@ -1038,19 +1055,16 @@ class PeopleCounterProcessor(BaseStreamProcessor):
         # to avoid wasting time on get() timeout while allowing recovery
         if self._centralized_inference_failures >= 5:
             now = time.time()
+            # Always drain during backoff to prevent result queue buildup
+            # from orphaned responses the server is still sending
+            try:
+                while True:
+                    self.inference_result_queue.get_nowait()
+            except queue_module.Empty:
+                pass
             retry_interval = self._get_inference_retry_interval()
             if now - self._last_inference_retry_time < retry_interval:
                 return detections  # Still in backoff window
-            # Drain stale results so retry reads a fresh response
-            drained = 0
-            while True:
-                try:
-                    self.inference_result_queue.get_nowait()
-                    drained += 1
-                except queue_module.Empty:
-                    break
-            if drained > 0:
-                self.logger.info(f"Drained {drained} stale inference results before retry")
             self._last_inference_retry_time = now
             self.logger.info(f"Inference backoff: attempting periodic retry (interval: {retry_interval:.0f}s)")
             # Self-healing: re-send REGISTER in case inference server lost our mapping
@@ -1085,15 +1099,16 @@ class PeopleCounterProcessor(BaseStreamProcessor):
                 self._centralized_inference_failures += 1
                 return detections
 
-            # Wait for response from inference server
-            response = self.inference_result_queue.get(timeout=5.0)
+            # Wait for correlated response (discards stale/mismatched responses)
+            response = self._wait_for_response(request.request_id, timeout=5.0)
 
-            # Success - reset failure counter
-            if self._centralized_inference_failures > 0:
-                self.logger.info(
-                    f"Inference recovered after {self._centralized_inference_failures} consecutive failures"
-                )
-            self._centralized_inference_failures = 0
+            # Only reset failure counter on genuine success (not error/stale responses)
+            if not response.error:
+                if self._centralized_inference_failures > 0:
+                    self.logger.info(
+                        f"Inference recovered after {self._centralized_inference_failures} consecutive failures"
+                    )
+                self._centralized_inference_failures = 0
 
             if response.error:
                 self.logger.warning(f"Inference server error: {response.error}")
@@ -1332,19 +1347,15 @@ class PeopleCounterProcessor(BaseStreamProcessor):
         # Share failure counter with detection — both use the same inference server
         if self._centralized_inference_failures >= 5:
             now = time.time()
+            # Always drain during backoff to prevent result queue buildup
+            try:
+                while True:
+                    self.inference_result_queue.get_nowait()
+            except queue_module.Empty:
+                pass
             retry_interval = self._get_inference_retry_interval()
             if now - self._last_inference_retry_time < retry_interval:
                 return [None] * len(boxes)
-            # Drain stale results so retry reads a fresh response
-            drained = 0
-            while True:
-                try:
-                    self.inference_result_queue.get_nowait()
-                    drained += 1
-                except queue_module.Empty:
-                    break
-            if drained > 0:
-                self.logger.info(f"Drained {drained} stale inference results before ReID retry")
             self._last_inference_retry_time = now
 
         try:
@@ -1364,14 +1375,16 @@ class PeopleCounterProcessor(BaseStreamProcessor):
                 self._centralized_inference_failures += 1
                 return [None] * len(boxes)
 
-            response = self.inference_result_queue.get(timeout=5.0)
+            # Wait for correlated response (discards stale/mismatched responses)
+            response = self._wait_for_response(request.request_id, timeout=5.0)
 
-            # Success - reset failure counter
-            if self._centralized_inference_failures > 0:
-                self.logger.info(
-                    f"Inference recovered after {self._centralized_inference_failures} consecutive failures"
-                )
-            self._centralized_inference_failures = 0
+            # Only reset failure counter on genuine success (not error/stale responses)
+            if not response.error:
+                if self._centralized_inference_failures > 0:
+                    self.logger.info(
+                        f"Inference recovered after {self._centralized_inference_failures} consecutive failures"
+                    )
+                self._centralized_inference_failures = 0
 
             if response.error:
                 self.logger.warning(f"ReID server error: {response.error}")
@@ -1743,16 +1756,17 @@ class PeopleCounterProcessor(BaseStreamProcessor):
                     # No ByteTrack match - will need ReID
                     unmatched_detections.append(detection)
 
-        # PHASE 1.5: Extract ReID for matched trackers near danger zone
-        # Phase 1 matched trackers never get appearance features, which breaks
-        # checkpoint save and ReID recovery. Extract for danger zone trackers.
+        # PHASE 1.5 + PHASE 2 COMBINED: Extract ReID features in ONE batch call.
+        # Phase 1.5 covers matched trackers near danger zone (need appearance for
+        # checkpoint save/recovery). Phase 2 covers unmatched detections (need
+        # features for ReID matching). Merging into one call halves inference latency.
         reid_available = (
             self.doorway_config['use_reid'] and
             (self.reid_extractor is not None or self.use_centralized_inference)
         )
+        phase1_reid_trackers = []
+        phase1_reid_boxes = []
         if matched_trackers and reid_available:
-            phase1_reid_trackers = []
-            phase1_reid_boxes = []
             for track_id in matched_trackers:
                 tracker = self.trackers[track_id]
                 if (tracker.in_danger_zone or tracker.checkpoint is not None) and \
@@ -1762,32 +1776,30 @@ class PeopleCounterProcessor(BaseStreamProcessor):
                         x, y, w, h = det.bbox
                         phase1_reid_trackers.append(track_id)
                         phase1_reid_boxes.append((x, y, x + w, y + h))
-            if phase1_reid_boxes:
-                if self.use_centralized_inference:
-                    phase1_features = self._extract_appearance_batch_centralized(frame, phase1_reid_boxes)
-                else:
-                    phase1_features = self.reid_extractor.extract_batch(frame, phase1_reid_boxes)
-                for i, track_id in enumerate(phase1_reid_trackers):
-                    if phase1_features[i] is not None:
-                        self.trackers[track_id].update_appearance(phase1_features[i])
 
-        # PHASE 2: Extract ReID features ONLY for unmatched detections (performance optimization)
+        phase2_reid_boxes = []
         if unmatched_detections and reid_available:
-            # Collect bounding boxes for batch extraction
-            reid_boxes = []
             for det in unmatched_detections:
                 x, y, w, h = det.bbox
-                reid_boxes.append((x, y, x + w, y + h))
+                phase2_reid_boxes.append((x, y, x + w, y + h))
 
-            # Extract features via centralized server or local GPU
+        # ONE combined batch call for both phases
+        combined_boxes = phase1_reid_boxes + phase2_reid_boxes
+        if combined_boxes and reid_available:
             if self.use_centralized_inference:
-                features_list = self._extract_appearance_batch_centralized(frame, reid_boxes)
+                combined_features = self._extract_appearance_batch_centralized(frame, combined_boxes)
             else:
-                features_list = self.reid_extractor.extract_batch(frame, reid_boxes)
+                combined_features = self.reid_extractor.extract_batch(frame, combined_boxes)
 
-            # Assign features to detections
+            # Distribute Phase 1.5 results
+            n_phase1 = len(phase1_reid_boxes)
+            for i, track_id in enumerate(phase1_reid_trackers):
+                if combined_features[i] is not None:
+                    self.trackers[track_id].update_appearance(combined_features[i])
+
+            # Distribute Phase 2 results
             for i, det in enumerate(unmatched_detections):
-                det.appearance_features = features_list[i]
+                det.appearance_features = combined_features[n_phase1 + i]
 
         # PHASE 3: Try to match unmatched detections using ReID + position
         still_unmatched = []
@@ -1889,9 +1901,13 @@ class PeopleCounterProcessor(BaseStreamProcessor):
         # In group crossings, by the time someone enters the danger zone they may
         # already be occluded. Create checkpoints early when bboxes overlap so
         # checkpoint recovery can kick in if the track is lost.
+        # Uses ONE batched REID call instead of individual calls per tracker.
         if frame is not None and self.doorway_config['use_reid'] and (self.reid_extractor is not None or self.use_centralized_inference):
             tracker_items = [(tid, t) for tid, t in self.trackers.items()
                              if t.detections and t.checkpoint is None]
+            # First pass: identify all trackers that need preemptive checkpoints
+            preemptive_tids = set()
+            preemptive_overlaps = {}  # tid -> partner tid for logging
             for i in range(len(tracker_items)):
                 tid_a, tr_a = tracker_items[i]
                 bbox_a = tr_a.detections[-1].bbox
@@ -1900,44 +1916,61 @@ class PeopleCounterProcessor(BaseStreamProcessor):
                     bbox_b = tr_b.detections[-1].bbox
                     iou = self._calculate_bbox_iou(bbox_a, bbox_b)
                     if iou > 0.15:
-                        # Create preemptive checkpoints for both overlapping trackers
-                        for tid, tr in [(tid_a, tr_a), (tid_b, tr_b)]:
-                            if tr.checkpoint is not None:
-                                continue  # Other tracker in the pair may have just gotten one
-                            det = tr.detections[-1]
-                            x, y, w, h = det.bbox
-                            embedding = self._extract_appearance_features(frame, x, y, x + w, y + h)
-                            if embedding is not None:
-                                # Use current_zone for entry_side since we may not have
-                                # entered the danger zone yet (no previous_zone transition)
-                                zone = tr.current_zone
-                                if zone in (DangerZone.LEFT_ZONE, DangerZone.RIGHT_ZONE):
-                                    entry_side = 'left' if zone == DangerZone.LEFT_ZONE else 'right'
-                                elif zone == DangerZone.DANGER_ZONE:
-                                    # Already in danger zone — use velocity to infer entry side
-                                    vx, _ = tr.get_smooth_velocity()
-                                    entry_side = 'left' if vx > 0 else 'right'
-                                else:
-                                    # Zone unknown — use position relative to center
-                                    entry_side = 'left' if det.center[0] < width / 2 else 'right'
-                                vx, _ = tr.get_smooth_velocity()
-                                expected_exit = 'right' if vx > 0 else 'left' if vx < 0 else (
-                                    'right' if entry_side == 'left' else 'left')
-                                tr.checkpoint = ReIDCheckpoint(
-                                    embedding=embedding,
-                                    entry_side=entry_side,
-                                    entry_time=time.time(),
-                                    entry_position=det.center,
-                                    expected_exit_side=expected_exit,
-                                    confidence=det.confidence,
-                                    velocity_x=vx
-                                )
-                                tr.search_active = True
-                                if tr.mean_appearance is None:
-                                    tr.update_appearance(embedding)
-                                self.logger.debug(
-                                    f"Preemptive checkpoint: track #{tid} overlaps #{tid_a if tid == tid_b else tid_b} "
-                                    f"(IoU={iou:.2f}, entry_side={entry_side})")
+                        if tid_a not in preemptive_tids:
+                            preemptive_tids.add(tid_a)
+                            preemptive_overlaps[tid_a] = (tid_b, iou)
+                        if tid_b not in preemptive_tids:
+                            preemptive_tids.add(tid_b)
+                            preemptive_overlaps[tid_b] = (tid_a, iou)
+
+            # Batch extract ReID features for all overlapping trackers at once
+            if preemptive_tids:
+                preemptive_list = [(tid, self.trackers[tid]) for tid in preemptive_tids
+                                   if tid in self.trackers and self.trackers[tid].checkpoint is None]
+                preemptive_boxes = []
+                for tid, tr in preemptive_list:
+                    det = tr.detections[-1]
+                    x, y, w, h = det.bbox
+                    preemptive_boxes.append((x, y, x + w, y + h))
+
+                if preemptive_boxes:
+                    if self.use_centralized_inference:
+                        preemptive_features = self._extract_appearance_batch_centralized(frame, preemptive_boxes)
+                    else:
+                        preemptive_features = self.reid_extractor.extract_batch(frame, preemptive_boxes)
+
+                    for idx, (tid, tr) in enumerate(preemptive_list):
+                        embedding = preemptive_features[idx]
+                        if embedding is None or tr.checkpoint is not None:
+                            continue
+                        det = tr.detections[-1]
+                        zone = tr.current_zone
+                        if zone in (DangerZone.LEFT_ZONE, DangerZone.RIGHT_ZONE):
+                            entry_side = 'left' if zone == DangerZone.LEFT_ZONE else 'right'
+                        elif zone == DangerZone.DANGER_ZONE:
+                            vx, _ = tr.get_smooth_velocity()
+                            entry_side = 'left' if vx > 0 else 'right'
+                        else:
+                            entry_side = 'left' if det.center[0] < width / 2 else 'right'
+                        vx, _ = tr.get_smooth_velocity()
+                        expected_exit = 'right' if vx > 0 else 'left' if vx < 0 else (
+                            'right' if entry_side == 'left' else 'left')
+                        tr.checkpoint = ReIDCheckpoint(
+                            embedding=embedding,
+                            entry_side=entry_side,
+                            entry_time=time.time(),
+                            entry_position=det.center,
+                            expected_exit_side=expected_exit,
+                            confidence=det.confidence,
+                            velocity_x=vx
+                        )
+                        tr.search_active = True
+                        if tr.mean_appearance is None:
+                            tr.update_appearance(embedding)
+                        partner_tid, iou = preemptive_overlaps.get(tid, (None, 0))
+                        self.logger.debug(
+                            f"Preemptive checkpoint: track #{tid} overlaps #{partner_tid} "
+                            f"(IoU={iou:.2f}, entry_side={entry_side})")
 
         # Check for crossings on unmatched trackers using interpolation
         # This catches crossings that may have occurred during dropped frames

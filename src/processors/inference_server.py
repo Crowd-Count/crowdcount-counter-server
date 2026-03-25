@@ -16,12 +16,16 @@ Architecture:
 import time
 import logging
 import multiprocessing
+import itertools
 import shutil
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, List, Tuple, Dict
 from enum import Enum
 from pathlib import Path
 import numpy as np
+
+# Lightweight monotonic counter for request IDs (one per process, no locking needed)
+_request_id_counter = itertools.count()
 
 # Get project root directory (crowdcount-counter-server/)
 PROJECT_ROOT = Path(__file__).parent.parent.parent
@@ -57,6 +61,10 @@ class InferenceRequest:
     boxes: Optional[List[Tuple[int, int, int, int]]] = None
     # For REGISTER requests
     slot_name: Optional[str] = None
+    # Timestamp for staleness checking
+    created_at: float = field(default_factory=time.time)
+    # Unique ID for request/response correlation
+    request_id: str = field(default_factory=lambda: str(next(_request_id_counter)))
 
 
 @dataclass
@@ -80,6 +88,8 @@ class InferenceResponse:
     features: Optional[List[Optional[np.ndarray]]] = None
     # Error info
     error: Optional[str] = None
+    # Correlation ID echoed from request
+    request_id: Optional[str] = None
 
 
 class InferenceServer:
@@ -138,6 +148,8 @@ class InferenceServer:
         # Stats
         self.requests_processed = 0
         self.start_time = None
+        self._stale_drops = 0
+        self._last_stale_log_time = 0.0
 
         # Logger
         self.logger = logging.getLogger(f"InferenceServer-GPU{gpu_id}")
@@ -333,59 +345,67 @@ class InferenceServer:
         from ultralytics import YOLO
         from .deep_reid import create_reid_extractor
 
-        self.running = True
         self.start_time = time.time()
 
-        # Set CUDA device for this process
-        device_str = f'cuda:{self.gpu_id}'
-        torch.cuda.set_device(self.gpu_id)
-        self.logger.info(f"Initializing on {device_str} ({torch.cuda.get_device_name(self.gpu_id)})")
-
-        # Resolve model path (TensorRT engine or PyTorch .pt)
-        resolved_path = self._resolve_model_path(device_str)
-        is_engine = resolved_path.endswith('.engine')
-
-        # Load YOLO model
-        self.logger.info(f"Loading YOLO model: {resolved_path}")
+        # Set CUDA device and load models — wrapped so a crash (CUDA OOM,
+        # corrupted weights) is logged immediately instead of dying silently.
         try:
+            device_str = f'cuda:{self.gpu_id}'
+            torch.cuda.set_device(self.gpu_id)
+            self.logger.info(f"Initializing on {device_str} ({torch.cuda.get_device_name(self.gpu_id)})")
+
+            # Resolve model path (TensorRT engine or PyTorch .pt)
+            resolved_path = self._resolve_model_path(device_str)
+            is_engine = resolved_path.endswith('.engine')
+
+            # Load YOLO model
+            self.logger.info(f"Loading YOLO model: {resolved_path}")
+            try:
+                if is_engine:
+                    self.model = YOLO(resolved_path, task='detect')
+                else:
+                    self.model = YOLO(resolved_path)
+                    self.model.to(device_str)
+            except Exception as e:
+                if is_engine:
+                    self.logger.error(f"TensorRT engine load failed: {e}, falling back to PyTorch")
+                    self.model = YOLO(self.model_path)
+                    self.model.to(device_str)
+                    is_engine = False
+                else:
+                    raise
+
+            backend = "TensorRT" if is_engine else "PyTorch"
             if is_engine:
-                self.model = YOLO(resolved_path, task='detect')
+                self.logger.info(f"YOLO model loaded on {device_str} (backend: {backend})")
             else:
-                self.model = YOLO(resolved_path)
-                self.model.to(device_str)
+                model_device = next(self.model.model.parameters()).device
+                self.logger.info(f"YOLO model loaded on device: {model_device} (backend: {backend})")
+
+            # Get class names
+            if hasattr(self.model, 'names'):
+                self.class_names = self.model.names
+
+            # Load ReID model
+            if self.reid_model_name:
+                self.logger.info(f"Loading ReID model: {self.reid_model_name}")
+                self.reid_extractor = create_reid_extractor(
+                    model_name=self.reid_model_name,
+                    device=device_str,
+                    verbose=True
+                )
+                self.logger.info(f"ReID model loaded (feature dim: {self.reid_extractor.feature_dim})")
         except Exception as e:
-            if is_engine:
-                self.logger.error(f"TensorRT engine load failed: {e}, falling back to PyTorch")
-                self.model = YOLO(self.model_path)
-                self.model.to(device_str)
-                is_engine = False
-            else:
-                raise
-
-        backend = "TensorRT" if is_engine else "PyTorch"
-        if is_engine:
-            self.logger.info(f"YOLO model loaded on {device_str} (backend: {backend})")
-        else:
-            model_device = next(self.model.model.parameters()).device
-            self.logger.info(f"YOLO model loaded on device: {model_device} (backend: {backend})")
-
-        # Get class names
-        if hasattr(self.model, 'names'):
-            self.class_names = self.model.names
-
-        # Load ReID model
-        if self.reid_model_name:
-            self.logger.info(f"Loading ReID model: {self.reid_model_name}")
-            self.reid_extractor = create_reid_extractor(
-                model_name=self.reid_model_name,
-                device=device_str,
-                verbose=True
-            )
-            self.logger.info(f"ReID model loaded (feature dim: {self.reid_extractor.feature_dim})")
+            self.logger.error(f"FATAL: Model loading failed — {e}")
+            import traceback
+            self.logger.error(traceback.format_exc())
+            self.running = False
+            return
 
         # Warmup model (initializes TensorRT CUDA kernels, prevents first-inference spike)
         self._warmup_model(device_str)
 
+        self.running = True
         self.logger.info(
             f"Inference server ready (batch_size={self.batch_size}, "
             f"batch_wait_ms={self.batch_wait_ms}, backend={backend}), waiting for requests..."
@@ -406,7 +426,15 @@ class InferenceServer:
 
                 if detect_batch:
                     self._process_detect_batch(detect_batch)
+
+                # DETECT priority: before processing the (potentially slow) REID
+                # batch, check if more DETECT requests have arrived. Process them
+                # first so detection latency isn't blocked by cross-camera REID.
                 if reid_batch:
+                    urgent_detect = self._collect_urgent_detects()
+                    if urgent_detect:
+                        self._process_detect_batch(urgent_detect)
+                        self.requests_processed += len(urgent_detect)
                     self._process_reid_batch(reid_batch)
 
                 self.requests_processed += len(batch)
@@ -503,6 +531,13 @@ class InferenceServer:
                 self._send_unregistered_error(request)
                 continue
 
+            # Check staleness — drop before GPU inference so the
+            # response doesn't arrive after the processor's 5s timeout.
+            age = time.time() - request.created_at
+            if age > 3.0:
+                self._handle_stale(request, slot_name, age)
+                continue
+
             batch.append((request, slot_name))
             if len(batch) == 1:
                 # Start the batch window from the first real request, not from
@@ -510,6 +545,59 @@ class InferenceServer:
                 deadline = time.time() + self.batch_wait_ms / 1000.0
 
         return batch
+
+    def _collect_urgent_detects(self):
+        """Non-blocking: drain any DETECT requests already waiting in the queue.
+
+        Called between DETECT and REID processing to ensure DETECT latency
+        isn't blocked by a slow cross-camera REID batch.  Control messages
+        (REGISTER/UNREGISTER/SHUTDOWN) are handled inline.  REID requests
+        found here are put back on the queue for the next batch cycle.
+        """
+        urgent = []
+        requeue = []
+        while len(urgent) < self.batch_size:
+            try:
+                request = self.request_queue.get_nowait()
+            except Exception:
+                break  # Queue empty
+
+            if request.type == RequestType.SHUTDOWN:
+                self.running = False
+                # Put back so main loop sees it
+                self.request_queue.put(request)
+                break
+            if request.type == RequestType.REGISTER:
+                self._handle_register(request)
+                continue
+            if request.type == RequestType.UNREGISTER:
+                self._handle_unregister(request)
+                continue
+
+            slot_name = self.camera_to_slot.get(request.camera_id)
+            if slot_name is None:
+                self._send_unregistered_error(request)
+                continue
+
+            age = time.time() - request.created_at
+            if age > 3.0:
+                self._handle_stale(request, slot_name, age)
+                continue
+
+            if request.type == RequestType.DETECT:
+                urgent.append((request, slot_name))
+            else:
+                # REID — save for next batch cycle
+                requeue.append(request)
+
+        # Put non-DETECT requests back on the queue
+        for req in requeue:
+            try:
+                self.request_queue.put_nowait(req)
+            except Exception:
+                pass  # Queue full — drop (processor will retry)
+
+        return urgent
 
     # -------------------------------------------------------------------------
     # Control message handlers
@@ -533,12 +621,32 @@ class InferenceServer:
         self.logger.info(msg)
         print(msg, flush=True)
 
+    def _handle_stale(self, request, slot_name, age):
+        """Handle a stale request — send error response and track stats."""
+        result_queue = self.result_queues.get(slot_name)
+        if result_queue:
+            try:
+                result_queue.put_nowait(InferenceResponse(
+                    type=request.type,
+                    camera_id=request.camera_id,
+                    error="stale",
+                    request_id=request.request_id,
+                ))
+            except Exception:
+                pass  # Queue full — camera will timeout anyway
+        self._stale_drops += 1
+        now = time.time()
+        if now - self._last_stale_log_time >= 10.0:
+            self.logger.warning(f"Dropped {self._stale_drops} stale requests in last 10s (latest age: {age:.1f}s)")
+            self._stale_drops = 0
+            self._last_stale_log_time = now
+
     # -------------------------------------------------------------------------
     # Error response helpers
     # -------------------------------------------------------------------------
 
     def _send_unregistered_error(self, request):
-        """Log warning for requests from unregistered cameras."""
+        """Send error response for requests from unregistered cameras."""
         msg = (
             f"InferenceServer-GPU{self.gpu_id}: DROPPED request from "
             f"{request.camera_id} (not registered). "
@@ -546,6 +654,22 @@ class InferenceServer:
         )
         self.logger.warning(msg)
         print(msg, flush=True)
+
+        # Send error response so processor doesn't block for 5s timeout.
+        # Use slot_name from the request to find the result queue.
+        slot_name = getattr(request, 'slot_name', None)
+        if slot_name:
+            result_queue = self.result_queues.get(slot_name)
+            if result_queue:
+                try:
+                    result_queue.put_nowait(InferenceResponse(
+                        type=request.type,
+                        camera_id=request.camera_id,
+                        error="unregistered",
+                        request_id=getattr(request, 'request_id', None),
+                    ))
+                except Exception:
+                    pass  # Best-effort
 
     def _send_error_response(self, request, slot_name, error_msg):
         """Send an error response to the camera's result queue."""
@@ -556,6 +680,7 @@ class InferenceServer:
                     type=request.type,
                     camera_id=request.camera_id,
                     error=f"inference_server_error: {error_msg}",
+                    request_id=request.request_id,
                 ))
             except Exception:
                 pass  # Best-effort
@@ -620,6 +745,7 @@ class InferenceServer:
                     type=RequestType.DETECT,
                     camera_id=request.camera_id,
                     detections=detections,
+                    request_id=request.request_id,
                 )
                 result_queue = self.result_queues.get(slot_name)
                 if result_queue:
@@ -649,6 +775,7 @@ class InferenceServer:
                     camera_id=request.camera_id,
                     features=[None] * len(request.boxes) if request.boxes else [],
                     error="ReID extractor not available",
+                    request_id=request.request_id,
                 )
                 result_queue = self.result_queues.get(slot_name)
                 if result_queue:
@@ -674,6 +801,7 @@ class InferenceServer:
                     type=RequestType.REID,
                     camera_id=request.camera_id,
                     features=features,
+                    request_id=request.request_id,
                 )
                 result_queue = self.result_queues.get(slot_name)
                 if result_queue:
