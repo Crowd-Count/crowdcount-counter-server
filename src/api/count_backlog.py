@@ -39,7 +39,6 @@ class CountBacklog:
                 CREATE TABLE IF NOT EXISTS count_backlog (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     device_id TEXT NOT NULL,
-                    password TEXT NOT NULL,
                     operation TEXT NOT NULL CHECK(operation IN ('add', 'sub')),
                     count INTEGER NOT NULL DEFAULT 1,
                     crossing_timestamp REAL NOT NULL,
@@ -51,7 +50,7 @@ class CountBacklog:
                 CREATE INDEX IF NOT EXISTS idx_backlog_device_id ON count_backlog(device_id);
             """)
 
-    def add(self, device_id: str, password: str, operation: str, count: int = 1,
+    def add(self, device_id: str, operation: str, count: int = 1,
             crossing_timestamp: Optional[float] = None):
         """Queue a failed count operation for later retry."""
         now = time.time()
@@ -60,9 +59,9 @@ class CountBacklog:
         with self._lock:
             self._conn.execute(
                 """INSERT INTO count_backlog
-                   (device_id, password, operation, count, crossing_timestamp, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
-                (device_id, password, operation, count, crossing_timestamp, now)
+                   (device_id, operation, count, crossing_timestamp, created_at)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (device_id, operation, count, crossing_timestamp, now)
             )
             self._conn.commit()
         self.logger.info(f"Backlogged {operation} {count} for device {device_id}")

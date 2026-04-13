@@ -38,6 +38,14 @@ ENV/
 .DS_Store
 Thumbs.db
 
+# credentials/secrets
+.env
+.env.*
+*.pem
+*.key
+*.crt
+credentials.json
+
 # Logs
 *.log
 

@@ -6,15 +6,19 @@ Automatically spawns a processor for each new stream
 
 import os
 import sys
+import re
 import time
 import json
 import logging
 import threading
 import signal
 from pathlib import Path
+from functools import wraps
 from typing import Dict, Type, Optional
 from flask import Flask, request, jsonify, Response, render_template_string, send_from_directory
 from flask_cors import CORS
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 import multiprocessing
 import requests as req_lib
 import cv2
@@ -383,18 +387,44 @@ class StreamOrchestrator:
         # Flask app for receiving MediaMTX webhooks and device management
         self.app = Flask(__name__, static_folder=str(STATIC_DIR))
         CORS(self.app)
+        self.limiter = Limiter(
+            get_remote_address,
+            app=self.app,
+            default_limits=["60 per minute"],
+            storage_uri="memory://",
+        )
         self.setup_routes()
+
+    @staticmethod
+    def _is_valid_identifier(value: str, max_length: int = 128) -> bool:
+        """Validate that a string is a safe identifier (alphanumeric, hyphens, underscores, @, dots)."""
+        if not value or len(value) > max_length:
+            return False
+        return bool(re.match(r'^[a-zA-Z0-9@._-]+$', value))
+
+    def _validate_device_id(self, f):
+        """Decorator to validate device_id path parameter."""
+        @wraps(f)
+        def decorated(*args, **kwargs):
+            device_id = kwargs.get('device_id', '')
+            if not self._is_valid_identifier(device_id):
+                return jsonify({'error': 'Invalid device ID'}), 400
+            return f(*args, **kwargs)
+        return decorated
 
     def setup_routes(self):
         """Setup Flask routes for MediaMTX webhooks"""
 
         @self.app.route('/stream/ready', methods=['POST'])
+        @self.limiter.limit("50000 per minute")
         def stream_ready():
             """Called by MediaMTX when a stream becomes ready"""
             data = request.get_json()
+            if not data:
+                return jsonify({'status': 'error', 'message': 'Invalid request body'}), 400
             stream_name = data.get('stream', '')
 
-            if stream_name:
+            if stream_name and self._is_valid_identifier(stream_name):
                 # Cancel any pending reconnect timeout (stream came back)
                 with self._state_lock:
                     if stream_name in self.pending_reconnect:
@@ -417,13 +447,14 @@ class StreamOrchestrator:
                 # Get client IP (Tailscale IP)
                 client_ip = request.remote_addr
 
-                # Get device info from pre-registration, or use defaults
+                # Get device info from pre-registration - reject unregistered streams
+                is_mirror = stream_name in self._mirror_streams
                 with self._state_lock:
                     if stream_name in self.device_info:
                         device_id = self.device_info[stream_name].get('device_id', stream_name)
                         password = self.device_info[stream_name].get('password', '')
-                    else:
-                        # No pre-registration, use stream name as device_id
+                    elif is_mirror:
+                        # Mirror streams don't need credentials
                         device_id = stream_name
                         password = ''
                         self.device_info[stream_name] = {
@@ -431,9 +462,10 @@ class StreamOrchestrator:
                             'password': password,
                             'timestamp': time.time()
                         }
-
-                # Skip DB registration for mirror streams (they aren't real devices)
-                is_mirror = stream_name in self._mirror_streams
+                    else:
+                        # No pre-registration - reject the stream
+                        self.logger.warning(f"✗ Rejected unregistered stream: {stream_name} from {request.remote_addr}")
+                        return jsonify({'status': 'error', 'message': 'Device not registered'}), 401
 
                 if not is_mirror:
                     # Update device status in database
@@ -467,7 +499,7 @@ class StreamOrchestrator:
                 self.logger.info(f"   Stream Name: {stream_name}")
                 self.logger.info(f"   Device ID:   {device_id}")
                 self.logger.info(f"   IP Address:  {client_ip}")
-                self.logger.info(f"   Password:    {password if password else '(none)'}")
+                self.logger.info(f"   Password:    {'***' if password else '(none)'}")
                 self.logger.info("=" * 60)
 
                 self.start_processor(stream_name)
@@ -476,12 +508,15 @@ class StreamOrchestrator:
             return jsonify({'status': 'error', 'message': 'No stream name provided'}), 400
 
         @self.app.route('/stream/stopped', methods=['POST'])
+        @self.limiter.limit("50000 per minute")
         def stream_stopped():
             """Called by MediaMTX when a stream stops - uses grace period before marking offline"""
             data = request.get_json()
+            if not data:
+                return jsonify({'status': 'error', 'message': 'Invalid request body'}), 400
             stream_name = data.get('stream', '')
 
-            if stream_name:
+            if stream_name and self._is_valid_identifier(stream_name):
                 self.logger.info(f"Received stream stopped notification: {stream_name}")
 
                 # Stop the processor but don't mark offline yet - use grace period
@@ -492,6 +527,7 @@ class StreamOrchestrator:
             return jsonify({'status': 'error', 'message': 'No stream name provided'}), 400
 
         @self.app.route('/auth', methods=['POST'])
+        @self.limiter.limit("50000 per minute")
         def auth_device():
             """
             Authentication endpoint for MediaMTX
@@ -583,22 +619,28 @@ class StreamOrchestrator:
             }), 200
 
         @self.app.route('/device/register', methods=['POST'])
+        @self.limiter.limit("50000 per minute")
         def register_device():
             """
             Register device information for a stream.
             Validates device credentials before allowing registration.
             """
             data = request.get_json()
+            if not data:
+                return jsonify({'status': 'error', 'message': 'Invalid request body'}), 400
             stream_name = data.get('stream_name', '')
             device_id = data.get('device_id', stream_name)
             password = data.get('password', '')
 
-            if not stream_name:
+            if not stream_name or not self._is_valid_identifier(stream_name):
                 return jsonify({'status': 'error', 'message': 'stream_name is required'}), 400
 
-            if not device_id or not password:
+            if not device_id or not self._is_valid_identifier(device_id):
+                return jsonify({'status': 'error', 'message': 'Invalid device_id'}), 400
+
+            if not password:
                 self.logger.warning(f"✗ Registration attempt with missing credentials from {request.remote_addr}")
-                return jsonify({'status': 'error', 'message': 'device_id and password are required'}), 400
+                return jsonify({'status': 'error', 'message': 'password is required'}), 400
 
             # Validate credentials against CrowdCount API
             self.logger.info(f"Validating credentials for {device_id}...")
@@ -676,6 +718,8 @@ class StreamOrchestrator:
         @self.app.route('/view/<stream_name>')
         def view_stream(stream_name):
             """Serve HTML viewer for a stream"""
+            if not self._is_valid_identifier(stream_name):
+                return jsonify({'error': 'Invalid stream name'}), 400
             locations = _load_locations()
             with self._state_lock:
                 device_info = self.device_info.get(stream_name, {})
@@ -960,6 +1004,8 @@ class StreamOrchestrator:
             Query params:
                 overlay: 'true' (default) for annotated stream, 'false' for clean stream
             """
+            if not self._is_valid_identifier(stream_name):
+                return jsonify({'error': 'Invalid stream name'}), 400
             # Check if overlay should be shown (default: true)
             show_overlay = request.args.get('overlay', 'true').lower() != 'false'
 
@@ -1069,6 +1115,8 @@ class StreamOrchestrator:
         @self.app.route('/api/stream/<stream_name>/stats')
         def stream_stats(stream_name):
             """Get stream statistics including FPS, location, resolution, uptime"""
+            if not self._is_valid_identifier(stream_name):
+                return jsonify({'error': 'Invalid stream name'}), 400
             locations = _load_locations()
             with self._state_lock:
                 device_info = self.device_info.get(stream_name, {})
@@ -1244,9 +1292,10 @@ class StreamOrchestrator:
 
             except Exception as e:
                 self.logger.error(f"Error listing devices: {e}")
-                return jsonify({'error': str(e)}), 500
+                return jsonify({'error': 'Internal server error'}), 500
 
         @self.app.route('/api/device/<path:device_id>', methods=['GET'])
+        @self._validate_device_id
         def get_device_info(device_id):
             """Get details of a specific device"""
             try:
@@ -1262,9 +1311,11 @@ class StreamOrchestrator:
 
             except Exception as e:
                 self.logger.error(f"Error getting device: {e}")
-                return jsonify({'error': str(e)}), 500
+                return jsonify({'error': 'Internal server error'}), 500
 
         @self.app.route('/api/device/<path:device_id>/restart', methods=['POST'])
+        @self.limiter.limit("50000 per minute")
+        @self._validate_device_id
         def restart_device(device_id):
             """Restart a device's camera stream service"""
             try:
@@ -1309,9 +1360,11 @@ class StreamOrchestrator:
 
             except Exception as e:
                 self.logger.error(f"Error restarting device: {e}")
-                return jsonify({'error': str(e)}), 500
+                return jsonify({'error': 'Internal server error'}), 500
 
         @self.app.route('/api/device/<path:device_id>/stop', methods=['POST'])
+        @self.limiter.limit("50000 per minute")
+        @self._validate_device_id
         def stop_device(device_id):
             """Stop a device's camera stream service"""
             try:
@@ -1346,9 +1399,11 @@ class StreamOrchestrator:
 
             except Exception as e:
                 self.logger.error(f"Error stopping device: {e}")
-                return jsonify({'error': str(e)}), 500
+                return jsonify({'error': 'Internal server error'}), 500
 
         @self.app.route('/api/device/<path:device_id>/start', methods=['POST'])
+        @self.limiter.limit("50000 per minute")
+        @self._validate_device_id
         def start_device(device_id):
             """Start a device's camera stream service"""
             try:
@@ -1383,9 +1438,10 @@ class StreamOrchestrator:
 
             except Exception as e:
                 self.logger.error(f"Error starting device: {e}")
-                return jsonify({'error': str(e)}), 500
+                return jsonify({'error': 'Internal server error'}), 500
 
         @self.app.route('/api/device/<path:device_id>/logs', methods=['GET'])
+        @self._validate_device_id
         def get_device_logs(device_id):
             """Get service logs from a device"""
             try:
@@ -1398,7 +1454,12 @@ class StreamOrchestrator:
                     return jsonify({'error': 'Device not found or no IP'}), 404
 
                 ip = result['tailscale_ip']
-                lines = request.args.get('lines', '50')
+                #prevent user dumps
+                try:
+                    lines = int(request.args.get('lines', '50'))
+                    lines = max(1, min(lines, 1000))
+                except (ValueError, TypeError):
+                    lines = 50
 
                 # Get SSH password if available
                 password = self.ssh_passwords.get(device_id)
@@ -1420,13 +1481,20 @@ class StreamOrchestrator:
 
             except Exception as e:
                 self.logger.error(f"Error getting logs: {e}")
-                return jsonify({'error': str(e)}), 500
+                return jsonify({'error': 'Internal server error'}), 500
 
         @self.app.route('/api/device/<path:device_id>/config', methods=['PUT'])
+        @self.limiter.limit("50000 per minute")
+        @self._validate_device_id
         def update_device_config(device_id):
             """Update device configuration"""
             try:
                 data = request.get_json()
+
+                # Reject unknown fields
+                ALLOWED_CONFIG_FIELDS = {'width', 'height', 'fps'}
+                if not data or not set(data.keys()).issubset(ALLOWED_CONFIG_FIELDS):
+                    return jsonify({'error': 'Invalid fields'}), 400
 
                 # Validate input values to prevent shell injection
                 if 'width' in data:
@@ -1521,9 +1589,10 @@ class StreamOrchestrator:
 
             except Exception as e:
                 self.logger.error(f"Error updating config: {e}")
-                return jsonify({'error': str(e)}), 500
+                return jsonify({'error': 'Internal server error'}), 500
 
         @self.app.route('/api/device/<path:device_id>/status', methods=['GET'])
+        @self._validate_device_id
         def get_device_service_status(device_id):
             """Get current service status from device"""
             try:
@@ -1558,7 +1627,7 @@ class StreamOrchestrator:
 
             except Exception as e:
                 self.logger.error(f"Error getting status: {e}")
-                return jsonify({'error': str(e)}), 500
+                return jsonify({'error': 'Internal server error'}), 500
 
         @self.app.route('/api/server/info', methods=['GET'])
         def server_info():
@@ -1581,14 +1650,18 @@ class StreamOrchestrator:
                 })
             except Exception as e:
                 self.logger.error(f"Error getting server info: {e}")
-                return jsonify({'error': str(e)}), 500
+                return jsonify({'error': 'Internal server error'}), 500
 
         # SSH Password Management Routes
         @self.app.route('/api/device/<path:device_id>/ssh/password', methods=['POST'])
+        @self.limiter.limit("50000 per minute")
+        @self._validate_device_id
         def set_ssh_password(device_id):
             """Set SSH password for a device (for developer counters)"""
             try:
                 data = request.get_json()
+                if not data:
+                    return jsonify({'error': 'Invalid request body'}), 400
                 password = data.get('password', '')
 
                 if not password:
@@ -1602,9 +1675,11 @@ class StreamOrchestrator:
 
             except Exception as e:
                 self.logger.error(f"Error setting SSH password: {e}")
-                return jsonify({'error': str(e)}), 500
+                return jsonify({'error': 'Internal server error'}), 500
 
         @self.app.route('/api/device/<path:device_id>/ssh/password', methods=['DELETE'])
+        @self.limiter.limit("50000 per minute")
+        @self._validate_device_id
         def delete_ssh_password(device_id):
             """Delete stored SSH password for a device"""
             try:
@@ -1616,9 +1691,10 @@ class StreamOrchestrator:
 
             except Exception as e:
                 self.logger.error(f"Error deleting SSH password: {e}")
-                return jsonify({'error': str(e)}), 500
+                return jsonify({'error': 'Internal server error'}), 500
 
         @self.app.route('/api/device/<path:device_id>/ssh/requires-password', methods=['GET'])
+        @self._validate_device_id
         def check_password_required(device_id):
             """Check if device requires SSH password (developer counter)"""
             try:
@@ -1634,7 +1710,7 @@ class StreamOrchestrator:
 
             except Exception as e:
                 self.logger.error(f"Error checking password requirement: {e}")
-                return jsonify({'error': str(e)}), 500
+                return jsonify({'error': 'Internal server error'}), 500
 
         @self.app.route('/api/backlog/status', methods=['GET'])
         def backlog_status():
@@ -1648,7 +1724,7 @@ class StreamOrchestrator:
                 })
             except Exception as e:
                 self.logger.error(f"Error getting backlog status: {e}")
-                return jsonify({'error': str(e)}), 500
+                return jsonify({'error': 'Internal server error'}), 500
 
     def _flush_backlog_loop(self):
         """Background loop that drains the count backlog when the API is reachable."""
@@ -1684,19 +1760,25 @@ class StreamOrchestrator:
 
     def _flush_single_entry(self, entry: dict) -> bool:
         """Attempt to send a single backlogged count to the API. Returns True on success."""
+        device_id = entry['device_id']
+        password = self.device_info.get(device_id, {}).get('password', '')
+        if not password:
+            self.logger.warning(f"Backlog flush: no password for device {device_id}, skipping")
+            return False
+
         op = entry['operation']
         if op == 'add':
             endpoint = '/add_to_count'
             data = {
-                'device_id': entry['device_id'],
-                'password': entry['password'],
+                'device_id': device_id,
+                'password': password,
                 'count_to_add': str(entry['count'])
             }
         else:
             endpoint = '/sub_from_count'
             data = {
-                'device_id': entry['device_id'],
-                'password': entry['password'],
+                'device_id': device_id,
+                'password': password,
                 'count_to_sub': str(entry['count'])
             }
 

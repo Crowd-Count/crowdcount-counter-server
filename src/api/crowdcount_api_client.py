@@ -85,7 +85,6 @@ class CrowdCountAPIClient:
         if self._backlog is not None:
             self._backlog.add(
                 device_id=self.device_id,
-                password=self.password,
                 operation=operation,
                 count=count,
                 crossing_timestamp=crossing_timestamp

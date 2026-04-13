@@ -6,6 +6,7 @@ lapx>=0.5.2
 # Web Framework
 Flask>=2.3.0
 Flask-CORS>=4.0.0
+Flask-Limiter>=3.5.0
 
 # SSH for remote device control
 paramiko>=3.4.0
