@@ -1,0 +1,35 @@
+# CrowdCount Single-Session Worker Image (M2)
+#
+# Container-per-session image launched by the Upstream processor supervisor
+# (upstream-processor's CrowdCountProcessManager runs it with CC_* env vars
+# in a per-run --env-file). Unlike the orchestrator image, the code is BAKED
+# IN — supervisor-launched containers get no code bind-mounts — and there is
+# no MediaMTX, no orchestrator, no entrypoint template step: PID1 is the
+# single-session worker itself, so docker stop's SIGTERM reaches it directly.
+#
+# Build FROM the existing built orchestrator image so the worker inherits the
+# exact dependency stack production runs (CUDA 12.8 runtime, PyTorch nightly
+# cu128 for RTX 50 Blackwell, torchreid, ultralytics) with no downloads:
+#
+#   docker build -f Dockerfile.worker -t crowdcount-counter:dev .
+#
+# The tag must match what the Upstream package registry entry references
+# (overhead_people_counter.v1 -> container_image "crowdcount-counter:dev").
+
+ARG BASE_IMAGE=crowdcount-counter-server-prod
+FROM ${BASE_IMAGE}
+
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+WORKDIR /app
+
+# Bake the application code + model weights into the image
+# (.dockerignore keeps runtime data and git internals out).
+COPY . /app
+
+# Single-session worker is PID1: no shell wrapper, no entrypoint script.
+# Configuration is entirely CC_* environment variables (see
+# scripts/run_counter_worker.py --help).
+ENTRYPOINT ["python3", "/app/scripts/run_counter_worker.py"]
+CMD []

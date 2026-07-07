@@ -1,0 +1,9 @@
+# Keep the worker image lean and deterministic: no git internals, no runtime
+# state, no logs. (The orchestrator Dockerfile only COPYs requirements.txt +
+# docker-entrypoint.sh, so this file does not change its builds.)
+.git
+data/
+*.log
+__pycache__/
+*.pyc
+.DS_Store
