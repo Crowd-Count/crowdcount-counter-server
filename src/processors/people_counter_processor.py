@@ -20,12 +20,10 @@ import numpy as np
 import time
 import math
 import threading
-import requests
-from collections import deque, defaultdict
-from dataclasses import dataclass, field
+from collections import deque
+from dataclasses import dataclass
 from typing import Optional, Tuple, List, Dict
 from enum import Enum
-import os
 import queue as queue_module
 
 from .base_processor import BaseStreamProcessor
@@ -33,6 +31,7 @@ from .base_processor import BaseStreamProcessor
 # Import API client
 import sys
 from pathlib import Path
+
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from api.crowdcount_api_client import CrowdCountAPIClient
 
@@ -43,6 +42,7 @@ MODELS_DIR = PROJECT_ROOT / "models"
 # Try to import YOLO, provide helpful error if not available
 try:
     from ultralytics import YOLO
+
     YOLO_AVAILABLE = True
 except ImportError:
     YOLO_AVAILABLE = False
@@ -50,19 +50,24 @@ except ImportError:
 
 # Try to import torch for ReID feature extraction
 try:
-    import torch
-    import torch.nn.functional as F
+    # Availability probe: imported only to prove torch is installed (ReID
+    # runs in deep_reid.py); find_spec would miss broken installs.
+    import torch  # noqa: F401
+    import torch.nn.functional as F  # noqa: F401
+
     TORCH_AVAILABLE = True
 except ImportError:
     TORCH_AVAILABLE = False
     print("Warning: torch not installed. ReID features disabled.")
 
-# Import deep ReID extractor
-from .deep_reid import create_reid_extractor, TORCHREID_AVAILABLE
+# Import deep ReID extractor (after the optional-dependency probes above,
+# which must run first to set the *_AVAILABLE flags)
+from .deep_reid import create_reid_extractor  # noqa: E402
 
 
 class CrossingDirection(Enum):
     """Direction of crossing the doorway line"""
+
     LEFT_TO_RIGHT = "left_to_right"
     RIGHT_TO_LEFT = "right_to_left"
     NONE = "none"
@@ -70,14 +75,16 @@ class CrossingDirection(Enum):
 
 class DangerZone(Enum):
     """METHOD 5: Zone definitions for occlusion-aware tracking"""
-    LEFT_ZONE = "left_zone"           # Safe zone on left side
-    DANGER_ZONE = "danger_zone"       # High occlusion risk zone (near/on the line)
-    RIGHT_ZONE = "right_zone"         # Safe zone on right side
+
+    LEFT_ZONE = "left_zone"  # Safe zone on left side
+    DANGER_ZONE = "danger_zone"  # High occlusion risk zone (near/on the line)
+    RIGHT_ZONE = "right_zone"  # Safe zone on right side
 
 
 @dataclass
 class Detection:
     """Represents a single person detection with optional ReID features"""
+
     center: Tuple[int, int]
     bbox: Tuple[int, int, int, int]  # x, y, width, height
     confidence: float
@@ -86,7 +93,9 @@ class Detection:
     class_name: str
     track_id: Optional[int] = None  # ByteTrack assigned ID
     appearance_features: Optional[np.ndarray] = None  # ReID embedding
-    is_predicted: bool = False  # True for extrapolated positions (adaptive frame skipping)
+    is_predicted: bool = (
+        False  # True for extrapolated positions (adaptive frame skipping)
+    )
 
     def __hash__(self):
         """Make Detection hashable for set operations"""
@@ -96,13 +105,14 @@ class Detection:
 @dataclass
 class ReIDCheckpoint:
     """METHOD 5: Checkpoint data for ReID-based track recovery"""
-    embedding: np.ndarray          # ReID features when entering danger zone
-    entry_side: str                # 'left' or 'right'
-    entry_time: float              # Timestamp when checkpoint created
+
+    embedding: np.ndarray  # ReID features when entering danger zone
+    entry_side: str  # 'left' or 'right'
+    entry_time: float  # Timestamp when checkpoint created
     entry_position: Tuple[int, int]  # Position when entering danger zone
-    expected_exit_side: str        # Expected destination based on velocity
-    confidence: float              # Detection confidence at checkpoint
-    velocity_x: float              # X velocity at checkpoint time
+    expected_exit_side: str  # Expected destination based on velocity
+    confidence: float  # Detection confidence at checkpoint
+    velocity_x: float  # X velocity at checkpoint time
 
 
 class PersonTracker:
@@ -117,10 +127,10 @@ class PersonTracker:
     """
 
     # Method 5 configuration constants
-    DANGER_ZONE_BUFFER = 0.10       # Width of danger zone (10% of frame)
-    CHECKPOINT_TIMEOUT = 5.0        # Max seconds to search for lost track
+    DANGER_ZONE_BUFFER = 0.10  # Width of danger zone (10% of frame)
+    CHECKPOINT_TIMEOUT = 5.0  # Max seconds to search for lost track
     RELINK_SIMILARITY_THRESHOLD = 0.55  # ReID match threshold for relinking
-    LINGERING_TIMEOUT = 10.0        # Extended timeout for slow-moving people
+    LINGERING_TIMEOUT = 10.0  # Extended timeout for slow-moving people
 
     def __init__(self, track_id: int, initial_detection: Detection):
         self.track_id = track_id
@@ -129,8 +139,10 @@ class PersonTracker:
         self.velocities = deque(maxlen=15)
         self.creation_time = time.time()
         self.last_update_time = time.time()
-        self.last_real_position = None      # Center from last YOLO detection (not predicted)
-        self.last_real_time = None          # Timestamp from last YOLO detection
+        self.last_real_position = (
+            None  # Center from last YOLO detection (not predicted)
+        )
+        self.last_real_time = None  # Timestamp from last YOLO detection
 
         # Multiple crossing state tracking
         self.total_crossings = 0
@@ -148,27 +160,35 @@ class PersonTracker:
         self.detection_count = 0  # Total detections for this track
         self.min_detections_to_count = 2  # TUNED: Lowered for faster crossing detection
         self.consecutive_side_detections = 0  # Consecutive detections on same side
-        self.min_consecutive_for_crossing = 1  # Reduced from 2 - trajectory validation handles consistency
+        self.min_consecutive_for_crossing = (
+            1  # Reduced from 2 - trajectory validation handles consistency
+        )
 
         # ReID appearance features
         self.appearance_history = deque(maxlen=10)  # Store recent appearance embeddings
         self.mean_appearance = None  # Running mean of appearance features
 
         # Pending crossing validation
-        self.pending_crossing = None  # (direction, timestamp) if crossing needs validation
+        self.pending_crossing = (
+            None  # (direction, timestamp) if crossing needs validation
+        )
         self.crossing_start_position = None  # Position when crossing started
 
         # METHOD 5: Checkpoint and zone tracking
-        self.checkpoint: Optional[ReIDCheckpoint] = None  # Current checkpoint if in danger zone
-        self.current_zone: Optional[DangerZone] = None     # Current zone
-        self.previous_zone: Optional[DangerZone] = None    # Previous zone
-        self.in_danger_zone = False                        # Currently in danger zone
-        self.search_active = False                         # Searching for lost track
-        self.relinked_from: Optional[int] = None           # Track ID we were relinked from
-        self.needs_checkpoint = False                      # Flag for processor to create checkpoint
+        self.checkpoint: Optional[ReIDCheckpoint] = (
+            None  # Current checkpoint if in danger zone
+        )
+        self.current_zone: Optional[DangerZone] = None  # Current zone
+        self.previous_zone: Optional[DangerZone] = None  # Previous zone
+        self.in_danger_zone = False  # Currently in danger zone
+        self.search_active = False  # Searching for lost track
+        self.relinked_from: Optional[int] = None  # Track ID we were relinked from
+        self.needs_checkpoint = False  # Flag for processor to create checkpoint
 
         # METHOD 5.4: Velocity-gated crossing validation (reflection prevention)
-        self.danger_zone_frame_count = 0                   # Frames spent in danger zone during current transit
+        self.danger_zone_frame_count = (
+            0  # Frames spent in danger zone during current transit
+        )
 
         # Add initial detection
         self.update(initial_detection)
@@ -191,7 +211,11 @@ class PersonTracker:
             if self.last_real_position is not None:
                 dx = detection.center[0] - self.last_real_position[0]
                 dy = detection.center[1] - self.last_real_position[1]
-                dt = detection.timestamp - self.last_real_time if self.last_real_time else 0.033
+                dt = (
+                    detection.timestamp - self.last_real_time
+                    if self.last_real_time
+                    else 0.033
+                )
                 if dt > 0:
                     vx = dx / dt
                     vy = dy / dt
@@ -206,7 +230,9 @@ class PersonTracker:
                 self.appearance_history.append(detection.appearance_features)
                 # Update running mean of appearance (re-normalize to maintain L2 norm)
                 if len(self.appearance_history) > 0:
-                    self.mean_appearance = np.mean(list(self.appearance_history), axis=0)
+                    self.mean_appearance = np.mean(
+                        list(self.appearance_history), axis=0
+                    )
                     norm = np.linalg.norm(self.mean_appearance)
                     if norm > 0:
                         self.mean_appearance = self.mean_appearance / norm
@@ -234,8 +260,9 @@ class PersonTracker:
         # Clamp to [0, 1] range (can be slightly out of range due to floating point)
         return max(0.0, min(1.0, float(similarity)))
 
-    def _determine_zone(self, x: int, frame_width: int, doorway_center: float,
-                        danger_buffer: float) -> DangerZone:
+    def _determine_zone(
+        self, x: int, frame_width: int, doorway_center: float, danger_buffer: float
+    ) -> DangerZone:
         """METHOD 5: Determine which zone the x-coordinate is in."""
         center_x = frame_width * doorway_center
         buffer_px = frame_width * danger_buffer / 2
@@ -247,22 +274,23 @@ class PersonTracker:
         else:
             return DangerZone.DANGER_ZONE
 
-    def create_checkpoint(self, embedding: np.ndarray, position: Tuple[int, int],
-                          confidence: float) -> None:
+    def create_checkpoint(
+        self, embedding: np.ndarray, position: Tuple[int, int], confidence: float
+    ) -> None:
         """METHOD 5: Create a checkpoint when entering danger zone."""
         vx, _ = self.get_smooth_velocity()
 
         # Determine entry side based on previous zone
-        entry_side = 'left' if self.previous_zone == DangerZone.LEFT_ZONE else 'right'
+        entry_side = "left" if self.previous_zone == DangerZone.LEFT_ZONE else "right"
 
         # Predict expected exit side based on velocity
         if vx > 0:
-            expected_exit = 'right'
+            expected_exit = "right"
         elif vx < 0:
-            expected_exit = 'left'
+            expected_exit = "left"
         else:
             # No clear velocity - predict based on entry side (likely continues same direction)
-            expected_exit = 'right' if entry_side == 'left' else 'left'
+            expected_exit = "right" if entry_side == "left" else "left"
 
         self.checkpoint = ReIDCheckpoint(
             embedding=embedding,
@@ -271,7 +299,7 @@ class PersonTracker:
             entry_position=position,
             expected_exit_side=expected_exit,
             confidence=confidence,
-            velocity_x=vx
+            velocity_x=vx,
         )
         self.search_active = True
 
@@ -280,10 +308,15 @@ class PersonTracker:
         self.checkpoint = None
         self.search_active = False
 
-    def check_crossing(self, frame_width: int, doorway_center: float, doorway_width: float,
-                       danger_buffer: float = None,
-                       min_transit_frames: int = 1,
-                       frame_height: int = 480) -> Optional[CrossingDirection]:
+    def check_crossing(
+        self,
+        frame_width: int,
+        doorway_center: float,
+        doorway_width: float,
+        danger_buffer: float = None,
+        min_transit_frames: int = 1,
+        frame_height: int = 480,
+    ) -> Optional[CrossingDirection]:
         """
         METHOD 5: Explicit Occlusion Handling with ReID Relink
 
@@ -311,33 +344,38 @@ class PersonTracker:
         new_zone = self._determine_zone(current_x, frame_width, doorway_center, buffer)
 
         # Track zone transitions
-        zone_changed = (new_zone != self.current_zone)
+        zone_changed = new_zone != self.current_zone
         self.previous_zone = self.current_zone
         self.current_zone = new_zone
 
         # Update in_danger_zone flag
-        self.in_danger_zone = (new_zone == DangerZone.DANGER_ZONE)
+        self.in_danger_zone = new_zone == DangerZone.DANGER_ZONE
 
         # Vertical exit detection: person in danger zone moving toward frame top/bottom
         # Catches people who cross the doorway then exit via stairs (up/down)
-        if (new_zone == DangerZone.DANGER_ZONE and
-            self.checkpoint is not None and
-            len(self.positions) >= 3 and
-            len(self.velocities) >= 2):
-
+        if (
+            new_zone == DangerZone.DANGER_ZONE
+            and self.checkpoint is not None
+            and len(self.positions) >= 3
+            and len(self.velocities) >= 2
+        ):
             current_y = self.positions[-1][1]
             edge_threshold = frame_height * 0.12  # Within 12% of top/bottom edge
 
             recent_vy = [v[1] for v in list(self.velocities)[-3:]]
             avg_vy = sum(recent_vy) / len(recent_vy)
 
-            exiting_top = (current_y < edge_threshold and avg_vy < -5.0)
-            exiting_bottom = (current_y > frame_height - edge_threshold and avg_vy > 5.0)
+            exiting_top = current_y < edge_threshold and avg_vy < -5.0
+            exiting_bottom = current_y > frame_height - edge_threshold and avg_vy > 5.0
 
             if exiting_top or exiting_bottom:
                 entry_side = self.checkpoint.entry_side
-                if entry_side and current_time - self.last_crossing_time >= self.min_crossing_interval:
-                    if entry_side == 'left':
+                if (
+                    entry_side
+                    and current_time - self.last_crossing_time
+                    >= self.min_crossing_interval
+                ):
+                    if entry_side == "left":
                         crossing_vertical = CrossingDirection.LEFT_TO_RIGHT
                     else:
                         crossing_vertical = CrossingDirection.RIGHT_TO_LEFT
@@ -345,7 +383,7 @@ class PersonTracker:
                     self.total_crossings += 1
                     self.crossing_events.append((current_time, crossing_vertical))
                     self.last_crossing_time = current_time
-                    self.last_side = 'right' if entry_side == 'left' else 'left'
+                    self.last_side = "right" if entry_side == "left" else "left"
                     self.clear_checkpoint()
                     self.danger_zone_frame_count = 0
                     return crossing_vertical
@@ -364,9 +402,9 @@ class PersonTracker:
 
         # Update legacy side tracking
         if new_zone == DangerZone.LEFT_ZONE:
-            self.current_side = 'left'
+            self.current_side = "left"
         elif new_zone == DangerZone.RIGHT_ZONE:
-            self.current_side = 'right'
+            self.current_side = "right"
         # Don't update side while in danger zone
 
         # Initialize last_side if needed
@@ -383,7 +421,9 @@ class PersonTracker:
             self.needs_checkpoint = True
 
         # Check for checkpoint timeout
-        if self.checkpoint and (current_time - self.checkpoint.entry_time > self.CHECKPOINT_TIMEOUT):
+        if self.checkpoint and (
+            current_time - self.checkpoint.entry_time > self.CHECKPOINT_TIMEOUT
+        ):
             self.clear_checkpoint()
 
         # Track consecutive side detections
@@ -407,43 +447,73 @@ class PersonTracker:
             if self.previous_zone == DangerZone.DANGER_ZONE:
                 if self.checkpoint:
                     entry_side = self.checkpoint.entry_side
-                    exit_side = 'left' if self.current_zone == DangerZone.LEFT_ZONE else 'right'
+                    exit_side = (
+                        "left" if self.current_zone == DangerZone.LEFT_ZONE else "right"
+                    )
 
-                    if entry_side != exit_side and self.danger_zone_frame_count >= min_transit_frames:
+                    if (
+                        entry_side != exit_side
+                        and self.danger_zone_frame_count >= min_transit_frames
+                    ):
                         # Successful crossing through danger zone
-                        if entry_side == 'left' and exit_side == 'right':
-                            if current_time - self.last_crossing_time >= self.min_crossing_interval:
+                        if entry_side == "left" and exit_side == "right":
+                            if (
+                                current_time - self.last_crossing_time
+                                >= self.min_crossing_interval
+                            ):
                                 crossing_to_emit = CrossingDirection.LEFT_TO_RIGHT
                                 self.total_crossings += 1
-                                self.crossing_events.append((current_time, crossing_to_emit))
+                                self.crossing_events.append(
+                                    (current_time, crossing_to_emit)
+                                )
                                 self.last_crossing_time = current_time
-                                self.last_side = 'right'
-                        elif entry_side == 'right' and exit_side == 'left':
-                            if current_time - self.last_crossing_time >= self.min_crossing_interval:
+                                self.last_side = "right"
+                        elif entry_side == "right" and exit_side == "left":
+                            if (
+                                current_time - self.last_crossing_time
+                                >= self.min_crossing_interval
+                            ):
                                 crossing_to_emit = CrossingDirection.RIGHT_TO_LEFT
                                 self.total_crossings += 1
-                                self.crossing_events.append((current_time, crossing_to_emit))
+                                self.crossing_events.append(
+                                    (current_time, crossing_to_emit)
+                                )
                                 self.last_crossing_time = current_time
-                                self.last_side = 'left'
+                                self.last_side = "left"
 
                     # Clear checkpoint after processing
                     self.clear_checkpoint()
 
                 else:
                     # No checkpoint - use simple side change detection
-                    if self.last_side and self.current_side and self.last_side != self.current_side and self.danger_zone_frame_count >= min_transit_frames:
-                        if self.last_side == 'left' and self.current_side == 'right':
-                            if current_time - self.last_crossing_time >= self.min_crossing_interval:
+                    if (
+                        self.last_side
+                        and self.current_side
+                        and self.last_side != self.current_side
+                        and self.danger_zone_frame_count >= min_transit_frames
+                    ):
+                        if self.last_side == "left" and self.current_side == "right":
+                            if (
+                                current_time - self.last_crossing_time
+                                >= self.min_crossing_interval
+                            ):
                                 crossing_to_emit = CrossingDirection.LEFT_TO_RIGHT
                                 self.total_crossings += 1
-                                self.crossing_events.append((current_time, crossing_to_emit))
+                                self.crossing_events.append(
+                                    (current_time, crossing_to_emit)
+                                )
                                 self.last_crossing_time = current_time
                                 self.last_side = self.current_side
-                        elif self.last_side == 'right' and self.current_side == 'left':
-                            if current_time - self.last_crossing_time >= self.min_crossing_interval:
+                        elif self.last_side == "right" and self.current_side == "left":
+                            if (
+                                current_time - self.last_crossing_time
+                                >= self.min_crossing_interval
+                            ):
                                 crossing_to_emit = CrossingDirection.RIGHT_TO_LEFT
                                 self.total_crossings += 1
-                                self.crossing_events.append((current_time, crossing_to_emit))
+                                self.crossing_events.append(
+                                    (current_time, crossing_to_emit)
+                                )
                                 self.last_crossing_time = current_time
                                 self.last_side = self.current_side
 
@@ -452,19 +522,30 @@ class PersonTracker:
 
             # Direct zone skip: LEFT_ZONE <-> RIGHT_ZONE without passing through DANGER_ZONE
             # This happens when the danger zone is narrow and the person's center jumps over it
-            elif (self.previous_zone in (DangerZone.LEFT_ZONE, DangerZone.RIGHT_ZONE) and
-                  self.current_zone in (DangerZone.LEFT_ZONE, DangerZone.RIGHT_ZONE) and
-                  self.previous_zone != self.current_zone):
-                if self.last_side and self.current_side and self.last_side != self.current_side:
-                    if current_time - self.last_crossing_time >= self.min_crossing_interval:
-                        if self.last_side == 'left' and self.current_side == 'right':
+            elif (
+                self.previous_zone in (DangerZone.LEFT_ZONE, DangerZone.RIGHT_ZONE)
+                and self.current_zone in (DangerZone.LEFT_ZONE, DangerZone.RIGHT_ZONE)
+                and self.previous_zone != self.current_zone
+            ):
+                if (
+                    self.last_side
+                    and self.current_side
+                    and self.last_side != self.current_side
+                ):
+                    if (
+                        current_time - self.last_crossing_time
+                        >= self.min_crossing_interval
+                    ):
+                        if self.last_side == "left" and self.current_side == "right":
                             crossing_to_emit = CrossingDirection.LEFT_TO_RIGHT
-                        elif self.last_side == 'right' and self.current_side == 'left':
+                        elif self.last_side == "right" and self.current_side == "left":
                             crossing_to_emit = CrossingDirection.RIGHT_TO_LEFT
 
                         if crossing_to_emit:
                             self.total_crossings += 1
-                            self.crossing_events.append((current_time, crossing_to_emit))
+                            self.crossing_events.append(
+                                (current_time, crossing_to_emit)
+                            )
                             self.last_crossing_time = current_time
                             self.last_side = self.current_side
 
@@ -518,7 +599,9 @@ class PersonTracker:
 
         return (int(predicted_x), int(predicted_y))
 
-    def interpolate_positions(self, current_time: float, num_steps: int = 3) -> List[Tuple[int, int]]:
+    def interpolate_positions(
+        self, current_time: float, num_steps: int = 3
+    ) -> List[Tuple[int, int]]:
         """
         Generate interpolated positions between last known position and predicted current position.
         Useful for checking crossings that may have occurred during dropped frames.
@@ -553,50 +636,68 @@ class PeopleCounterProcessor(BaseStreamProcessor):
     Tracks people crossing a virtual line and maintains counts
     """
 
-    def __init__(self, stream_name: str, rtsp_url: str, device_info: Optional[dict] = None,
-                 frame_queue=None, inference_request_queue=None, inference_result_queue=None,
-                 processor_heartbeat=None, inference_slot_name=None):
-        super().__init__(stream_name, rtsp_url, device_info, frame_queue,
-                         inference_request_queue, inference_result_queue,
-                         processor_heartbeat=processor_heartbeat,
-                         inference_slot_name=inference_slot_name)
+    def __init__(
+        self,
+        stream_name: str,
+        rtsp_url: str,
+        device_info: Optional[dict] = None,
+        frame_queue=None,
+        inference_request_queue=None,
+        inference_result_queue=None,
+        processor_heartbeat=None,
+        inference_slot_name=None,
+    ):
+        super().__init__(
+            stream_name,
+            rtsp_url,
+            device_info,
+            frame_queue,
+            inference_request_queue,
+            inference_result_queue,
+            processor_heartbeat=processor_heartbeat,
+            inference_slot_name=inference_slot_name,
+        )
 
         # YOLO model setup
         self.model = None
-        self.model_path = str(MODELS_DIR / "crowdcount-v6.pt")  # V6 model trained on V6_data dataset (mAP50=0.944)
-        self.tracker_config = str(MODELS_DIR / "botsort.yaml")  # BoT-SORT config (superset of ByteTrack with ReID)
-        self.class_names = {0: 'person'}  # Default
+        self.model_path = str(
+            MODELS_DIR / "crowdcount-v6.pt"
+        )  # V6 model trained on V6_data dataset (mAP50=0.944)
+        self.tracker_config = str(
+            MODELS_DIR / "botsort.yaml"
+        )  # BoT-SORT config (superset of ByteTrack with ReID)
+        self.class_names = {0: "person"}  # Default
 
         # Doorway configuration - TUNED FOR GROUP DETECTION
         self.doorway_config = {
-            'doorway_center': 0.5,      # 50% of frame width (center line)
-            'doorway_width': 0.02,      # 2% of frame width (narrow line)
-            'approach_zone': 0.15,      # 15% approach zone on each side
-            'min_path_length': 50,      # Minimum pixels traveled
-            'max_tracking_distance': 0.156,  # Proportion of frame width (~100px at 640w)
-            'tracker_timeout': 1.5,     # TUNED: Reduced from 3.0 to let false tracks expire faster
-            'yolo_conf_threshold': 0.31,  # F1-optimal threshold from V6 PR curve analysis
-            'yolo_iou_threshold': 0.3,   # TUNED: Lowered from 0.45 to separate overlapping people
-            'min_crossing_interval': 0.5,  # TUNED: Increased from 0.3 to prevent double counts
-            'min_peak_confidence': 0.35,  # Aligned with YOLO conf — final quality gate before counting a crossing
-            'reid_similarity_threshold': 0.6,  # TUNED: Increased for deep ReID (more discriminative)
-            'use_bytetrack': True,       # NEW: Enable ByteTrack
-            'use_reid': True,            # NEW: Enable ReID features
-            'reid_model': 'osnet_x0_25',  # Deep ReID model: osnet_x0_25 (fastest ~3ms GPU) - was osnet_x1_0
+            "doorway_center": 0.5,  # 50% of frame width (center line)
+            "doorway_width": 0.02,  # 2% of frame width (narrow line)
+            "approach_zone": 0.15,  # 15% approach zone on each side
+            "min_path_length": 50,  # Minimum pixels traveled
+            "max_tracking_distance": 0.156,  # Proportion of frame width (~100px at 640w)
+            "tracker_timeout": 1.5,  # TUNED: Reduced from 3.0 to let false tracks expire faster
+            "yolo_conf_threshold": 0.31,  # F1-optimal threshold from V6 PR curve analysis
+            "yolo_iou_threshold": 0.3,  # TUNED: Lowered from 0.45 to separate overlapping people
+            "min_crossing_interval": 0.5,  # TUNED: Increased from 0.3 to prevent double counts
+            "min_peak_confidence": 0.35,  # Aligned with YOLO conf — final quality gate before counting a crossing
+            "reid_similarity_threshold": 0.6,  # TUNED: Increased for deep ReID (more discriminative)
+            "use_bytetrack": True,  # NEW: Enable ByteTrack
+            "use_reid": True,  # NEW: Enable ReID features
+            "reid_model": "osnet_x0_25",  # Deep ReID model: osnet_x0_25 (fastest ~3ms GPU) - was osnet_x1_0
             # METHOD 5: Occlusion + ReID Relink parameters (RECOMMENDED)
-            'danger_zone_buffer': 0.10,         # Width of danger zone (10% of frame)
-            'checkpoint_timeout': 5.0,          # Max seconds to search for lost track
-            'relink_similarity_threshold': 0.55,  # ReID match threshold for relinking (lower OK for occlusion)
-            'lingering_timeout': 10.0,          # Extended timeout for slow-moving people
+            "danger_zone_buffer": 0.10,  # Width of danger zone (10% of frame)
+            "checkpoint_timeout": 5.0,  # Max seconds to search for lost track
+            "relink_similarity_threshold": 0.55,  # ReID match threshold for relinking (lower OK for occlusion)
+            "lingering_timeout": 10.0,  # Extended timeout for slow-moving people
             # METHOD 5.4: Anti-teleport validation
-            'velocity_validation_enabled': True,        # Enable anti-teleport crossing validation
-            'velocity_min_transit_frames': 1,           # Min frames detected in danger zone (anti-teleport)
+            "velocity_validation_enabled": True,  # Enable anti-teleport crossing validation
+            "velocity_min_transit_frames": 1,  # Min frames detected in danger zone (anti-teleport)
             # Night mode: CLAHE preprocessing for low-light enhancement
-            'use_clahe': True,                  # Enable CLAHE preprocessing for night/low-light
-            'clahe_clip_limit': 2.0,            # Contrast limit (1.5-3.0, higher = more contrast but more noise)
-            'clahe_tile_size': 8,               # Tile grid size (8 is standard)
-            'clahe_engage_threshold': 60,       # Engage CLAHE when brightness drops below this (0-255)
-            'clahe_disengage_threshold': 80,    # Disengage CLAHE when brightness rises above this (0-255)
+            "use_clahe": True,  # Enable CLAHE preprocessing for night/low-light
+            "clahe_clip_limit": 2.0,  # Contrast limit (1.5-3.0, higher = more contrast but more noise)
+            "clahe_tile_size": 8,  # Tile grid size (8 is standard)
+            "clahe_engage_threshold": 60,  # Engage CLAHE when brightness drops below this (0-255)
+            "clahe_disengage_threshold": 80,  # Disengage CLAHE when brightness rises above this (0-255)
         }
 
         # METHOD 5: Active checkpoints for lost track recovery
@@ -607,11 +708,13 @@ class PeopleCounterProcessor(BaseStreamProcessor):
 
         # CLAHE preprocessor for night mode (initialized in on_start)
         self.clahe = None
-        self.clahe_engaged = False  # Hysteresis state: whether CLAHE is currently active
+        self.clahe_engaged = (
+            False  # Hysteresis state: whether CLAHE is currently active
+        )
 
         # Adaptive detection frame skipping
-        self._last_detection_frame = 0       # Frame number of last YOLO run
-        self._adaptive_detection = True      # Enable/disable adaptive skipping
+        self._last_detection_frame = 0  # Frame number of last YOLO run
+        self._adaptive_detection = True  # Enable/disable adaptive skipping
 
         # Tracking
         self.trackers: Dict[int, PersonTracker] = {}
@@ -621,25 +724,27 @@ class PeopleCounterProcessor(BaseStreamProcessor):
         # Crossing counts
         self.crossings = {
             CrossingDirection.LEFT_TO_RIGHT: 0,
-            CrossingDirection.RIGHT_TO_LEFT: 0
+            CrossingDirection.RIGHT_TO_LEFT: 0,
         }
         self.crossing_log = []
 
         # Initialize API client with device credentials
         # API is enabled only if device has credentials
-        device_id = self.device_info.get('device_id', self.stream_name)
-        password = self.device_info.get('password', '')
+        device_id = self.device_info.get("device_id", self.stream_name)
+        password = self.device_info.get("password", "")
         self.api_client = CrowdCountAPIClient(
             device_id=device_id,
             password=password,
-            base_url='https://api.crowdcount.tech',
-            timeout=5
+            base_url="https://api.crowdcount.tech",
+            timeout=5,
         )
 
         # Fetch direction flip setting and set up periodic refresh
         self.direction_flipped = self.api_client.get_direction_flipped()
         self.direction_refresh_timer = None
-        self.logger.info(f"Direction flipped setting initialized: {self.direction_flipped}")
+        self.logger.info(
+            f"Direction flipped setting initialized: {self.direction_flipped}"
+        )
 
     def on_start(self):
         """Initialize models or connect to centralized inference server when processor starts"""
@@ -647,6 +752,7 @@ class PeopleCounterProcessor(BaseStreamProcessor):
         # because threading.Lock and sqlite3.Connection are not picklable across processes)
         from api.count_backlog import CountBacklog
         from config.server_config import BACKLOG_DB_PATH
+
         backlog = CountBacklog(str(BACKLOG_DB_PATH))
         self.api_client.set_backlog(backlog)
 
@@ -655,8 +761,8 @@ class PeopleCounterProcessor(BaseStreamProcessor):
 
         # Determine mode: centralized inference vs legacy per-process GPU
         self.use_centralized_inference = (
-            self.inference_request_queue is not None and
-            self.inference_result_queue is not None
+            self.inference_request_queue is not None
+            and self.inference_result_queue is not None
         )
 
         if self.use_centralized_inference:
@@ -667,6 +773,7 @@ class PeopleCounterProcessor(BaseStreamProcessor):
     def _on_start_centralized(self):
         """Initialize for centralized inference mode (CPU-only worker)"""
         from .inference_server import RequestType, InferenceRequest
+
         # Store these for use in extract_detections / ReID calls
         self._RequestType = RequestType
         self._InferenceRequest = InferenceRequest
@@ -677,7 +784,10 @@ class PeopleCounterProcessor(BaseStreamProcessor):
         self._last_queue_full_log = 0  # Rate-limit "queue full" warnings
         self._last_inference_error_log = 0  # Rate-limit inference timeout errors
 
-        print(f"[{self.stream_name}] Centralized inference mode (CPU-only worker)", flush=True)
+        print(
+            f"[{self.stream_name}] Centralized inference mode (CPU-only worker)",
+            flush=True,
+        )
         self.logger.info("Using centralized inference server (no local GPU)")
 
         # Initialize standalone tracker (BoT-SORT with ReID or ByteTrack fallback)
@@ -690,21 +800,26 @@ class PeopleCounterProcessor(BaseStreamProcessor):
         # Log velocity validation settings
         self._log_velocity_settings()
 
-        print(f"[{self.stream_name}] Worker ready (BoT-SORT + crossing logic on CPU)", flush=True)
+        print(
+            f"[{self.stream_name}] Worker ready (BoT-SORT + crossing logic on CPU)",
+            flush=True,
+        )
 
     def _on_start_legacy(self):
         """Initialize for legacy per-process GPU mode (original behavior)"""
         if not YOLO_AVAILABLE:
-            print(f"ERROR: YOLO not available - cannot start people counter", flush=True)
+            print("ERROR: YOLO not available - cannot start people counter", flush=True)
             self.logger.error("YOLO not available - cannot start people counter")
-            raise ImportError("ultralytics package required. Install with: pip install ultralytics")
+            raise ImportError(
+                "ultralytics package required. Install with: pip install ultralytics"
+            )
 
         try:
             import torch
 
             # Check CUDA availability
             cuda_available = torch.cuda.is_available()
-            self.device = 'cuda' if cuda_available else 'cpu'
+            self.device = "cuda" if cuda_available else "cpu"
 
             print(f"Loading YOLO model: {self.model_path}", flush=True)
             print(f"Using device: {self.device}", flush=True)
@@ -714,7 +829,9 @@ class PeopleCounterProcessor(BaseStreamProcessor):
 
             self.logger.info(f"Loading YOLO model: {self.model_path}")
             self.logger.info(f"Using device: {self.device}")
-            self.logger.info(f"ByteTrack enabled: {self.doorway_config['use_bytetrack']}")
+            self.logger.info(
+                f"ByteTrack enabled: {self.doorway_config['use_bytetrack']}"
+            )
             self.logger.info(f"ReID enabled: {self.doorway_config['use_reid']}")
 
             # Load model with explicit CUDA device
@@ -727,31 +844,61 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             self.logger.info(f"Model loaded on device: {model_device}")
 
             # Get class names from model
-            if hasattr(self.model, 'names'):
+            if hasattr(self.model, "names"):
                 self.class_names = self.model.names
-                print(f"Model classes: {', '.join([f'{k}:{v}' for k, v in list(self.class_names.items())[:5]])}...", flush=True)
-                self.logger.info(f"Model classes: {', '.join([f'{k}:{v}' for k, v in self.class_names.items()])}")
+                print(
+                    f"Model classes: {', '.join([f'{k}:{v}' for k, v in list(self.class_names.items())[:5]])}...",
+                    flush=True,
+                )
+                self.logger.info(
+                    f"Model classes: {', '.join([f'{k}:{v}' for k, v in self.class_names.items()])}"
+                )
 
             # Log tuned parameters
-            print(f"Tuned parameters for group detection:", flush=True)
-            print(f"  - Confidence threshold: {self.doorway_config['yolo_conf_threshold']}", flush=True)
-            print(f"  - IOU threshold: {self.doorway_config['yolo_iou_threshold']}", flush=True)
-            print(f"  - Min crossing interval: {self.doorway_config['min_crossing_interval']}s", flush=True)
-            print(f"  - Tracker timeout: {self.doorway_config['tracker_timeout']}s", flush=True)
+            print("Tuned parameters for group detection:", flush=True)
+            print(
+                f"  - Confidence threshold: {self.doorway_config['yolo_conf_threshold']}",
+                flush=True,
+            )
+            print(
+                f"  - IOU threshold: {self.doorway_config['yolo_iou_threshold']}",
+                flush=True,
+            )
+            print(
+                f"  - Min crossing interval: {self.doorway_config['min_crossing_interval']}s",
+                flush=True,
+            )
+            print(
+                f"  - Tracker timeout: {self.doorway_config['tracker_timeout']}s",
+                flush=True,
+            )
 
-            print("YOLO + ByteTrack loaded successfully with CUDA!" if cuda_available else "YOLO + ByteTrack loaded (CPU mode)", flush=True)
+            print(
+                "YOLO + ByteTrack loaded successfully with CUDA!"
+                if cuda_available
+                else "YOLO + ByteTrack loaded (CPU mode)",
+                flush=True,
+            )
             self.logger.info("YOLO model with ByteTrack loaded successfully")
 
             # Initialize Deep ReID extractor
-            if self.doorway_config['use_reid']:
-                print(f"Loading Deep ReID model: {self.doorway_config['reid_model']}...", flush=True)
-                self.reid_extractor = create_reid_extractor(
-                    model_name=self.doorway_config['reid_model'],
-                    device=self.device,
-                    verbose=True
+            if self.doorway_config["use_reid"]:
+                print(
+                    f"Loading Deep ReID model: {self.doorway_config['reid_model']}...",
+                    flush=True,
                 )
-                print(f"Deep ReID loaded (feature dim: {self.reid_extractor.feature_dim})", flush=True)
-                self.logger.info(f"Deep ReID initialized: {self.doorway_config['reid_model']}")
+                self.reid_extractor = create_reid_extractor(
+                    model_name=self.doorway_config["reid_model"],
+                    device=self.device,
+                    verbose=True,
+                )
+                print(
+                    f"Deep ReID loaded (feature dim: {self.reid_extractor.feature_dim})",
+                    flush=True,
+                )
+                self.logger.info(
+                    f"Deep ReID initialized: {self.doorway_config['reid_model']}"
+                )
 
             # Initialize CLAHE for night mode preprocessing
             self._init_clahe()
@@ -771,85 +918,102 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             import os
 
             # Load tracker config from yaml
-            with open(self.tracker_config, 'r') as f:
+            with open(self.tracker_config, "r") as f:
                 bt_config = yaml.safe_load(f)
 
-            tracker_type = bt_config.get('tracker_type', 'bytetrack')
+            tracker_type = bt_config.get("tracker_type", "bytetrack")
 
             # Create args object with shared parameters
             class TrackerArgs:
                 pass
 
             args = TrackerArgs()
-            args.track_high_thresh = bt_config.get('track_high_thresh', 0.25)
-            args.track_low_thresh = bt_config.get('track_low_thresh', 0.15)
-            args.new_track_thresh = bt_config.get('new_track_thresh', 0.3)
-            args.track_buffer = bt_config.get('track_buffer', 30)
-            args.match_thresh = bt_config.get('match_thresh', 0.75)
-            args.fuse_score = bt_config.get('fuse_score', True)
+            args.track_high_thresh = bt_config.get("track_high_thresh", 0.25)
+            args.track_low_thresh = bt_config.get("track_low_thresh", 0.15)
+            args.new_track_thresh = bt_config.get("new_track_thresh", 0.3)
+            args.track_buffer = bt_config.get("track_buffer", 30)
+            args.match_thresh = bt_config.get("match_thresh", 0.75)
+            args.fuse_score = bt_config.get("fuse_score", True)
 
-            if tracker_type == 'botsort':
+            if tracker_type == "botsort":
                 from ultralytics.trackers.bot_sort import BOTSORT
 
                 # BoT-SORT specific args
-                args.gmc_method = bt_config.get('gmc_method', 'none')
-                args.proximity_thresh = bt_config.get('proximity_thresh', 0.5)
-                args.appearance_thresh = bt_config.get('appearance_thresh', 0.25)
-                args.with_reid = bt_config.get('with_reid', False)
+                args.gmc_method = bt_config.get("gmc_method", "none")
+                args.proximity_thresh = bt_config.get("proximity_thresh", 0.5)
+                args.appearance_thresh = bt_config.get("appearance_thresh", 0.25)
+                args.with_reid = bt_config.get("with_reid", False)
                 # Resolve model path relative to MODELS_DIR for reliability
-                model_name = bt_config.get('model', 'yolo11n-cls.pt')
+                model_name = bt_config.get("model", "yolo11n-cls.pt")
                 model_path = MODELS_DIR / model_name
                 args.model = str(model_path) if model_path.exists() else model_name
 
                 # Force CPU for ReID model — processors are CPU-only workers
-                old_cuda = os.environ.get('CUDA_VISIBLE_DEVICES')
-                os.environ['CUDA_VISIBLE_DEVICES'] = ''
+                old_cuda = os.environ.get("CUDA_VISIBLE_DEVICES")
+                os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
                 try:
                     self.byte_tracker = BOTSORT(args, frame_rate=8)
                 finally:
                     # Restore original CUDA_VISIBLE_DEVICES
                     if old_cuda is not None:
-                        os.environ['CUDA_VISIBLE_DEVICES'] = old_cuda
+                        os.environ["CUDA_VISIBLE_DEVICES"] = old_cuda
                     else:
-                        del os.environ['CUDA_VISIBLE_DEVICES']
+                        del os.environ["CUDA_VISIBLE_DEVICES"]
 
                 reid_status = "with ReID" if args.with_reid else "without ReID"
-                print(f"[{self.stream_name}] Standalone BoT-SORT initialized {reid_status}", flush=True)
-                self.logger.info(f"Standalone BoT-SORT tracker initialized {reid_status} (model={args.model})")
+                print(
+                    f"[{self.stream_name}] Standalone BoT-SORT initialized {reid_status}",
+                    flush=True,
+                )
+                self.logger.info(
+                    f"Standalone BoT-SORT tracker initialized {reid_status} (model={args.model})"
+                )
             else:
                 from ultralytics.trackers.byte_tracker import BYTETracker
 
                 self.byte_tracker = BYTETracker(args, frame_rate=8)
-                print(f"[{self.stream_name}] Standalone ByteTrack initialized", flush=True)
+                print(
+                    f"[{self.stream_name}] Standalone ByteTrack initialized", flush=True
+                )
                 self.logger.info("Standalone ByteTrack tracker initialized")
 
         except Exception as e:
             self.logger.error(f"Failed to initialize standalone tracker: {e}")
             import traceback
+
             self.logger.error(traceback.format_exc())
             self.byte_tracker = None
 
     def _init_clahe(self):
         """Initialize CLAHE for night mode preprocessing."""
-        if self.doorway_config['use_clahe']:
-            clip_limit = self.doorway_config['clahe_clip_limit']
-            tile_size = self.doorway_config['clahe_tile_size']
-            engage_threshold = self.doorway_config['clahe_engage_threshold']
-            disengage_threshold = self.doorway_config['clahe_disengage_threshold']
+        if self.doorway_config["use_clahe"]:
+            clip_limit = self.doorway_config["clahe_clip_limit"]
+            tile_size = self.doorway_config["clahe_tile_size"]
+            engage_threshold = self.doorway_config["clahe_engage_threshold"]
+            disengage_threshold = self.doorway_config["clahe_disengage_threshold"]
             self.clahe = cv2.createCLAHE(
-                clipLimit=clip_limit,
-                tileGridSize=(tile_size, tile_size)
+                clipLimit=clip_limit, tileGridSize=(tile_size, tile_size)
             )
-            print(f"CLAHE night mode enabled (clipLimit={clip_limit}, tileSize={tile_size}x{tile_size}, engage<{engage_threshold}, disengage>{disengage_threshold})", flush=True)
-            self.logger.info(f"CLAHE initialized: clipLimit={clip_limit}, tileGridSize={tile_size}, engageThreshold={engage_threshold}, disengageThreshold={disengage_threshold}")
+            print(
+                f"CLAHE night mode enabled (clipLimit={clip_limit}, tileSize={tile_size}x{tile_size}, engage<{engage_threshold}, disengage>{disengage_threshold})",
+                flush=True,
+            )
+            self.logger.info(
+                f"CLAHE initialized: clipLimit={clip_limit}, tileGridSize={tile_size}, engageThreshold={engage_threshold}, disengageThreshold={disengage_threshold}"
+            )
 
     def _log_velocity_settings(self):
         """Log METHOD 5.4 anti-teleport validation settings."""
-        if self.doorway_config.get('velocity_validation_enabled', False):
-            print(f"Anti-teleport crossing validation enabled", flush=True)
-            print(f"  - Min transit frames: {self.doorway_config['velocity_min_transit_frames']}", flush=True)
-            self.logger.info(f"Anti-teleport validation enabled: min_transit_frames={self.doorway_config['velocity_min_transit_frames']}")
+        if self.doorway_config.get("velocity_validation_enabled", False):
+            print("Anti-teleport crossing validation enabled", flush=True)
+            print(
+                f"  - Min transit frames: {self.doorway_config['velocity_min_transit_frames']}",
+                flush=True,
+            )
+            self.logger.info(
+                f"Anti-teleport validation enabled: min_transit_frames={self.doorway_config['velocity_min_transit_frames']}"
+            )
 
     def on_stop(self):
         """Cleanup when processor stops"""
@@ -863,18 +1027,20 @@ class PeopleCounterProcessor(BaseStreamProcessor):
         rl_count = self.crossings[CrossingDirection.RIGHT_TO_LEFT]
         net_flow = lr_count - rl_count
 
-        self.logger.info("="*60)
+        self.logger.info("=" * 60)
         self.logger.info("PEOPLE COUNTER - Summary")
-        self.logger.info("="*60)
+        self.logger.info("=" * 60)
         self.logger.info(f"Total Crossings: {total}")
         self.logger.info(f"  Left → Right: {lr_count}")
         self.logger.info(f"  Right → Left: {rl_count}")
         self.logger.info(f"  Net Flow (L→R): {net_flow:+d}")
-        self.logger.info("="*60)
+        self.logger.info("=" * 60)
 
     def _schedule_direction_refresh(self):
         """Schedule the next direction_flipped setting refresh"""
-        self.direction_refresh_timer = threading.Timer(60.0, self._refresh_direction_setting)
+        self.direction_refresh_timer = threading.Timer(
+            60.0, self._refresh_direction_setting
+        )
         self.direction_refresh_timer.daemon = True
         self.direction_refresh_timer.start()
 
@@ -883,7 +1049,9 @@ class PeopleCounterProcessor(BaseStreamProcessor):
         try:
             new_value = self.api_client.get_direction_flipped()
             if new_value != self.direction_flipped:
-                self.logger.info(f"Direction flipped setting changed: {self.direction_flipped} → {new_value}")
+                self.logger.info(
+                    f"Direction flipped setting changed: {self.direction_flipped} → {new_value}"
+                )
                 self.direction_flipped = new_value
         except Exception as e:
             self.logger.warning(f"Failed to refresh direction_flipped setting: {e}")
@@ -955,8 +1123,10 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             mean_brightness = np.mean(gray)
 
-            engage_threshold = self.doorway_config.get('clahe_engage_threshold', 60)
-            disengage_threshold = self.doorway_config.get('clahe_disengage_threshold', 80)
+            engage_threshold = self.doorway_config.get("clahe_engage_threshold", 60)
+            disengage_threshold = self.doorway_config.get(
+                "clahe_disengage_threshold", 80
+            )
 
             # Hysteresis: engage below 60, disengage above 80
             if not self.clahe_engaged:
@@ -998,7 +1168,7 @@ class PeopleCounterProcessor(BaseStreamProcessor):
         - Legacy: runs YOLO model.track() locally with per-process GPU
         """
         # Apply CLAHE preprocessing for night mode if enabled
-        if self.doorway_config['use_clahe'] and self.clahe is not None:
+        if self.doorway_config["use_clahe"] and self.clahe is not None:
             frame = self._apply_clahe(frame)
 
         if self.use_centralized_inference:
@@ -1042,7 +1212,7 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             if remaining <= 0:
                 raise queue_module.Empty()
             response = self.inference_result_queue.get(timeout=remaining)
-            resp_id = getattr(response, 'request_id', None)
+            resp_id = getattr(response, "request_id", None)
             if resp_id is None or resp_id == request_id:
                 return response
             # Stale/mismatched — discard and keep waiting
@@ -1066,16 +1236,23 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             if now - self._last_inference_retry_time < retry_interval:
                 return detections  # Still in backoff window
             self._last_inference_retry_time = now
-            self.logger.info(f"Inference backoff: attempting periodic retry (interval: {retry_interval:.0f}s)")
+            self.logger.info(
+                f"Inference backoff: attempting periodic retry (interval: {retry_interval:.0f}s)"
+            )
             # Self-healing: re-send REGISTER in case inference server lost our mapping
             if self.inference_slot_name:
                 try:
-                    self.inference_request_queue.put(self._InferenceRequest(
-                        type=self._RequestType.REGISTER,
-                        camera_id=self.stream_name,
-                        slot_name=self.inference_slot_name,
-                    ), timeout=1.0)
-                    self.logger.info("Re-sent REGISTER to inference server (self-healing)")
+                    self.inference_request_queue.put(
+                        self._InferenceRequest(
+                            type=self._RequestType.REGISTER,
+                            camera_id=self.stream_name,
+                            slot_name=self.inference_slot_name,
+                        ),
+                        timeout=1.0,
+                    )
+                    self.logger.info(
+                        "Re-sent REGISTER to inference server (self-healing)"
+                    )
                 except Exception:
                     pass
 
@@ -1085,8 +1262,8 @@ class PeopleCounterProcessor(BaseStreamProcessor):
                 type=self._RequestType.DETECT,
                 camera_id=self.stream_name,
                 frame=frame,
-                conf=self.doorway_config['yolo_conf_threshold'],
-                iou=self.doorway_config['yolo_iou_threshold'],
+                conf=self.doorway_config["yolo_conf_threshold"],
+                iou=self.doorway_config["yolo_iou_threshold"],
                 slot_name=self.inference_slot_name,
             )
             try:
@@ -1094,7 +1271,9 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             except queue_module.Full:
                 now = time.time()
                 if now - self._last_queue_full_log > 30:
-                    self.logger.warning("Inference request queue full - skipping detection (suppressing for 30s)")
+                    self.logger.warning(
+                        "Inference request queue full - skipping detection (suppressing for 30s)"
+                    )
                     self._last_queue_full_log = now
                 self._centralized_inference_failures += 1
                 return detections
@@ -1129,7 +1308,7 @@ class PeopleCounterProcessor(BaseStreamProcessor):
                         class_id=det_result.class_id,
                         class_name=det_result.class_name,
                         track_id=track_id,
-                        appearance_features=None  # Extracted on-demand in update_trackers
+                        appearance_features=None,  # Extracted on-demand in update_trackers
                     )
                     detections.append(detection)
 
@@ -1147,6 +1326,7 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             self._centralized_inference_failures += 1
             self.logger.error(f"Centralized detection error: {e}")
             import traceback
+
             self.logger.error(traceback.format_exc())
 
         return detections
@@ -1190,17 +1370,22 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             # .conf, .cls, .xywh, .xyxy attributes and boolean/integer indexing
             class DetectionWrapper:
                 """Lightweight wrapper to satisfy ultralytics BYTETracker API."""
+
                 def __init__(self, xyxy, xywh, conf, cls):
                     self.xyxy = np.array(xyxy, dtype=np.float32)
                     self.xywh = np.array(xywh, dtype=np.float32)
                     self.conf = np.array(conf, dtype=np.float32)
                     self.cls = np.array(cls, dtype=np.float32)
+
                 def __len__(self):
                     return len(self.conf)
+
                 def __getitem__(self, idx):
                     return DetectionWrapper(
-                        self.xyxy[idx], self.xywh[idx],
-                        self.conf[idx], self.cls[idx],
+                        self.xyxy[idx],
+                        self.xywh[idx],
+                        self.conf[idx],
+                        self.cls[idx],
                     )
 
             wrapper = DetectionWrapper(xyxy_list, xywh_list, conf_list, cls_list)
@@ -1222,7 +1407,7 @@ class PeopleCounterProcessor(BaseStreamProcessor):
 
                 # Find closest input detection by center distance
                 best_idx = None
-                best_dist = float('inf')
+                best_dist = float("inf")
                 for i, det in enumerate(det_results):
                     if track_ids[i] is not None:
                         continue  # Already matched
@@ -1241,6 +1426,7 @@ class PeopleCounterProcessor(BaseStreamProcessor):
         except Exception as e:
             self.logger.error(f"ByteTrack error: {e}")
             import traceback
+
             self.logger.error(traceback.format_exc())
             return [None] * len(det_results)
 
@@ -1249,25 +1435,25 @@ class PeopleCounterProcessor(BaseStreamProcessor):
         detections = []
 
         try:
-            if self.doorway_config['use_bytetrack']:
+            if self.doorway_config["use_bytetrack"]:
                 # Use ByteTrack for improved tracking (especially for groups)
                 results = self.model.track(
                     frame,
-                    conf=self.doorway_config['yolo_conf_threshold'],
-                    iou=self.doorway_config['yolo_iou_threshold'],
+                    conf=self.doorway_config["yolo_conf_threshold"],
+                    iou=self.doorway_config["yolo_iou_threshold"],
                     classes=[0],  # Only detect person class
                     persist=True,  # Persist tracks across frames
                     tracker=self.tracker_config,  # Use our BoT-SORT/ByteTrack config
-                    verbose=False
+                    verbose=False,
                 )
             else:
                 # Fallback to standard detection
                 results = self.model(
                     frame,
-                    conf=self.doorway_config['yolo_conf_threshold'],
-                    iou=self.doorway_config['yolo_iou_threshold'],
+                    conf=self.doorway_config["yolo_conf_threshold"],
+                    iou=self.doorway_config["yolo_iou_threshold"],
                     classes=[0],
-                    verbose=False
+                    verbose=False,
                 )
 
             if results and len(results) > 0:
@@ -1278,7 +1464,7 @@ class PeopleCounterProcessor(BaseStreamProcessor):
                         # Get confidence and class
                         confidence = float(box.conf[0])
                         class_id = int(box.cls[0])
-                        class_name = self.class_names.get(class_id, 'unknown')
+                        class_name = self.class_names.get(class_id, "unknown")
 
                         # ONLY process person detections (class_id == 0)
                         if class_id != 0:
@@ -1286,7 +1472,7 @@ class PeopleCounterProcessor(BaseStreamProcessor):
 
                         # Get ByteTrack ID if available
                         track_id = None
-                        if hasattr(box, 'id') and box.id is not None:
+                        if hasattr(box, "id") and box.id is not None:
                             track_id = int(box.id[0])
 
                         # Get box coordinates
@@ -1308,18 +1494,21 @@ class PeopleCounterProcessor(BaseStreamProcessor):
                             class_id=class_id,
                             class_name=class_name,
                             track_id=track_id,
-                            appearance_features=None  # Extracted on-demand in update_trackers
+                            appearance_features=None,  # Extracted on-demand in update_trackers
                         )
                         detections.append(detection)
 
         except Exception as e:
             self.logger.error(f"Detection error: {e}")
             import traceback
+
             self.logger.error(traceback.format_exc())
 
         return detections
 
-    def _extract_appearance_features(self, frame, x1: int, y1: int, x2: int, y2: int) -> Optional[np.ndarray]:
+    def _extract_appearance_features(
+        self, frame, x1: int, y1: int, x2: int, y2: int
+    ) -> Optional[np.ndarray]:
         """
         Extract deep ReID appearance features from a person bounding box.
         Uses OSNet pretrained on person re-identification datasets.
@@ -1335,11 +1524,15 @@ class PeopleCounterProcessor(BaseStreamProcessor):
                 return None
             return self.reid_extractor.extract(frame, x1, y1, x2, y2)
 
-    def _extract_appearance_batch_centralized(self, frame, boxes: List[Tuple[int, int, int, int]]) -> List[Optional[np.ndarray]]:
+    def _extract_appearance_batch_centralized(
+        self, frame, boxes: List[Tuple[int, int, int, int]]
+    ) -> List[Optional[np.ndarray]]:
         """Extract ReID features for multiple boxes via centralized inference server."""
         return self._extract_appearance_centralized(frame, boxes)
 
-    def _extract_appearance_centralized(self, frame, boxes: List[Tuple[int, int, int, int]]) -> List[Optional[np.ndarray]]:
+    def _extract_appearance_centralized(
+        self, frame, boxes: List[Tuple[int, int, int, int]]
+    ) -> List[Optional[np.ndarray]]:
         """Send ReID extraction request to inference server and wait for response."""
         if not boxes:
             return []
@@ -1370,7 +1563,9 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             except queue_module.Full:
                 now = time.time()
                 if now - self._last_queue_full_log > 30:
-                    self.logger.warning("Inference request queue full - skipping ReID (suppressing for 30s)")
+                    self.logger.warning(
+                        "Inference request queue full - skipping ReID (suppressing for 30s)"
+                    )
                     self._last_queue_full_log = now
                 self._centralized_inference_failures += 1
                 return [None] * len(boxes)
@@ -1406,7 +1601,15 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             self.logger.error(f"Centralized ReID error: {e}")
             return [None] * len(boxes)
 
-    def _check_and_handle_crossing(self, track_id: int, detection: Detection, frame_width: int, current_time: float, frame=None, frame_height: int = 480):
+    def _check_and_handle_crossing(
+        self,
+        track_id: int,
+        detection: Detection,
+        frame_width: int,
+        current_time: float,
+        frame=None,
+        frame_height: int = 480,
+    ):
         """Check for crossing and handle API calls if crossing detected."""
         tracker = self.trackers[track_id]
 
@@ -1416,27 +1619,35 @@ class PeopleCounterProcessor(BaseStreamProcessor):
         # count the crossing. The checkpoint recovery path has its own ReID similarity gate.
         crossing_dir = tracker.check_crossing(
             frame_width,
-            self.doorway_config['doorway_center'],
-            self.doorway_config['doorway_width'],
-            self.doorway_config['danger_zone_buffer'],  # METHOD 5: pass danger zone buffer
-            min_transit_frames=self.doorway_config.get('velocity_min_transit_frames', 1),
-            frame_height=frame_height
+            self.doorway_config["doorway_center"],
+            self.doorway_config["doorway_width"],
+            self.doorway_config[
+                "danger_zone_buffer"
+            ],  # METHOD 5: pass danger zone buffer
+            min_transit_frames=self.doorway_config.get(
+                "velocity_min_transit_frames", 1
+            ),
+            frame_height=frame_height,
         )
 
         # METHOD 5: Create checkpoint when tracker enters danger zone
         if tracker.needs_checkpoint and frame is not None:
             tracker.needs_checkpoint = False
-            if self.doorway_config['use_reid'] and (self.reid_extractor is not None or self.use_centralized_inference):
+            if self.doorway_config["use_reid"] and (
+                self.reid_extractor is not None or self.use_centralized_inference
+            ):
                 x, y, w, h = detection.bbox
                 embedding = self._extract_appearance_features(frame, x, y, x + w, y + h)
                 if embedding is not None:
-                    tracker.create_checkpoint(embedding, detection.center, detection.confidence)
+                    tracker.create_checkpoint(
+                        embedding, detection.center, detection.confidence
+                    )
                     if tracker.mean_appearance is None:
                         tracker.update_appearance(embedding)
 
         # Gate actual crossing counting on minimum confidence —
         # filters out shadows, reflections, and other low-confidence artifacts
-        min_conf = self.doorway_config.get('min_peak_confidence', 0.40)
+        min_conf = self.doorway_config.get("min_peak_confidence", 0.40)
         if tracker.peak_confidence < min_conf:
             return  # Track hasn't proven to be a real person yet
 
@@ -1448,36 +1659,54 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             # Apply direction flip logic if enabled
             if self.direction_flipped:
                 if crossing_dir == CrossingDirection.LEFT_TO_RIGHT:
-                    threading.Thread(target=self.api_client.subtract_from_count, args=(1,),
-                                     kwargs={'crossing_timestamp': current_time}, daemon=True).start()
+                    threading.Thread(
+                        target=self.api_client.subtract_from_count,
+                        args=(1,),
+                        kwargs={"crossing_timestamp": current_time},
+                        daemon=True,
+                    ).start()
                 elif crossing_dir == CrossingDirection.RIGHT_TO_LEFT:
-                    threading.Thread(target=self.api_client.add_to_count, args=(1,),
-                                     kwargs={'crossing_timestamp': current_time}, daemon=True).start()
+                    threading.Thread(
+                        target=self.api_client.add_to_count,
+                        args=(1,),
+                        kwargs={"crossing_timestamp": current_time},
+                        daemon=True,
+                    ).start()
             else:
                 if crossing_dir == CrossingDirection.LEFT_TO_RIGHT:
-                    threading.Thread(target=self.api_client.add_to_count, args=(1,),
-                                     kwargs={'crossing_timestamp': current_time}, daemon=True).start()
+                    threading.Thread(
+                        target=self.api_client.add_to_count,
+                        args=(1,),
+                        kwargs={"crossing_timestamp": current_time},
+                        daemon=True,
+                    ).start()
                 elif crossing_dir == CrossingDirection.RIGHT_TO_LEFT:
-                    threading.Thread(target=self.api_client.subtract_from_count, args=(1,),
-                                     kwargs={'crossing_timestamp': current_time}, daemon=True).start()
+                    threading.Thread(
+                        target=self.api_client.subtract_from_count,
+                        args=(1,),
+                        kwargs={"crossing_timestamp": current_time},
+                        daemon=True,
+                    ).start()
 
             # Log the crossing
             crossing_info = {
-                'timestamp': current_time,
-                'track_id': track_id,
-                'direction': crossing_dir.value,
-                'confidence': self.trackers[track_id].peak_confidence,
-                'total_crossings_by_person': self.trackers[track_id].total_crossings,
-                'position': detection.center,
-                'detection_count': self.trackers[track_id].detection_count
+                "timestamp": current_time,
+                "track_id": track_id,
+                "direction": crossing_dir.value,
+                "confidence": self.trackers[track_id].peak_confidence,
+                "total_crossings_by_person": self.trackers[track_id].total_crossings,
+                "position": detection.center,
+                "detection_count": self.trackers[track_id].detection_count,
             }
             self.crossing_log.append(crossing_info)
 
             total = sum(self.crossings.values())
-            self.logger.info(f"CROSSING #{total}: {crossing_dir.value} | "
-                           f"Track #{track_id} (detections: {self.trackers[track_id].detection_count}) | "
-                           f"L->R: {self.crossings[CrossingDirection.LEFT_TO_RIGHT]} | "
-                           f"R->L: {self.crossings[CrossingDirection.RIGHT_TO_LEFT]}")
+            self.logger.info(
+                f"CROSSING #{total}: {crossing_dir.value} | "
+                f"Track #{track_id} (detections: {self.trackers[track_id].detection_count}) | "
+                f"L->R: {self.crossings[CrossingDirection.LEFT_TO_RIGHT]} | "
+                f"R->L: {self.crossings[CrossingDirection.RIGHT_TO_LEFT]}"
+            )
 
     @staticmethod
     def _calculate_bbox_iou(bbox1, bbox2) -> float:
@@ -1505,7 +1734,9 @@ class PeopleCounterProcessor(BaseStreamProcessor):
 
         return intersection / union if union > 0 else 0.0
 
-    def _match_by_position_and_reid(self, detection: Detection, frame_width: int = 640) -> Optional[int]:
+    def _match_by_position_and_reid(
+        self, detection: Detection, frame_width: int = 640
+    ) -> Optional[int]:
         """
         Match detection to tracker using position distance and ReID similarity.
         Used for detections that ByteTrack couldn't match directly.
@@ -1514,7 +1745,7 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             return None
 
         best_match_id = None
-        best_score = float('inf')
+        best_score = float("inf")
 
         for track_id, tracker in self.trackers.items():
             if len(tracker.positions) == 0:
@@ -1523,8 +1754,8 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             # Calculate distance to last known position
             last_pos = tracker.positions[-1]
             dist = math.sqrt(
-                (detection.center[0] - last_pos[0])**2 +
-                (detection.center[1] - last_pos[1])**2
+                (detection.center[0] - last_pos[0]) ** 2
+                + (detection.center[1] - last_pos[1]) ** 2
             )
 
             # Consider velocity for prediction
@@ -1535,24 +1766,31 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             predicted_y = last_pos[1] + vy * time_diff
 
             pred_dist = math.sqrt(
-                (detection.center[0] - predicted_x)**2 +
-                (detection.center[1] - predicted_y)**2
+                (detection.center[0] - predicted_x) ** 2
+                + (detection.center[1] - predicted_y) ** 2
             )
 
             position_dist = min(dist, pred_dist)
 
-            if position_dist > self.doorway_config['max_tracking_distance'] * frame_width:
+            if (
+                position_dist
+                > self.doorway_config["max_tracking_distance"] * frame_width
+            ):
                 continue
 
             # Calculate ReID similarity score (if available)
             reid_score = 0.0
-            if (self.doorway_config['use_reid'] and
-                detection.appearance_features is not None and
-                tracker.mean_appearance is not None):
-                reid_score = tracker.get_appearance_similarity(detection.appearance_features)
+            if (
+                self.doorway_config["use_reid"]
+                and detection.appearance_features is not None
+                and tracker.mean_appearance is not None
+            ):
+                reid_score = tracker.get_appearance_similarity(
+                    detection.appearance_features
+                )
 
             # Combined score: weight position and appearance
-            if reid_score > self.doorway_config['reid_similarity_threshold']:
+            if reid_score > self.doorway_config["reid_similarity_threshold"]:
                 final_score = position_dist * (1.0 - reid_score * 0.5)
             else:
                 final_score = position_dist
@@ -1563,7 +1801,9 @@ class PeopleCounterProcessor(BaseStreamProcessor):
 
         return best_match_id
 
-    def match_detection_to_tracker(self, detection: Detection, frame_width: int = 640) -> Optional[int]:
+    def match_detection_to_tracker(
+        self, detection: Detection, frame_width: int = 640
+    ) -> Optional[int]:
         """
         Match a detection to existing tracker using ByteTrack ID, ReID, and distance.
         Priority: ByteTrack ID > ReID similarity > Position distance
@@ -1579,7 +1819,7 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             # ByteTrack assigned a new ID - this might be a new person or re-ID needed
 
         best_match_id = None
-        best_score = float('inf')  # Lower is better for distance-based scoring
+        best_score = float("inf")  # Lower is better for distance-based scoring
 
         # Priority 2 & 3: Combined ReID + distance matching
         for track_id, tracker in self.trackers.items():
@@ -1589,8 +1829,8 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             # Calculate distance to last known position
             last_pos = tracker.positions[-1]
             dist = math.sqrt(
-                (detection.center[0] - last_pos[0])**2 +
-                (detection.center[1] - last_pos[1])**2
+                (detection.center[0] - last_pos[0]) ** 2
+                + (detection.center[1] - last_pos[1]) ** 2
             )
 
             # Consider velocity for prediction
@@ -1603,28 +1843,35 @@ class PeopleCounterProcessor(BaseStreamProcessor):
 
             # Distance to predicted position
             pred_dist = math.sqrt(
-                (detection.center[0] - predicted_x)**2 +
-                (detection.center[1] - predicted_y)**2
+                (detection.center[0] - predicted_x) ** 2
+                + (detection.center[1] - predicted_y) ** 2
             )
 
             # Use minimum of actual and predicted distance
             position_dist = min(dist, pred_dist)
 
             # Skip if too far away
-            if position_dist > self.doorway_config['max_tracking_distance'] * frame_width:
+            if (
+                position_dist
+                > self.doorway_config["max_tracking_distance"] * frame_width
+            ):
                 continue
 
             # Calculate ReID similarity score (if available)
             reid_score = 0.0
-            if (self.doorway_config['use_reid'] and
-                detection.appearance_features is not None and
-                tracker.mean_appearance is not None):
-                reid_score = tracker.get_appearance_similarity(detection.appearance_features)
+            if (
+                self.doorway_config["use_reid"]
+                and detection.appearance_features is not None
+                and tracker.mean_appearance is not None
+            ):
+                reid_score = tracker.get_appearance_similarity(
+                    detection.appearance_features
+                )
 
             # Combined score: weight position and appearance
             # Lower score = better match
             # If ReID similarity is high (>0.5), reduce the effective distance
-            if reid_score > self.doorway_config['reid_similarity_threshold']:
+            if reid_score > self.doorway_config["reid_similarity_threshold"]:
                 # High appearance similarity - give significant boost
                 final_score = position_dist * (1.0 - reid_score * 0.5)
             else:
@@ -1636,7 +1883,9 @@ class PeopleCounterProcessor(BaseStreamProcessor):
 
         return best_match_id
 
-    def _find_best_reid_match(self, detection: Detection, max_distance: float = 200, frame_width: int = 640) -> Optional[int]:
+    def _find_best_reid_match(
+        self, detection: Detection, max_distance: float = 200, frame_width: int = 640
+    ) -> Optional[int]:
         """
         Find the best ReID match for a detection among lost/stale trackers.
         Used when ByteTrack loses a track (e.g., during occlusion in groups).
@@ -1645,7 +1894,7 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             return None
 
         best_match_id = None
-        best_similarity = self.doorway_config['reid_similarity_threshold']
+        best_similarity = self.doorway_config["reid_similarity_threshold"]
 
         for track_id, tracker in self.trackers.items():
             # Only consider trackers that haven't been updated recently (lost tracks)
@@ -1664,8 +1913,8 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             if len(tracker.positions) > 0:
                 last_pos = tracker.positions[-1]
                 dist = math.sqrt(
-                    (detection.center[0] - last_pos[0])**2 +
-                    (detection.center[1] - last_pos[1])**2
+                    (detection.center[0] - last_pos[0]) ** 2
+                    + (detection.center[1] - last_pos[1]) ** 2
                 )
 
                 # Scale max distance by time gap and velocity
@@ -1684,7 +1933,9 @@ class PeopleCounterProcessor(BaseStreamProcessor):
                     continue
 
             # Calculate appearance similarity
-            similarity = tracker.get_appearance_similarity(detection.appearance_features)
+            similarity = tracker.get_appearance_similarity(
+                detection.appearance_features
+            )
 
             if similarity > best_similarity:
                 best_similarity = similarity
@@ -1714,7 +1965,14 @@ class PeopleCounterProcessor(BaseStreamProcessor):
                 if detection.is_predicted and detection.track_id in self.trackers:
                     self.trackers[detection.track_id].update(detection)
                     matched_trackers.add(detection.track_id)
-                    self._check_and_handle_crossing(detection.track_id, detection, width, current_time, frame, frame_height=height)
+                    self._check_and_handle_crossing(
+                        detection.track_id,
+                        detection,
+                        width,
+                        current_time,
+                        frame,
+                        frame_height=height,
+                    )
             # Skip all remaining phases — no real detections to match
             # Still need to clean up stale trackers (fall through to cleanup below)
             unmatched_detections = []
@@ -1724,7 +1982,10 @@ class PeopleCounterProcessor(BaseStreamProcessor):
 
             for detection in detections:
                 # Quick check: does ByteTrack ID match an existing tracker?
-                if detection.track_id is not None and detection.track_id in self.trackers:
+                if (
+                    detection.track_id is not None
+                    and detection.track_id in self.trackers
+                ):
                     track_id = detection.track_id
                     tracker = self.trackers[track_id]
                     # Detect ByteTrack ID switch: if the detection is far from where
@@ -1733,7 +1994,7 @@ class PeopleCounterProcessor(BaseStreamProcessor):
                     if tracker.positions:
                         predicted = tracker.get_predicted_position(current_time)
                         distance = abs(detection.center[0] - predicted[0])
-                        max_dist = self.doorway_config['max_tracking_distance'] * width
+                        max_dist = self.doorway_config["max_tracking_distance"] * width
                         if distance > max_dist:
                             tracker.previous_zone = None
                             tracker.current_zone = None
@@ -1744,14 +2005,22 @@ class PeopleCounterProcessor(BaseStreamProcessor):
                             tracker.search_active = False
                             self.logger.debug(
                                 f"ByteTrack ID switch detected: track #{track_id} "
-                                f"jumped {distance/width*100:.1f}% from predicted pos, "
-                                f"resetting state")
+                                f"jumped {distance / width * 100:.1f}% from predicted pos, "
+                                f"resetting state"
+                            )
                     # Update existing tracker
                     tracker.update(detection)
                     matched_trackers.add(track_id)
 
                     # Check for crossing with trajectory validation
-                    self._check_and_handle_crossing(track_id, detection, width, current_time, frame, frame_height=height)
+                    self._check_and_handle_crossing(
+                        track_id,
+                        detection,
+                        width,
+                        current_time,
+                        frame,
+                        frame_height=height,
+                    )
                 else:
                     # No ByteTrack match - will need ReID
                     unmatched_detections.append(detection)
@@ -1760,17 +2029,17 @@ class PeopleCounterProcessor(BaseStreamProcessor):
         # Phase 1.5 covers matched trackers near danger zone (need appearance for
         # checkpoint save/recovery). Phase 2 covers unmatched detections (need
         # features for ReID matching). Merging into one call halves inference latency.
-        reid_available = (
-            self.doorway_config['use_reid'] and
-            (self.reid_extractor is not None or self.use_centralized_inference)
+        reid_available = self.doorway_config["use_reid"] and (
+            self.reid_extractor is not None or self.use_centralized_inference
         )
         phase1_reid_trackers = []
         phase1_reid_boxes = []
         if matched_trackers and reid_available:
             for track_id in matched_trackers:
                 tracker = self.trackers[track_id]
-                if (tracker.in_danger_zone or tracker.checkpoint is not None) and \
-                   len(tracker.appearance_history) < 3:
+                if (tracker.in_danger_zone or tracker.checkpoint is not None) and len(
+                    tracker.appearance_history
+                ) < 3:
                     det = tracker.detections[-1]
                     if not det.is_predicted:
                         x, y, w, h = det.bbox
@@ -1787,9 +2056,13 @@ class PeopleCounterProcessor(BaseStreamProcessor):
         combined_boxes = phase1_reid_boxes + phase2_reid_boxes
         if combined_boxes and reid_available:
             if self.use_centralized_inference:
-                combined_features = self._extract_appearance_batch_centralized(frame, combined_boxes)
+                combined_features = self._extract_appearance_batch_centralized(
+                    frame, combined_boxes
+                )
             else:
-                combined_features = self.reid_extractor.extract_batch(frame, combined_boxes)
+                combined_features = self.reid_extractor.extract_batch(
+                    frame, combined_boxes
+                )
 
             # Distribute Phase 1.5 results
             n_phase1 = len(phase1_reid_boxes)
@@ -1810,18 +2083,24 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             if track_id is not None:
                 self.trackers[track_id].update(detection)
                 matched_trackers.add(track_id)
-                self._check_and_handle_crossing(track_id, detection, width, current_time, frame, frame_height=height)
+                self._check_and_handle_crossing(
+                    track_id, detection, width, current_time, frame, frame_height=height
+                )
             else:
                 # Try ReID recovery for lost tracks
-                if self.doorway_config['use_reid']:
-                    reid_match = self._find_best_reid_match(detection, frame_width=width)
+                if self.doorway_config["use_reid"]:
+                    reid_match = self._find_best_reid_match(
+                        detection, frame_width=width
+                    )
                     if reid_match is not None:
                         tracker = self.trackers[reid_match]
                         # Detect position jump from ReID recovery
                         if tracker.positions:
                             predicted = tracker.get_predicted_position(current_time)
                             distance = abs(detection.center[0] - predicted[0])
-                            max_dist = self.doorway_config['max_tracking_distance'] * width
+                            max_dist = (
+                                self.doorway_config["max_tracking_distance"] * width
+                            )
                             if distance > max_dist:
                                 # Significant jump from predicted position — reset zone state
                                 # to prevent the jump from being misinterpreted as a crossing
@@ -1835,7 +2114,14 @@ class PeopleCounterProcessor(BaseStreamProcessor):
                         tracker.update(detection)
                         matched_trackers.add(reid_match)
                         self.logger.debug(f"ReID recovered track #{reid_match}")
-                        self._check_and_handle_crossing(reid_match, detection, width, current_time, frame, frame_height=height)
+                        self._check_and_handle_crossing(
+                            reid_match,
+                            detection,
+                            width,
+                            current_time,
+                            frame,
+                            frame_height=height,
+                        )
                         continue
                 still_unmatched.append(detection)
 
@@ -1855,24 +2141,33 @@ class PeopleCounterProcessor(BaseStreamProcessor):
                 self.trackers[new_id] = PersonTracker(new_id, detection)
 
                 # Check active_checkpoints for a ReID match from an expired tracker
-                if detection.appearance_features is not None and self.active_checkpoints:
+                if (
+                    detection.appearance_features is not None
+                    and self.active_checkpoints
+                ):
                     best_cp_id = None
-                    best_cp_sim = self.doorway_config.get('relink_similarity_threshold', 0.55)
+                    best_cp_sim = self.doorway_config.get(
+                        "relink_similarity_threshold", 0.55
+                    )
 
                     for cp_id, cp_data in self.active_checkpoints.items():
                         # Distance sanity check: new detection must be within reasonable
                         # distance of where the person was last tracked (entering danger zone).
                         # Without this, frame-edge entrants can falsely match to distant checkpoints.
-                        cp_pos = cp_data['checkpoint'].entry_position
+                        cp_pos = cp_data["checkpoint"].entry_position
                         dist = math.sqrt(
-                            (detection.center[0] - cp_pos[0])**2 +
-                            (detection.center[1] - cp_pos[1])**2
+                            (detection.center[0] - cp_pos[0]) ** 2
+                            + (detection.center[1] - cp_pos[1]) ** 2
                         )
-                        max_recovery_dist = self.doorway_config['max_tracking_distance'] * width * 2.5
+                        max_recovery_dist = (
+                            self.doorway_config["max_tracking_distance"] * width * 2.5
+                        )
                         if dist > max_recovery_dist:
                             continue
 
-                        sim = float(np.dot(cp_data['embedding'], detection.appearance_features))
+                        sim = float(
+                            np.dot(cp_data["embedding"], detection.appearance_features)
+                        )
                         sim = max(0.0, min(1.0, sim))
                         if sim > best_cp_sim:
                             best_cp_sim = sim
@@ -1880,7 +2175,7 @@ class PeopleCounterProcessor(BaseStreamProcessor):
 
                     if best_cp_id is not None:
                         recovered_cp = self.active_checkpoints.pop(best_cp_id)
-                        checkpoint = recovered_cp['checkpoint']
+                        checkpoint = recovered_cp["checkpoint"]
                         tracker = self.trackers[new_id]
 
                         # Transfer checkpoint to new tracker — let zone-transition logic
@@ -1895,16 +2190,24 @@ class PeopleCounterProcessor(BaseStreamProcessor):
                             tracker.last_side = checkpoint.entry_side
                         self.logger.info(
                             f"Checkpoint transferred: track #{new_id} from #{best_cp_id} "
-                            f"(similarity={best_cp_sim:.2f}, entry_side={checkpoint.entry_side})")
+                            f"(similarity={best_cp_sim:.2f}, entry_side={checkpoint.entry_side})"
+                        )
 
         # Preemptive checkpoint creation for overlapping trackers.
         # In group crossings, by the time someone enters the danger zone they may
         # already be occluded. Create checkpoints early when bboxes overlap so
         # checkpoint recovery can kick in if the track is lost.
         # Uses ONE batched REID call instead of individual calls per tracker.
-        if frame is not None and self.doorway_config['use_reid'] and (self.reid_extractor is not None or self.use_centralized_inference):
-            tracker_items = [(tid, t) for tid, t in self.trackers.items()
-                             if t.detections and t.checkpoint is None]
+        if (
+            frame is not None
+            and self.doorway_config["use_reid"]
+            and (self.reid_extractor is not None or self.use_centralized_inference)
+        ):
+            tracker_items = [
+                (tid, t)
+                for tid, t in self.trackers.items()
+                if t.detections and t.checkpoint is None
+            ]
             # First pass: identify all trackers that need preemptive checkpoints
             preemptive_tids = set()
             preemptive_overlaps = {}  # tid -> partner tid for logging
@@ -1925,8 +2228,11 @@ class PeopleCounterProcessor(BaseStreamProcessor):
 
             # Batch extract ReID features for all overlapping trackers at once
             if preemptive_tids:
-                preemptive_list = [(tid, self.trackers[tid]) for tid in preemptive_tids
-                                   if tid in self.trackers and self.trackers[tid].checkpoint is None]
+                preemptive_list = [
+                    (tid, self.trackers[tid])
+                    for tid in preemptive_tids
+                    if tid in self.trackers and self.trackers[tid].checkpoint is None
+                ]
                 preemptive_boxes = []
                 for tid, tr in preemptive_list:
                     det = tr.detections[-1]
@@ -1935,9 +2241,15 @@ class PeopleCounterProcessor(BaseStreamProcessor):
 
                 if preemptive_boxes:
                     if self.use_centralized_inference:
-                        preemptive_features = self._extract_appearance_batch_centralized(frame, preemptive_boxes)
+                        preemptive_features = (
+                            self._extract_appearance_batch_centralized(
+                                frame, preemptive_boxes
+                            )
+                        )
                     else:
-                        preemptive_features = self.reid_extractor.extract_batch(frame, preemptive_boxes)
+                        preemptive_features = self.reid_extractor.extract_batch(
+                            frame, preemptive_boxes
+                        )
 
                     for idx, (tid, tr) in enumerate(preemptive_list):
                         embedding = preemptive_features[idx]
@@ -1946,15 +2258,24 @@ class PeopleCounterProcessor(BaseStreamProcessor):
                         det = tr.detections[-1]
                         zone = tr.current_zone
                         if zone in (DangerZone.LEFT_ZONE, DangerZone.RIGHT_ZONE):
-                            entry_side = 'left' if zone == DangerZone.LEFT_ZONE else 'right'
+                            entry_side = (
+                                "left" if zone == DangerZone.LEFT_ZONE else "right"
+                            )
                         elif zone == DangerZone.DANGER_ZONE:
                             vx, _ = tr.get_smooth_velocity()
-                            entry_side = 'left' if vx > 0 else 'right'
+                            entry_side = "left" if vx > 0 else "right"
                         else:
-                            entry_side = 'left' if det.center[0] < width / 2 else 'right'
+                            entry_side = (
+                                "left" if det.center[0] < width / 2 else "right"
+                            )
                         vx, _ = tr.get_smooth_velocity()
-                        expected_exit = 'right' if vx > 0 else 'left' if vx < 0 else (
-                            'right' if entry_side == 'left' else 'left')
+                        expected_exit = (
+                            "right"
+                            if vx > 0
+                            else "left"
+                            if vx < 0
+                            else ("right" if entry_side == "left" else "left")
+                        )
                         tr.checkpoint = ReIDCheckpoint(
                             embedding=embedding,
                             entry_side=entry_side,
@@ -1962,7 +2283,7 @@ class PeopleCounterProcessor(BaseStreamProcessor):
                             entry_position=det.center,
                             expected_exit_side=expected_exit,
                             confidence=det.confidence,
-                            velocity_x=vx
+                            velocity_x=vx,
                         )
                         tr.search_active = True
                         if tr.mean_appearance is None:
@@ -1970,7 +2291,8 @@ class PeopleCounterProcessor(BaseStreamProcessor):
                         partner_tid, iou = preemptive_overlaps.get(tid, (None, 0))
                         self.logger.debug(
                             f"Preemptive checkpoint: track #{tid} overlaps #{partner_tid} "
-                            f"(IoU={iou:.2f}, entry_side={entry_side})")
+                            f"(IoU={iou:.2f}, entry_side={entry_side})"
+                        )
 
         # Check for crossings on unmatched trackers using interpolation
         # This catches crossings that may have occurred during dropped frames
@@ -1991,28 +2313,31 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             # Also require minimum peak confidence to avoid counting shadows/reflections
             # Require 3+ positions (lowered from 5 — with frame skipping, short-lived
             # occluded tracks may only accumulate 2-3 positions before being lost)
-            min_conf = self.doorway_config.get('min_peak_confidence', 0.40)
-            if 0.1 < time_gap < 1.0 and len(tracker.positions) >= 3 and tracker.peak_confidence >= min_conf:
+            min_conf = self.doorway_config.get("min_peak_confidence", 0.40)
+            if (
+                0.1 < time_gap < 1.0
+                and len(tracker.positions) >= 3
+                and tracker.peak_confidence >= min_conf
+            ):
                 # Get interpolated positions through the gap
                 interpolated = tracker.interpolate_positions(current_time, num_steps=5)
 
                 # Save all mutable state that check_crossing() modifies
                 saved_state = {
-                    'current_zone': tracker.current_zone,
-                    'previous_zone': tracker.previous_zone,
-                    'current_side': tracker.current_side,
-                    'last_side': tracker.last_side,
-                    'in_danger_zone': tracker.in_danger_zone,
-                    'danger_zone_frame_count': tracker.danger_zone_frame_count,
-
-                    'needs_checkpoint': tracker.needs_checkpoint,
-                    'side_history': deque(tracker.side_history, maxlen=10),
-                    'consecutive_side_detections': tracker.consecutive_side_detections,
-                    'checkpoint': tracker.checkpoint,
-                    'search_active': tracker.search_active,
-                    'total_crossings': tracker.total_crossings,
-                    'crossing_events': list(tracker.crossing_events),
-                    'last_crossing_time': tracker.last_crossing_time,
+                    "current_zone": tracker.current_zone,
+                    "previous_zone": tracker.previous_zone,
+                    "current_side": tracker.current_side,
+                    "last_side": tracker.last_side,
+                    "in_danger_zone": tracker.in_danger_zone,
+                    "danger_zone_frame_count": tracker.danger_zone_frame_count,
+                    "needs_checkpoint": tracker.needs_checkpoint,
+                    "side_history": deque(tracker.side_history, maxlen=10),
+                    "consecutive_side_detections": tracker.consecutive_side_detections,
+                    "checkpoint": tracker.checkpoint,
+                    "search_active": tracker.search_active,
+                    "total_crossings": tracker.total_crossings,
+                    "crossing_events": list(tracker.crossing_events),
+                    "last_crossing_time": tracker.last_crossing_time,
                 }
 
                 interp_crossing_fired = False
@@ -2023,11 +2348,15 @@ class PeopleCounterProcessor(BaseStreamProcessor):
 
                     crossing_dir = tracker.check_crossing(
                         width,
-                        self.doorway_config['doorway_center'],
-                        self.doorway_config['doorway_width'],
-                        self.doorway_config['danger_zone_buffer'],  # METHOD 5: pass danger zone buffer
-                        min_transit_frames=self.doorway_config.get('velocity_min_transit_frames', 1),
-                        frame_height=height
+                        self.doorway_config["doorway_center"],
+                        self.doorway_config["doorway_width"],
+                        self.doorway_config[
+                            "danger_zone_buffer"
+                        ],  # METHOD 5: pass danger zone buffer
+                        min_transit_frames=self.doorway_config.get(
+                            "velocity_min_transit_frames", 1
+                        ),
+                        frame_height=height,
                     )
 
                     # Restore original positions
@@ -2045,51 +2374,55 @@ class PeopleCounterProcessor(BaseStreamProcessor):
                                 threading.Thread(
                                     target=self.api_client.subtract_from_count,
                                     args=(1,),
-                                    kwargs={'crossing_timestamp': current_time},
-                                    daemon=True
+                                    kwargs={"crossing_timestamp": current_time},
+                                    daemon=True,
                                 ).start()
                             elif crossing_dir == CrossingDirection.RIGHT_TO_LEFT:
                                 threading.Thread(
                                     target=self.api_client.add_to_count,
                                     args=(1,),
-                                    kwargs={'crossing_timestamp': current_time},
-                                    daemon=True
+                                    kwargs={"crossing_timestamp": current_time},
+                                    daemon=True,
                                 ).start()
                         else:
                             if crossing_dir == CrossingDirection.LEFT_TO_RIGHT:
                                 threading.Thread(
                                     target=self.api_client.add_to_count,
                                     args=(1,),
-                                    kwargs={'crossing_timestamp': current_time},
-                                    daemon=True
+                                    kwargs={"crossing_timestamp": current_time},
+                                    daemon=True,
                                 ).start()
                             elif crossing_dir == CrossingDirection.RIGHT_TO_LEFT:
                                 threading.Thread(
                                     target=self.api_client.subtract_from_count,
                                     args=(1,),
-                                    kwargs={'crossing_timestamp': current_time},
-                                    daemon=True
+                                    kwargs={"crossing_timestamp": current_time},
+                                    daemon=True,
                                 ).start()
 
                         total = sum(self.crossings.values())
-                        self.logger.info(f"INTERPOLATED CROSSING #{total}: {crossing_dir.value} | "
-                                       f"Track #{track_id} (gap: {time_gap:.2f}s) | "
-                                       f"L->R: {self.crossings[CrossingDirection.LEFT_TO_RIGHT]} | "
-                                       f"R->L: {self.crossings[CrossingDirection.RIGHT_TO_LEFT]}")
+                        self.logger.info(
+                            f"INTERPOLATED CROSSING #{total}: {crossing_dir.value} | "
+                            f"Track #{track_id} (gap: {time_gap:.2f}s) | "
+                            f"L->R: {self.crossings[CrossingDirection.LEFT_TO_RIGHT]} | "
+                            f"R->L: {self.crossings[CrossingDirection.RIGHT_TO_LEFT]}"
+                        )
                         break  # Only count one crossing per interpolation check
 
                 # Restore zone/velocity state so real detections start fresh
-                tracker.current_zone = saved_state['current_zone']
-                tracker.previous_zone = saved_state['previous_zone']
-                tracker.current_side = saved_state['current_side']
-                tracker.in_danger_zone = saved_state['in_danger_zone']
-                tracker.danger_zone_frame_count = saved_state['danger_zone_frame_count']
+                tracker.current_zone = saved_state["current_zone"]
+                tracker.previous_zone = saved_state["previous_zone"]
+                tracker.current_side = saved_state["current_side"]
+                tracker.in_danger_zone = saved_state["in_danger_zone"]
+                tracker.danger_zone_frame_count = saved_state["danger_zone_frame_count"]
 
-                tracker.needs_checkpoint = saved_state['needs_checkpoint']
-                tracker.side_history = saved_state['side_history']
-                tracker.consecutive_side_detections = saved_state['consecutive_side_detections']
-                tracker.checkpoint = saved_state['checkpoint']
-                tracker.search_active = saved_state['search_active']
+                tracker.needs_checkpoint = saved_state["needs_checkpoint"]
+                tracker.side_history = saved_state["side_history"]
+                tracker.consecutive_side_detections = saved_state[
+                    "consecutive_side_detections"
+                ]
+                tracker.checkpoint = saved_state["checkpoint"]
+                tracker.search_active = saved_state["search_active"]
 
                 if interp_crossing_fired:
                     # Keep crossing-related state so tracker "remembers" the crossing.
@@ -2097,10 +2430,10 @@ class PeopleCounterProcessor(BaseStreamProcessor):
                     # (the per-tracker cooldown now applies to future interpolation attempts).
                     pass
                 else:
-                    tracker.last_side = saved_state['last_side']
-                    tracker.total_crossings = saved_state['total_crossings']
-                    tracker.crossing_events = saved_state['crossing_events']
-                    tracker.last_crossing_time = saved_state['last_crossing_time']
+                    tracker.last_side = saved_state["last_side"]
+                    tracker.total_crossings = saved_state["total_crossings"]
+                    tracker.crossing_events = saved_state["crossing_events"]
+                    tracker.last_crossing_time = saved_state["last_crossing_time"]
 
         # Remove stale trackers
         trackers_to_remove = []
@@ -2115,25 +2448,41 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             # Checkpointed trackers were heading toward a crossing when lost —
             # extend their timeout to 3.0s to survive longer occlusions in groups.
             # The checkpoint itself has its own 5.0s timeout.
-            timeout = 3.0 if tracker.checkpoint is not None else self.doorway_config['tracker_timeout']
+            timeout = (
+                3.0
+                if tracker.checkpoint is not None
+                else self.doorway_config["tracker_timeout"]
+            )
             if real_staleness > timeout:
                 trackers_to_remove.append(track_id)
 
                 # Save checkpoint from expiring tracker for cross-track recovery
                 # Don't save recovered checkpoints back — prevents recycling loop
                 # where fragmented tracks endlessly pass the same checkpoint around
-                if (tracker.checkpoint and not getattr(tracker, 'checkpoint_is_recovered', False)
-                        and tracker.last_crossing_time < tracker.checkpoint.entry_time):
-                    save_embedding = (tracker.mean_appearance.copy() if tracker.mean_appearance is not None
-                                      else tracker.checkpoint.embedding.copy())
-                    embedding_source = 'mean_appearance' if tracker.mean_appearance is not None else 'checkpoint'
+                if (
+                    tracker.checkpoint
+                    and not getattr(tracker, "checkpoint_is_recovered", False)
+                    and tracker.last_crossing_time < tracker.checkpoint.entry_time
+                ):
+                    save_embedding = (
+                        tracker.mean_appearance.copy()
+                        if tracker.mean_appearance is not None
+                        else tracker.checkpoint.embedding.copy()
+                    )
+                    embedding_source = (
+                        "mean_appearance"
+                        if tracker.mean_appearance is not None
+                        else "checkpoint"
+                    )
                     self.active_checkpoints[track_id] = {
-                        'checkpoint': tracker.checkpoint,
-                        'embedding': save_embedding,
-                        'saved_time': current_time,
+                        "checkpoint": tracker.checkpoint,
+                        "embedding": save_embedding,
+                        "saved_time": current_time,
                     }
-                    self.logger.debug(f"Saved checkpoint from expiring track #{track_id} "
-                                    f"(entry_side={tracker.checkpoint.entry_side}, embedding={embedding_source})")
+                    self.logger.debug(
+                        f"Saved checkpoint from expiring track #{track_id} "
+                        f"(entry_side={tracker.checkpoint.entry_side}, embedding={embedding_source})"
+                    )
 
                 # Return ID to pool for reuse (only for non-ByteTrack IDs)
                 if track_id not in self.track_id_pool and track_id < 1000:
@@ -2143,10 +2492,11 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             del self.trackers[track_id]
 
         # Clean up expired active checkpoints
-        checkpoint_timeout = self.doorway_config.get('checkpoint_timeout', 5.0)
+        checkpoint_timeout = self.doorway_config.get("checkpoint_timeout", 5.0)
         expired_checkpoints = [
-            cp_id for cp_id, cp_data in self.active_checkpoints.items()
-            if current_time - cp_data['saved_time'] > checkpoint_timeout
+            cp_id
+            for cp_id, cp_data in self.active_checkpoints.items()
+            if current_time - cp_data["saved_time"] > checkpoint_timeout
         ]
         for cp_id in expired_checkpoints:
             del self.active_checkpoints[cp_id]
@@ -2157,46 +2507,57 @@ class PeopleCounterProcessor(BaseStreamProcessor):
         height, width = vis_frame.shape[:2]
 
         # Calculate doorway line position
-        center_x = int(width * self.doorway_config['doorway_center'])
-        line_half_width = int(width * self.doorway_config['doorway_width'] / 2)
+        center_x = int(width * self.doorway_config["doorway_center"])
+        line_half_width = int(width * self.doorway_config["doorway_width"] / 2)
 
         # Draw approach zones
-        approach_width = int(width * self.doorway_config['approach_zone'])
+        approach_width = int(width * self.doorway_config["approach_zone"])
 
         # Left approach zone
-        cv2.rectangle(vis_frame,
-                     (center_x - approach_width - line_half_width, 0),
-                     (center_x - line_half_width, height),
-                     (100, 100, 200), 1)
+        cv2.rectangle(
+            vis_frame,
+            (center_x - approach_width - line_half_width, 0),
+            (center_x - line_half_width, height),
+            (100, 100, 200),
+            1,
+        )
 
         # Right approach zone
-        cv2.rectangle(vis_frame,
-                     (center_x + line_half_width, 0),
-                     (center_x + approach_width + line_half_width, height),
-                     (100, 100, 200), 1)
+        cv2.rectangle(
+            vis_frame,
+            (center_x + line_half_width, 0),
+            (center_x + approach_width + line_half_width, height),
+            (100, 100, 200),
+            1,
+        )
 
         # Draw doorway center line (bright green)
-        cv2.line(vis_frame,
-                (center_x, 0),
-                (center_x, height),
-                (0, 255, 0), 2)
+        cv2.line(vis_frame, (center_x, 0), (center_x, height), (0, 255, 0), 2)
 
         # Draw thin lines on either side to show doorway width
-        cv2.line(vis_frame,
-                (center_x - line_half_width, 0),
-                (center_x - line_half_width, height),
-                (0, 180, 0), 1)
-        cv2.line(vis_frame,
-                (center_x + line_half_width, 0),
-                (center_x + line_half_width, height),
-                (0, 180, 0), 1)
+        cv2.line(
+            vis_frame,
+            (center_x - line_half_width, 0),
+            (center_x - line_half_width, height),
+            (0, 180, 0),
+            1,
+        )
+        cv2.line(
+            vis_frame,
+            (center_x + line_half_width, 0),
+            (center_x + line_half_width, height),
+            (0, 180, 0),
+            1,
+        )
 
         # Draw current detections
         for detection in detections:
             x, y, w, h = detection.bbox
 
             # Color based on whether ByteTrack assigned an ID
-            box_color = (0, 255, 255) if detection.track_id is not None else (255, 255, 0)
+            box_color = (
+                (0, 255, 255) if detection.track_id is not None else (255, 255, 0)
+            )
 
             # Draw bounding box
             cv2.rectangle(vis_frame, (x, y), (x + w, y + h), box_color, 2)
@@ -2209,9 +2570,15 @@ class PeopleCounterProcessor(BaseStreamProcessor):
                 conf_text = f"BT#{detection.track_id} {detection.confidence:.2f}"
             else:
                 conf_text = f"{detection.class_name}: {detection.confidence:.2f}"
-            cv2.putText(vis_frame, conf_text,
-                       (x, y - 5),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 1)
+            cv2.putText(
+                vis_frame,
+                conf_text,
+                (x, y - 5),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                box_color,
+                1,
+            )
 
         # Draw trackers
         for track_id, tracker in self.trackers.items():
@@ -2219,9 +2586,9 @@ class PeopleCounterProcessor(BaseStreamProcessor):
                 continue
 
             # Determine color based on side
-            if tracker.current_side == 'left':
+            if tracker.current_side == "left":
                 track_color = (255, 100, 100)  # Blue-ish
-            elif tracker.current_side == 'right':
+            elif tracker.current_side == "right":
                 track_color = (100, 100, 255)  # Red-ish
             else:
                 track_color = (0, 255, 0)  # Green
@@ -2229,10 +2596,13 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             # Draw path
             positions = list(tracker.positions)
             for i in range(1, len(positions)):
-                pt1 = (int(positions[i-1][0]), int(positions[i-1][1]))
+                pt1 = (int(positions[i - 1][0]), int(positions[i - 1][1]))
                 pt2 = (int(positions[i][0]), int(positions[i][1]))
                 # Skip zigzag segments from ID switches
-                if abs(positions[i][0] - positions[i-1][0]) > self.doorway_config['max_tracking_distance'] * width:
+                if (
+                    abs(positions[i][0] - positions[i - 1][0])
+                    > self.doorway_config["max_tracking_distance"] * width
+                ):
                     continue
                 thickness = max(1, int(3 * (i / len(positions))))
                 cv2.line(vis_frame, pt1, pt2, track_color, thickness)
@@ -2240,9 +2610,13 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             # Draw current position
             if positions:
                 current_pos = positions[-1]
-                cv2.circle(vis_frame,
-                          (int(current_pos[0]), int(current_pos[1])),
-                          8, track_color, -1)
+                cv2.circle(
+                    vis_frame,
+                    (int(current_pos[0]), int(current_pos[1])),
+                    8,
+                    track_color,
+                    -1,
+                )
 
                 # Draw track ID, detection count, and crossing count
                 info_text = f"#{track_id}"
@@ -2251,19 +2625,31 @@ class PeopleCounterProcessor(BaseStreamProcessor):
                 if tracker.total_crossings > 0:
                     info_text += f" x{tracker.total_crossings}"
 
-                cv2.putText(vis_frame, info_text,
-                           (int(current_pos[0]) + 10, int(current_pos[1]) - 10),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, track_color, 2)
+                cv2.putText(
+                    vis_frame,
+                    info_text,
+                    (int(current_pos[0]) + 10, int(current_pos[1]) - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    track_color,
+                    2,
+                )
 
                 # Draw velocity arrow
                 vx, vy = tracker.get_smooth_velocity()
                 if abs(vx) > 5 or abs(vy) > 5:
-                    arrow_end = (int(current_pos[0] + vx * 0.5),
-                               int(current_pos[1] + vy * 0.5))
-                    cv2.arrowedLine(vis_frame,
-                                  (int(current_pos[0]), int(current_pos[1])),
-                                  arrow_end,
-                                  (0, 255, 0), 2, tipLength=0.3)
+                    arrow_end = (
+                        int(current_pos[0] + vx * 0.5),
+                        int(current_pos[1] + vy * 0.5),
+                    )
+                    cv2.arrowedLine(
+                        vis_frame,
+                        (int(current_pos[0]), int(current_pos[1])),
+                        arrow_end,
+                        (0, 255, 0),
+                        2,
+                        tipLength=0.3,
+                    )
 
         # Draw statistics overlay
         stats_bg_height = 160
@@ -2278,25 +2664,67 @@ class PeopleCounterProcessor(BaseStreamProcessor):
         net_flow = lr_count - rl_count
 
         # Mode indicator
-        mode_text = "ByteTrack" if self.doorway_config['use_bytetrack'] else "Basic"
-        if self.doorway_config['use_reid']:
+        mode_text = "ByteTrack" if self.doorway_config["use_bytetrack"] else "Basic"
+        if self.doorway_config["use_reid"]:
             mode_text += "+ReID"
         if self._adaptive_detection:
             interval = self._get_detection_interval()
             mode_text += f" [{15 // interval}fps]"
 
-        cv2.putText(vis_frame, f"PEOPLE COUNTER [{mode_text}]",
-                   (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
-        cv2.putText(vis_frame, f"Total Crossings: {total_crossings}",
-                   (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-        cv2.putText(vis_frame, f"Left -> Right: {lr_count}",
-                   (10, 72), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (100, 255, 100), 1)
-        cv2.putText(vis_frame, f"Right -> Left: {rl_count}",
-                   (10, 94), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 100, 100), 1)
-        cv2.putText(vis_frame, f"Net Flow (L->R): {net_flow:+d}",
-                   (10, 116), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-        cv2.putText(vis_frame, f"Active Tracks: {len(self.trackers)} | Detections: {len(detections)}",
-                   (10, 138), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
+        cv2.putText(
+            vis_frame,
+            f"PEOPLE COUNTER [{mode_text}]",
+            (10, 25),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (0, 255, 0),
+            2,
+        )
+        cv2.putText(
+            vis_frame,
+            f"Total Crossings: {total_crossings}",
+            (10, 50),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (255, 255, 255),
+            1,
+        )
+        cv2.putText(
+            vis_frame,
+            f"Left -> Right: {lr_count}",
+            (10, 72),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (100, 255, 100),
+            1,
+        )
+        cv2.putText(
+            vis_frame,
+            f"Right -> Left: {rl_count}",
+            (10, 94),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (255, 100, 100),
+            1,
+        )
+        cv2.putText(
+            vis_frame,
+            f"Net Flow (L->R): {net_flow:+d}",
+            (10, 116),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (255, 255, 255),
+            1,
+        )
+        cv2.putText(
+            vis_frame,
+            f"Active Tracks: {len(self.trackers)} | Detections: {len(detections)}",
+            (10, 138),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            (200, 200, 200),
+            1,
+        )
 
         return vis_frame
 
@@ -2339,7 +2767,10 @@ class PeopleCounterProcessor(BaseStreamProcessor):
 
             # Don't predict for trackers with no real YOLO detection in >1.0s —
             # they're ghosts that would otherwise generate noise until cleanup.
-            if tracker.last_real_time is not None and (current_time - tracker.last_real_time) > 1.0:
+            if (
+                tracker.last_real_time is not None
+                and (current_time - tracker.last_real_time) > 1.0
+            ):
                 continue
 
             # Use the existing get_predicted_position method
@@ -2353,20 +2784,24 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             _, _, w, h = last_det.bbox
             bbox = (pred_x - w // 2, pred_y - h // 2, w, h)
 
-            predicted.append(Detection(
-                center=(pred_x, pred_y),
-                bbox=bbox,
-                confidence=last_det.confidence,
-                timestamp=current_time,
-                class_id=0,
-                class_name='person',
-                track_id=track_id,
-                is_predicted=True,
-            ))
+            predicted.append(
+                Detection(
+                    center=(pred_x, pred_y),
+                    bbox=bbox,
+                    confidence=last_det.confidence,
+                    timestamp=current_time,
+                    class_id=0,
+                    class_name="person",
+                    track_id=track_id,
+                    is_predicted=True,
+                )
+            )
 
         return predicted
 
-    def process_frame(self, frame: np.ndarray, frame_number: int, timestamp: float) -> Optional[np.ndarray]:
+    def process_frame(
+        self, frame: np.ndarray, frame_number: int, timestamp: float
+    ) -> Optional[np.ndarray]:
         """Process a single frame - main processing logic"""
         # Note: Buffer draining disabled - OpenCV read() blocks on live RTSP streams
         # The base processor already sets CAP_PROP_BUFFERSIZE=1 for low latency
@@ -2389,4 +2824,3 @@ class PeopleCounterProcessor(BaseStreamProcessor):
         vis_frame = self.draw_visualization(frame, detections)
 
         return vis_frame
-

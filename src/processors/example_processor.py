@@ -23,12 +23,16 @@ class ExampleProcessor(BaseStreamProcessor):
         self.logger.info("Example processor starting")
         self.logger.info(f"Device ID: {self.device_id}")
         self.logger.info(f"Has password: {bool(self.password)}")
-        self.logger.info("This is where you'd load ML models, initialize detectors, etc.")
+        self.logger.info(
+            "This is where you'd load ML models, initialize detectors, etc."
+        )
         # Example: Load a face detector, person detector, etc.
         # self.detector = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
         # Note: You can use self.device_id and self.password for authentication or device-specific processing
 
-    def process_frame(self, frame: np.ndarray, frame_number: int, timestamp: float) -> np.ndarray:
+    def process_frame(
+        self, frame: np.ndarray, frame_number: int, timestamp: float
+    ) -> np.ndarray:
         """
         Process each frame - this is where your computer vision logic goes
 
@@ -56,12 +60,33 @@ class ExampleProcessor(BaseStreamProcessor):
             self.detection_count += 1
 
         # Add overlay with stats
-        cv2.putText(display_frame, f"Device: {self.device_id}",
-                   (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        cv2.putText(display_frame, f"Frame: {frame_number}",
-                   (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        cv2.putText(display_frame, f"Detections: {self.detection_count}",
-                   (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        cv2.putText(
+            display_frame,
+            f"Device: {self.device_id}",
+            (10, 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (0, 255, 0),
+            2,
+        )
+        cv2.putText(
+            display_frame,
+            f"Frame: {frame_number}",
+            (10, 60),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (0, 255, 0),
+            2,
+        )
+        cv2.putText(
+            display_frame,
+            f"Detections: {self.detection_count}",
+            (10, 90),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (0, 255, 0),
+            2,
+        )
 
         # Example: Draw edge overlay
         # display_frame[edges > 0] = [0, 255, 0]  # Highlight edges in green
@@ -79,7 +104,9 @@ class ExampleProcessor(BaseStreamProcessor):
 
     def on_stop(self):
         """Cleanup any resources"""
-        self.logger.info(f"Example processor stopping. Total detections: {self.detection_count}")
+        self.logger.info(
+            f"Example processor stopping. Total detections: {self.detection_count}"
+        )
         # Example: Save results to database, close connections, etc.
 
 
@@ -92,7 +119,9 @@ class PassthroughProcessor(BaseStreamProcessor):
     def on_start(self):
         self.logger.info("Passthrough processor started - minimal processing")
 
-    def process_frame(self, frame: np.ndarray, frame_number: int, timestamp: float) -> None:
+    def process_frame(
+        self, frame: np.ndarray, frame_number: int, timestamp: float
+    ) -> None:
         """Just log every 100th frame"""
         if frame_number % 100 == 0:
             self.logger.debug(f"Frame {frame_number}: {frame.shape}")

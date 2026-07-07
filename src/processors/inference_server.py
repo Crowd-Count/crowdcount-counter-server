@@ -34,9 +34,10 @@ MODELS_DIR = PROJECT_ROOT / "models"
 
 class RequestType(Enum):
     """Types of inference requests"""
+
     DETECT = "detect"
     REID = "reid"
-    REGISTER = "register"    # Register camera_id -> slot mapping
+    REGISTER = "register"  # Register camera_id -> slot mapping
     UNREGISTER = "unregister"  # Unregister camera
     SHUTDOWN = "shutdown"
 
@@ -50,6 +51,7 @@ class InferenceRequest:
     pre-allocated as a pool and inherited by the child process at spawn time.
     Each camera is assigned a slot, and REGISTER requests map camera_id to slot.
     """
+
     type: RequestType
     camera_id: str
     frame: Optional[np.ndarray] = None
@@ -70,6 +72,7 @@ class InferenceRequest:
 @dataclass
 class DetectionResult:
     """Single detection returned from inference server"""
+
     center: Tuple[int, int]
     bbox: Tuple[int, int, int, int]  # x1, y1, width, height
     confidence: float
@@ -80,6 +83,7 @@ class DetectionResult:
 @dataclass
 class InferenceResponse:
     """Response sent from inference server back to camera worker"""
+
     type: RequestType
     camera_id: str
     # For DETECT responses
@@ -137,13 +141,13 @@ class InferenceServer:
         self.camera_to_slot: Dict[str, str] = {}
 
         # Batch settings
-        self.batch_size = config.get('batch_size', 8)
-        self.batch_wait_ms = config.get('batch_wait_ms', 30)
+        self.batch_size = config.get("batch_size", 8)
+        self.batch_wait_ms = config.get("batch_wait_ms", 30)
 
         # These are initialized in run() after CUDA context is set
         self.model = None
         self.reid_extractor = None
-        self.class_names = {0: 'person'}
+        self.class_names = {0: "person"}
 
         # Stats
         self.requests_processed = 0
@@ -156,7 +160,7 @@ class InferenceServer:
         if not self.logger.handlers:
             handler = logging.StreamHandler()
             formatter = logging.Formatter(
-                f'%(asctime)s - InferenceServer-GPU{gpu_id} - %(levelname)s - %(message)s'
+                f"%(asctime)s - InferenceServer-GPU{gpu_id} - %(levelname)s - %(message)s"
             )
             handler.setFormatter(formatter)
             self.logger.addHandler(handler)
@@ -171,7 +175,7 @@ class InferenceServer:
 
         Priority: explicit config dir > models/ dir (if writable) > data/engines/ fallback.
         """
-        explicit_dir = self.config.get('tensorrt_engine_dir', '')
+        explicit_dir = self.config.get("tensorrt_engine_dir", "")
         if explicit_dir:
             d = Path(explicit_dir)
             d.mkdir(parents=True, exist_ok=True)
@@ -201,12 +205,14 @@ class InferenceServer:
         """
         import torch
 
-        if not self.config.get('tensorrt_enabled', True):
+        if not self.config.get("tensorrt_enabled", True):
             self.logger.info("TensorRT disabled by config, using PyTorch model")
             return self.model_path
 
-        if not self.model_path.endswith('.pt'):
-            self.logger.info(f"Model is not a .pt file ({self.model_path}), skipping TensorRT")
+        if not self.model_path.endswith(".pt"):
+            self.logger.info(
+                f"Model is not a .pt file ({self.model_path}), skipping TensorRT"
+            )
             return self.model_path
 
         try:
@@ -214,12 +220,14 @@ class InferenceServer:
             cap = torch.cuda.get_device_capability(self.gpu_id)
             gpu_arch = f"sm{cap[0]}{cap[1]}"
 
-            max_batch = self.config.get('tensorrt_max_batch', self.batch_size)
-            imgsz = self.config.get('imgsz', 480)
+            max_batch = self.config.get("tensorrt_max_batch", self.batch_size)
+            imgsz = self.config.get("imgsz", 480)
 
             # Build GPU-specific engine filename
             model_stem = Path(self.model_path).stem
-            engine_name = f"{model_stem}_{gpu_arch}_b{max_batch}_fp16_imgsz{imgsz}.engine"
+            engine_name = (
+                f"{model_stem}_{gpu_arch}_b{max_batch}_fp16_imgsz{imgsz}.engine"
+            )
 
             engine_dir = self._get_engine_dir()
             engine_path = engine_dir / engine_name
@@ -231,11 +239,16 @@ class InferenceServer:
             self.logger.info(
                 f"No TensorRT engine found for {gpu_arch}, exporting: {engine_path}"
             )
-            return self._export_tensorrt_engine(engine_path, device_str, max_batch, imgsz)
+            return self._export_tensorrt_engine(
+                engine_path, device_str, max_batch, imgsz
+            )
 
         except Exception as e:
-            self.logger.error(f"TensorRT resolution failed, falling back to PyTorch: {e}")
+            self.logger.error(
+                f"TensorRT resolution failed, falling back to PyTorch: {e}"
+            )
             import traceback
+
             self.logger.error(traceback.format_exc())
             return self.model_path
 
@@ -279,7 +292,9 @@ class InferenceServer:
             # ultralytics returns the path to the exported engine
             exported = Path(exported_path)
             if not exported.exists():
-                raise FileNotFoundError(f"Export succeeded but file not found: {exported}")
+                raise FileNotFoundError(
+                    f"Export succeeded but file not found: {exported}"
+                )
 
             # Rename to our GPU-specific name
             if exported != engine_path:
@@ -290,7 +305,7 @@ class InferenceServer:
                 temp_pt.unlink()
 
             # Clean up any intermediate ONNX files
-            onnx_file = engine_dir / Path(self.model_path).with_suffix('.onnx').name
+            onnx_file = engine_dir / Path(self.model_path).with_suffix(".onnx").name
             if onnx_file.exists():
                 onnx_file.unlink()
                 self.logger.info(f"Cleaned up intermediate ONNX: {onnx_file}")
@@ -301,6 +316,7 @@ class InferenceServer:
         except Exception as e:
             self.logger.error(f"TensorRT export failed, falling back to PyTorch: {e}")
             import traceback
+
             self.logger.error(traceback.format_exc())
             return self.model_path
 
@@ -309,12 +325,14 @@ class InferenceServer:
 
         Prevents latency spike on first real inference.
         """
-        warmup_iters = self.config.get('tensorrt_warmup_iters', 3)
+        warmup_iters = self.config.get("tensorrt_warmup_iters", 3)
         if warmup_iters <= 0:
             return
 
-        imgsz = self.config.get('imgsz', 480)
-        self.logger.info(f"Warming up model with {warmup_iters} dummy inference passes...")
+        imgsz = self.config.get("imgsz", 480)
+        self.logger.info(
+            f"Warming up model with {warmup_iters} dummy inference passes..."
+        )
 
         try:
             dummy_frame = np.random.randint(0, 255, (imgsz, imgsz, 3), dtype=np.uint8)
@@ -350,25 +368,29 @@ class InferenceServer:
         # Set CUDA device and load models — wrapped so a crash (CUDA OOM,
         # corrupted weights) is logged immediately instead of dying silently.
         try:
-            device_str = f'cuda:{self.gpu_id}'
+            device_str = f"cuda:{self.gpu_id}"
             torch.cuda.set_device(self.gpu_id)
-            self.logger.info(f"Initializing on {device_str} ({torch.cuda.get_device_name(self.gpu_id)})")
+            self.logger.info(
+                f"Initializing on {device_str} ({torch.cuda.get_device_name(self.gpu_id)})"
+            )
 
             # Resolve model path (TensorRT engine or PyTorch .pt)
             resolved_path = self._resolve_model_path(device_str)
-            is_engine = resolved_path.endswith('.engine')
+            is_engine = resolved_path.endswith(".engine")
 
             # Load YOLO model
             self.logger.info(f"Loading YOLO model: {resolved_path}")
             try:
                 if is_engine:
-                    self.model = YOLO(resolved_path, task='detect')
+                    self.model = YOLO(resolved_path, task="detect")
                 else:
                     self.model = YOLO(resolved_path)
                     self.model.to(device_str)
             except Exception as e:
                 if is_engine:
-                    self.logger.error(f"TensorRT engine load failed: {e}, falling back to PyTorch")
+                    self.logger.error(
+                        f"TensorRT engine load failed: {e}, falling back to PyTorch"
+                    )
                     self.model = YOLO(self.model_path)
                     self.model.to(device_str)
                     is_engine = False
@@ -377,27 +399,32 @@ class InferenceServer:
 
             backend = "TensorRT" if is_engine else "PyTorch"
             if is_engine:
-                self.logger.info(f"YOLO model loaded on {device_str} (backend: {backend})")
+                self.logger.info(
+                    f"YOLO model loaded on {device_str} (backend: {backend})"
+                )
             else:
                 model_device = next(self.model.model.parameters()).device
-                self.logger.info(f"YOLO model loaded on device: {model_device} (backend: {backend})")
+                self.logger.info(
+                    f"YOLO model loaded on device: {model_device} (backend: {backend})"
+                )
 
             # Get class names
-            if hasattr(self.model, 'names'):
+            if hasattr(self.model, "names"):
                 self.class_names = self.model.names
 
             # Load ReID model
             if self.reid_model_name:
                 self.logger.info(f"Loading ReID model: {self.reid_model_name}")
                 self.reid_extractor = create_reid_extractor(
-                    model_name=self.reid_model_name,
-                    device=device_str,
-                    verbose=True
+                    model_name=self.reid_model_name, device=device_str, verbose=True
                 )
-                self.logger.info(f"ReID model loaded (feature dim: {self.reid_extractor.feature_dim})")
+                self.logger.info(
+                    f"ReID model loaded (feature dim: {self.reid_extractor.feature_dim})"
+                )
         except Exception as e:
             self.logger.error(f"FATAL: Model loading failed — {e}")
             import traceback
+
             self.logger.error(traceback.format_exc())
             self.running = False
             return
@@ -421,7 +448,9 @@ class InferenceServer:
                     continue
 
                 # Separate DETECT vs REID requests
-                detect_batch = [(r, s) for r, s in batch if r.type == RequestType.DETECT]
+                detect_batch = [
+                    (r, s) for r, s in batch if r.type == RequestType.DETECT
+                ]
                 reid_batch = [(r, s) for r, s in batch if r.type == RequestType.REID]
 
                 if detect_batch:
@@ -448,7 +477,11 @@ class InferenceServer:
                 if now - last_stats_time >= 10.0:
                     elapsed = now - self.start_time
                     rps = self.requests_processed / elapsed if elapsed > 0 else 0
-                    queue_size = self.request_queue.qsize() if hasattr(self.request_queue, 'qsize') else -1
+                    queue_size = (
+                        self.request_queue.qsize()
+                        if hasattr(self.request_queue, "qsize")
+                        else -1
+                    )
                     stats_msg = (
                         f"InferenceServer-GPU{self.gpu_id}: Stats: {self.requests_processed} requests | "
                         f"{rps:.1f} req/s | queue depth: {queue_size} | "
@@ -469,6 +502,7 @@ class InferenceServer:
             except Exception as e:
                 self.logger.error(f"Error in batch processing: {e}")
                 import traceback
+
                 self.logger.error(traceback.format_exc())
 
         # Cleanup
@@ -626,18 +660,22 @@ class InferenceServer:
         result_queue = self.result_queues.get(slot_name)
         if result_queue:
             try:
-                result_queue.put_nowait(InferenceResponse(
-                    type=request.type,
-                    camera_id=request.camera_id,
-                    error="stale",
-                    request_id=request.request_id,
-                ))
+                result_queue.put_nowait(
+                    InferenceResponse(
+                        type=request.type,
+                        camera_id=request.camera_id,
+                        error="stale",
+                        request_id=request.request_id,
+                    )
+                )
             except Exception:
                 pass  # Queue full — camera will timeout anyway
         self._stale_drops += 1
         now = time.time()
         if now - self._last_stale_log_time >= 10.0:
-            self.logger.warning(f"Dropped {self._stale_drops} stale requests in last 10s (latest age: {age:.1f}s)")
+            self.logger.warning(
+                f"Dropped {self._stale_drops} stale requests in last 10s (latest age: {age:.1f}s)"
+            )
             self._stale_drops = 0
             self._last_stale_log_time = now
 
@@ -657,17 +695,19 @@ class InferenceServer:
 
         # Send error response so processor doesn't block for 5s timeout.
         # Use slot_name from the request to find the result queue.
-        slot_name = getattr(request, 'slot_name', None)
+        slot_name = getattr(request, "slot_name", None)
         if slot_name:
             result_queue = self.result_queues.get(slot_name)
             if result_queue:
                 try:
-                    result_queue.put_nowait(InferenceResponse(
-                        type=request.type,
-                        camera_id=request.camera_id,
-                        error="unregistered",
-                        request_id=getattr(request, 'request_id', None),
-                    ))
+                    result_queue.put_nowait(
+                        InferenceResponse(
+                            type=request.type,
+                            camera_id=request.camera_id,
+                            error="unregistered",
+                            request_id=getattr(request, "request_id", None),
+                        )
+                    )
                 except Exception:
                     pass  # Best-effort
 
@@ -676,12 +716,14 @@ class InferenceServer:
         result_queue = self.result_queues.get(slot_name)
         if result_queue:
             try:
-                result_queue.put_nowait(InferenceResponse(
-                    type=request.type,
-                    camera_id=request.camera_id,
-                    error=f"inference_server_error: {error_msg}",
-                    request_id=request.request_id,
-                ))
+                result_queue.put_nowait(
+                    InferenceResponse(
+                        type=request.type,
+                        camera_id=request.camera_id,
+                        error=f"inference_server_error: {error_msg}",
+                        request_id=request.request_id,
+                    )
+                )
             except Exception:
                 pass  # Best-effort
 
@@ -696,7 +738,7 @@ class InferenceServer:
             for box in result.boxes:
                 confidence = float(box.conf[0])
                 class_id = int(box.cls[0])
-                class_name = self.class_names.get(class_id, 'unknown')
+                class_name = self.class_names.get(class_id, "unknown")
 
                 if class_id != 0:
                     continue
@@ -707,13 +749,15 @@ class InferenceServer:
                 width = int(x2 - x1)
                 height = int(y2 - y1)
 
-                detections.append(DetectionResult(
-                    center=(center_x, center_y),
-                    bbox=(int(x1), int(y1), width, height),
-                    confidence=confidence,
-                    class_id=class_id,
-                    class_name=class_name,
-                ))
+                detections.append(
+                    DetectionResult(
+                        center=(center_x, center_y),
+                        bbox=(int(x1), int(y1), width, height),
+                        confidence=confidence,
+                        class_id=class_id,
+                        class_name=class_name,
+                    )
+                )
         return detections
 
     def _process_detect_batch(self, requests_and_slots):
@@ -734,8 +778,8 @@ class InferenceServer:
                 iou=min_iou,
                 classes=[0],
                 half=True,
-                imgsz=self.config.get('imgsz', 480),
-                verbose=False
+                imgsz=self.config.get("imgsz", 480),
+                verbose=False,
             )
 
             # Distribute results to per-camera result queues
@@ -752,8 +796,13 @@ class InferenceServer:
                     try:
                         result_queue.put_nowait(response)
                     except Exception as e:
-                        self.logger.error(f"Failed to deliver result for {request.camera_id} (slot {slot_name}): {e}")
-                        print(f"InferenceServer-GPU{self.gpu_id}: DELIVERY FAILED {request.camera_id} slot={slot_name}: {e}", flush=True)
+                        self.logger.error(
+                            f"Failed to deliver result for {request.camera_id} (slot {slot_name}): {e}"
+                        )
+                        print(
+                            f"InferenceServer-GPU{self.gpu_id}: DELIVERY FAILED {request.camera_id} slot={slot_name}: {e}",
+                            flush=True,
+                        )
 
         except Exception as e:
             self.logger.error(f"Batch detection error: {e}")
@@ -782,7 +831,9 @@ class InferenceServer:
                     try:
                         result_queue.put_nowait(response)
                     except Exception as e:
-                        self.logger.error(f"Failed to deliver REID result for {request.camera_id}: {e}")
+                        self.logger.error(
+                            f"Failed to deliver REID result for {request.camera_id}: {e}"
+                        )
             return
 
         try:
@@ -793,7 +844,9 @@ class InferenceServer:
             ]
 
             # ONE batched GPU call for all cameras' ReID crops
-            all_features = self.reid_extractor.extract_cross_camera_batch(frame_boxes_pairs)
+            all_features = self.reid_extractor.extract_cross_camera_batch(
+                frame_boxes_pairs
+            )
 
             # Distribute results to per-camera result queues
             for (request, slot_name), features in zip(requests_and_slots, all_features):
@@ -808,10 +861,11 @@ class InferenceServer:
                     try:
                         result_queue.put_nowait(response)
                     except Exception as e:
-                        self.logger.error(f"Failed to deliver REID result for {request.camera_id}: {e}")
+                        self.logger.error(
+                            f"Failed to deliver REID result for {request.camera_id}: {e}"
+                        )
 
         except Exception as e:
             self.logger.error(f"Batch ReID error: {e}")
             for request, slot_name in requests_and_slots:
                 self._send_error_response(request, slot_name, str(e))
-

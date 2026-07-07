@@ -25,6 +25,7 @@ except ImportError:
 @dataclass
 class BufferedFrame:
     """Container for a buffered frame with metadata"""
+
     frame: np.ndarray
     capture_time: float
     sequence_num: int
@@ -67,7 +68,7 @@ class FrameJitterBuffer:
         cap: cv2.VideoCapture,
         target_fps: float = None,
         buffer_seconds: float = None,
-        logger: Optional[logging.Logger] = None
+        logger: Optional[logging.Logger] = None,
     ):
         """
         Initialize the jitter buffer.
@@ -110,13 +111,13 @@ class FrameJitterBuffer:
 
         # Statistics
         self.stats = {
-            'frames_read': 0,
-            'frames_emitted': 0,
-            'frames_skipped': 0,  # Frames grabbed but not decoded (saves CPU)
-            'underruns': 0,
-            'overflows': 0,
-            'duplicates_emitted': 0,
-            'input_fps': 0.0,  # Actual camera frame rate (computed in reader thread)
+            "frames_read": 0,
+            "frames_emitted": 0,
+            "frames_skipped": 0,  # Frames grabbed but not decoded (saves CPU)
+            "underruns": 0,
+            "overflows": 0,
+            "duplicates_emitted": 0,
+            "input_fps": 0.0,  # Actual camera frame rate (computed in reader thread)
         }
 
         # Input FPS tracking (reader thread)
@@ -157,7 +158,7 @@ class FrameJitterBuffer:
                     # grab() advances the stream but doesn't decode (much faster)
                     if self.cap.grab():
                         frames_skipped += 1
-                        self.stats['frames_skipped'] = frames_skipped
+                        self.stats["frames_skipped"] = frames_skipped
                     else:
                         consecutive_failures += 1
                         if consecutive_failures >= max_failures:
@@ -191,7 +192,7 @@ class FrameJitterBuffer:
                 buffered = BufferedFrame(
                     frame=frame,
                     capture_time=capture_time,
-                    sequence_num=self._sequence_counter
+                    sequence_num=self._sequence_counter,
                 )
 
                 with self._buffer_lock:
@@ -199,24 +200,29 @@ class FrameJitterBuffer:
                     self._buffer.append(buffered)
 
                     if was_full:
-                        self.stats['overflows'] += 1
+                        self.stats["overflows"] += 1
 
-                    self.stats['frames_read'] += 1
+                    self.stats["frames_read"] += 1
 
                     # Signal prefill complete when we have enough frames
-                    if not self._prefill_complete.is_set() and len(self._buffer) >= self.min_prefill:
+                    if (
+                        not self._prefill_complete.is_set()
+                        and len(self._buffer) >= self.min_prefill
+                    ):
                         self._prefill_complete.set()
 
                 # Compute actual camera input FPS (every 2 seconds)
                 if self._input_fps_last_time is None:
                     self._input_fps_last_time = capture_time
-                    self._input_fps_last_count = self.stats['frames_read']
+                    self._input_fps_last_count = self.stats["frames_read"]
                 else:
                     fps_elapsed = capture_time - self._input_fps_last_time
                     if fps_elapsed >= 2.0:
-                        frames_delta = self.stats['frames_read'] - self._input_fps_last_count
-                        self.stats['input_fps'] = frames_delta / fps_elapsed
-                        self._input_fps_last_count = self.stats['frames_read']
+                        frames_delta = (
+                            self.stats["frames_read"] - self._input_fps_last_count
+                        )
+                        self.stats["input_fps"] = frames_delta / fps_elapsed
+                        self._input_fps_last_count = self.stats["frames_read"]
                         self._input_fps_last_time = capture_time
 
                 # Store for underrun recovery (no lock needed, atomic reference assignment)
@@ -270,14 +276,18 @@ class FrameJitterBuffer:
         with self._buffer_lock:
             if len(self._buffer) > 0:
                 buffered = self._buffer.popleft()
-                self.stats['frames_emitted'] += 1
-                self._duplicate_start_time = None  # Reset duplication timer on real frame
-                self._staleness_logged = False  # Reset so we log again if staleness recurs
+                self.stats["frames_emitted"] += 1
+                self._duplicate_start_time = (
+                    None  # Reset duplication timer on real frame
+                )
+                self._staleness_logged = (
+                    False  # Reset so we log again if staleness recurs
+                )
                 return True, buffered.frame
             else:
                 # Underrun - buffer empty, must duplicate last frame
-                self.stats['underruns'] += 1
-                self.stats['duplicates_emitted'] += 1
+                self.stats["underruns"] += 1
+                self.stats["duplicates_emitted"] += 1
 
                 # Track how long we've been duplicating
                 now = time.time()
@@ -296,7 +306,7 @@ class FrameJitterBuffer:
                     return False, None  # Signal failure to processor
 
                 # Warn if underruns are frequent (source FPS may be lower than target)
-                if self.stats['underruns'] == 50:
+                if self.stats["underruns"] == 50:
                     self.logger.warning(
                         f"Frequent buffer underruns ({self.stats['underruns']}). "
                         f"Source may be slower than {self.target_fps} FPS target."
@@ -331,9 +341,7 @@ class FrameJitterBuffer:
 
         # Start reader thread
         self._reader_thread = threading.Thread(
-            target=self._reader_loop,
-            name="FrameBufferReader",
-            daemon=True
+            target=self._reader_loop, name="FrameBufferReader", daemon=True
         )
         self._reader_thread.start()
 
@@ -389,13 +397,13 @@ class FrameJitterBuffer:
         self._prefill_complete.clear()
         self._next_emit_time = None
         self.stats = {
-            'frames_read': 0,
-            'frames_emitted': 0,
-            'frames_skipped': 0,
-            'underruns': 0,
-            'overflows': 0,
-            'duplicates_emitted': 0,
-            'input_fps': 0.0,
+            "frames_read": 0,
+            "frames_emitted": 0,
+            "frames_skipped": 0,
+            "underruns": 0,
+            "overflows": 0,
+            "duplicates_emitted": 0,
+            "input_fps": 0.0,
         }
         self._input_fps_last_count = 0
         self._input_fps_last_time = None
@@ -421,9 +429,9 @@ class FrameJitterBuffer:
         current, maximum = self.get_buffer_level()
         return {
             **self.stats,
-            'buffer_level': current,
-            'buffer_max': maximum,
-            'buffer_percent': (current / maximum * 100) if maximum > 0 else 0,
+            "buffer_level": current,
+            "buffer_max": maximum,
+            "buffer_percent": (current / maximum * 100) if maximum > 0 else 0,
         }
 
     def isOpened(self) -> bool:

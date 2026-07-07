@@ -9,7 +9,7 @@ import argparse
 from pathlib import Path
 
 # Add src to path
-sys.path.insert(0, str(Path(__file__).parent.parent / 'src'))
+sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from streaming.stream_orchestrator import StreamOrchestrator
 from processors import (
@@ -17,25 +17,25 @@ from processors import (
     PassthroughProcessor,
     DisplayProcessor,
     MultiStreamDisplayProcessor,
-    PeopleCounterProcessor
+    PeopleCounterProcessor,
 )
 import multiprocessing
 
 
 # Available processor classes
 PROCESSORS = {
-    'example': ExampleProcessor,
-    'passthrough': PassthroughProcessor,
-    'display': DisplayProcessor,
-    'multi': MultiStreamDisplayProcessor,
-    'counter': PeopleCounterProcessor
+    "example": ExampleProcessor,
+    "passthrough": PassthroughProcessor,
+    "display": DisplayProcessor,
+    "multi": MultiStreamDisplayProcessor,
+    "counter": PeopleCounterProcessor,
 }
 
 
 def main():
     """Main entry point"""
     parser = argparse.ArgumentParser(
-        description='CrowdCount Counter Server - Stream Reception & Processing',
+        description="CrowdCount Counter Server - Stream Reception & Processing",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Available Processors:
@@ -57,15 +57,16 @@ Examples:
 
   # Run with multi-stream display
   python3 scripts/run_server.py --processor multi
-        """
+        """,
     )
 
     parser.add_argument(
-        '--processor', '-p',
+        "--processor",
+        "-p",
         type=str,
-        default='counter',
+        default="counter",
         choices=PROCESSORS.keys(),
-        help='Processor type to use for streams (default: counter)'
+        help="Processor type to use for streams (default: counter)",
     )
 
     args = parser.parse_args()
@@ -86,7 +87,7 @@ Examples:
     print()
 
     # Set up multiprocessing
-    multiprocessing.set_start_method('spawn', force=True)
+    multiprocessing.set_start_method("spawn", force=True)
 
     # Create orchestrator with selected processor
     orchestrator = StreamOrchestrator(processor_class=processor_class)

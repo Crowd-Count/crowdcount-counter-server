@@ -12,11 +12,16 @@ import numpy as np
 
 # Import video settings from central config
 try:
-    from config.server_config import VIDEO_FPS, FRAME_BUFFER_ENABLED, FRAME_BUFFER_SECONDS
+    from config.server_config import (
+        VIDEO_FPS,
+        FRAME_BUFFER_ENABLED,
+        FRAME_BUFFER_SECONDS,
+    )
 except ImportError:
     VIDEO_FPS = 15  # Fallback default
     FRAME_BUFFER_ENABLED = False
     FRAME_BUFFER_SECONDS = 2.5
+
 
 class BaseStreamProcessor(ABC):
     """
@@ -24,9 +29,17 @@ class BaseStreamProcessor(ABC):
     Each processor handles one video stream and runs its own processing logic.
     """
 
-    def __init__(self, stream_name: str, rtsp_url: str, device_info: Optional[dict] = None,
-                 frame_queue=None, inference_request_queue=None, inference_result_queue=None,
-                 processor_heartbeat=None, inference_slot_name=None):
+    def __init__(
+        self,
+        stream_name: str,
+        rtsp_url: str,
+        device_info: Optional[dict] = None,
+        frame_queue=None,
+        inference_request_queue=None,
+        inference_result_queue=None,
+        processor_heartbeat=None,
+        inference_slot_name=None,
+    ):
         """
         Initialize the stream processor
 
@@ -42,8 +55,8 @@ class BaseStreamProcessor(ABC):
         self.stream_name = stream_name
         self.rtsp_url = rtsp_url
         self.device_info = device_info or {}
-        self.device_id = self.device_info.get('device_id', stream_name)
-        self.password = self.device_info.get('password', '')
+        self.device_id = self.device_info.get("device_id", stream_name)
+        self.password = self.device_info.get("password", "")
         self.running = False
         self.cap: Optional[cv2.VideoCapture] = None
         self.frame_queue = frame_queue  # Queue for live viewing
@@ -63,7 +76,7 @@ class BaseStreamProcessor(ABC):
         if not self.logger.handlers:
             handler = logging.StreamHandler()
             formatter = logging.Formatter(
-                f'%(asctime)s - {stream_name} - %(levelname)s - %(message)s'
+                f"%(asctime)s - {stream_name} - %(levelname)s - %(message)s"
             )
             handler.setFormatter(formatter)
             self.logger.addHandler(handler)
@@ -78,7 +91,9 @@ class BaseStreamProcessor(ABC):
         self._current_interval_fps = 0.0  # Updated every 5s, published to frame_data
 
         # Frame validation and recovery (optimized for minimal overhead)
-        self._last_valid_frame_ref: Optional[np.ndarray] = None  # Reference only, no copy
+        self._last_valid_frame_ref: Optional[np.ndarray] = (
+            None  # Reference only, no copy
+        )
         self._validation_frame_counter = 0
         self._validation_interval = 5  # Only validate every N frames
         self.corrupted_frame_count = 0
@@ -107,24 +122,29 @@ class BaseStreamProcessor(ABC):
 
         for attempt in range(1, max_retries + 1):
             try:
-                self.logger.info(f"Connecting to stream (attempt {attempt}/{max_retries}): {self.rtsp_url}")
+                self.logger.info(
+                    f"Connecting to stream (attempt {attempt}/{max_retries}): {self.rtsp_url}"
+                )
 
                 # Set FFmpeg options for robust, low-latency RTSP streaming
                 # Critical for stable 15fps at 640p over Tailscale
                 import os
-                os.environ['OPENCV_FFMPEG_CAPTURE_OPTIONS'] = '|'.join([
-                    'rtsp_transport;tcp',         # Use TCP instead of UDP (more reliable)
-                    'stimeout;10000000',          # Socket timeout 10 seconds (in microseconds) - increased for stability
-                    'max_delay;100000',           # Max demux delay 100ms (reduced for lower latency)
-                    'reorder_queue_size;0',       # Disable packet reordering (lower latency)
-                    'fflags;nobuffer+discardcorrupt+igndts+flush_packets',  # No buffering + flush immediately
-                    'flags;low_delay',            # Enable low delay mode
-                    'err_detect;ignore_err',      # Ignore decoding errors (macroblock errors)
-                    'analyzeduration;500000',     # Reduce stream analysis time to 0.5s
-                    'probesize;500000',           # Reduce probe size to 0.5MB
-                    'buffer_size;0',              # Disable internal buffer
-                    'fifo_size;0',                # Disable FIFO buffer
-                ])
+
+                os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "|".join(
+                    [
+                        "rtsp_transport;tcp",  # Use TCP instead of UDP (more reliable)
+                        "stimeout;10000000",  # Socket timeout 10 seconds (in microseconds) - increased for stability
+                        "max_delay;100000",  # Max demux delay 100ms (reduced for lower latency)
+                        "reorder_queue_size;0",  # Disable packet reordering (lower latency)
+                        "fflags;nobuffer+discardcorrupt+igndts+flush_packets",  # No buffering + flush immediately
+                        "flags;low_delay",  # Enable low delay mode
+                        "err_detect;ignore_err",  # Ignore decoding errors (macroblock errors)
+                        "analyzeduration;500000",  # Reduce stream analysis time to 0.5s
+                        "probesize;500000",  # Reduce probe size to 0.5MB
+                        "buffer_size;0",  # Disable internal buffer
+                        "fifo_size;0",  # Disable FIFO buffer
+                    ]
+                )
 
                 # Create VideoCapture with FFmpeg backend
                 self.cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_FFMPEG)
@@ -138,7 +158,9 @@ class BaseStreamProcessor(ABC):
                 self.cap.set(cv2.CAP_PROP_FPS, VIDEO_FPS)
 
                 if not self.cap.isOpened():
-                    self.logger.warning(f"Failed to open stream (attempt {attempt}/{max_retries})")
+                    self.logger.warning(
+                        f"Failed to open stream (attempt {attempt}/{max_retries})"
+                    )
                     if self.cap:
                         self.cap.release()
                         self.cap = None
@@ -152,7 +174,9 @@ class BaseStreamProcessor(ABC):
                 # Test read a frame
                 ret, frame = self.cap.read()
                 if not ret or frame is None:
-                    self.logger.warning(f"Failed to read initial frame (attempt {attempt}/{max_retries})")
+                    self.logger.warning(
+                        f"Failed to read initial frame (attempt {attempt}/{max_retries})"
+                    )
                     self.cap.release()
                     self.cap = None
 
@@ -164,13 +188,15 @@ class BaseStreamProcessor(ABC):
 
                 # Success! Get stream properties
                 actual_fps = self.cap.get(cv2.CAP_PROP_FPS)
-                self.logger.info(f"Successfully connected to stream")
+                self.logger.info("Successfully connected to stream")
                 self.logger.info(f"  Resolution: {frame.shape[1]}x{frame.shape[0]}")
                 self.logger.info(f"  Reported FPS: {actual_fps:.1f}")
-                self.logger.info(f"  Buffer size: {self.cap.get(cv2.CAP_PROP_BUFFERSIZE)}")
+                self.logger.info(
+                    f"  Buffer size: {self.cap.get(cv2.CAP_PROP_BUFFERSIZE)}"
+                )
 
                 # Stabilization: drain any buffered frames and let stream settle
-                self.logger.info(f"  Stabilizing stream (draining buffers)...")
+                self.logger.info("  Stabilizing stream (draining buffers)...")
                 drain_start = time.time()
                 frames_drained = 0
                 while time.time() - drain_start < 1.0:  # Drain for up to 1 second
@@ -179,7 +205,9 @@ class BaseStreamProcessor(ABC):
                     else:
                         break
                     time.sleep(0.01)
-                self.logger.info(f"  Drained {frames_drained} buffered frames, stream ready")
+                self.logger.info(
+                    f"  Drained {frames_drained} buffered frames, stream ready"
+                )
 
                 # Initialize jitter buffer if enabled (smooths network timing variations)
                 if self.use_frame_buffer:
@@ -189,7 +217,7 @@ class BaseStreamProcessor(ABC):
                         cap=self.cap,
                         target_fps=VIDEO_FPS,
                         buffer_seconds=self.frame_buffer_seconds,
-                        logger=self.logger
+                        logger=self.logger,
                     )
 
                     if not self._jitter_buffer.start(prefill_timeout=15.0):
@@ -197,12 +225,16 @@ class BaseStreamProcessor(ABC):
                         self._jitter_buffer = None
                         return False
 
-                    self.logger.info(f"  Jitter buffer enabled: {self.frame_buffer_seconds}s buffer")
+                    self.logger.info(
+                        f"  Jitter buffer enabled: {self.frame_buffer_seconds}s buffer"
+                    )
 
                 return True
 
             except Exception as e:
-                self.logger.warning(f"Error connecting to stream (attempt {attempt}/{max_retries}): {e}")
+                self.logger.warning(
+                    f"Error connecting to stream (attempt {attempt}/{max_retries}): {e}"
+                )
                 if self.cap:
                     try:
                         self.cap.release()
@@ -255,7 +287,7 @@ class BaseStreamProcessor(ABC):
 
         # Sample center 50% of frame, every 20th pixel (much smaller than before)
         h, w = frame.shape[:2]
-        sample = frame[h//4:3*h//4:20, w//4:3*w//4:20]
+        sample = frame[h // 4 : 3 * h // 4 : 20, w // 4 : 3 * w // 4 : 20]
 
         # Use min/max instead of std (faster) for corruption detection
         sample_min = int(sample.min())
@@ -297,8 +329,8 @@ class BaseStreamProcessor(ABC):
         # Only validate every N frames for performance
         # But always validate if we're recovering from corrupted frames
         should_validate = (
-            self._validation_frame_counter >= self._validation_interval or
-            self.corrupted_frame_count > 0
+            self._validation_frame_counter >= self._validation_interval
+            or self.corrupted_frame_count > 0
         )
 
         if not should_validate:
@@ -322,7 +354,9 @@ class BaseStreamProcessor(ABC):
         if self.corrupted_frame_count <= self.max_corrupted_before_warn:
             self.logger.debug(f"Corrupted frame detected: {reason}")
         elif self.corrupted_frame_count == self.max_corrupted_before_warn + 1:
-            self.logger.warning(f"Many corrupted frames detected (>{self.max_corrupted_before_warn}), suppressing further debug logs")
+            self.logger.warning(
+                f"Many corrupted frames detected (>{self.max_corrupted_before_warn}), suppressing further debug logs"
+            )
 
         # Return cached frame if available - NOW we copy (only on actual corruption)
         if self._last_valid_frame_ref is not None:
@@ -332,7 +366,9 @@ class BaseStreamProcessor(ABC):
         return frame
 
     @abstractmethod
-    def process_frame(self, frame: np.ndarray, frame_number: int, timestamp: float) -> Optional[np.ndarray]:
+    def process_frame(
+        self, frame: np.ndarray, frame_number: int, timestamp: float
+    ) -> Optional[np.ndarray]:
         """
         Process a single frame. Override this method with your custom logic.
 
@@ -375,12 +411,17 @@ class BaseStreamProcessor(ABC):
         # Connect to stream
         print(f"[{self.stream_name}] Connecting to RTSP stream...", flush=True)
         if not self.connect_stream():
-            print(f"[{self.stream_name}] ERROR: Failed to connect to stream", flush=True)
+            print(
+                f"[{self.stream_name}] ERROR: Failed to connect to stream", flush=True
+            )
             self.logger.error("Failed to connect to stream, exiting")
             self.running = False
             return
 
-        print(f"[{self.stream_name}] Stream connected! Initializing processor...", flush=True)
+        print(
+            f"[{self.stream_name}] Stream connected! Initializing processor...",
+            flush=True,
+        )
         # Call custom start logic
         try:
             self.on_start()
@@ -390,15 +431,26 @@ class BaseStreamProcessor(ABC):
 
         # Log buffer status clearly
         if self._jitter_buffer is not None:
-            print(f"[{self.stream_name}] FRAME BUFFER ACTIVE: {self.frame_buffer_seconds}s buffer, targeting {VIDEO_FPS} FPS", flush=True)
+            print(
+                f"[{self.stream_name}] FRAME BUFFER ACTIVE: {self.frame_buffer_seconds}s buffer, targeting {VIDEO_FPS} FPS",
+                flush=True,
+            )
         else:
-            print(f"[{self.stream_name}] Frame buffer DISABLED (direct stream mode)", flush=True)
+            print(
+                f"[{self.stream_name}] Frame buffer DISABLED (direct stream mode)",
+                flush=True,
+            )
 
-        print(f"[{self.stream_name}] Processor ready! Starting frame processing loop...", flush=True)
+        print(
+            f"[{self.stream_name}] Processor ready! Starting frame processing loop...",
+            flush=True,
+        )
         # Main processing loop
         frame_number = 0
         consecutive_failures = 0
-        max_consecutive_failures = 10  # Exit quickly (~1s) — let orchestrator handle reconnection
+        max_consecutive_failures = (
+            10  # Exit quickly (~1s) — let orchestrator handle reconnection
+        )
 
         try:
             while self.running:
@@ -418,7 +470,9 @@ class BaseStreamProcessor(ABC):
                     # FFmpeg decode error (e.g., macroblock corruption)
                     consecutive_failures += 1
                     if consecutive_failures <= 3 or consecutive_failures % 10 == 0:
-                        self.logger.warning(f"Decode error ({consecutive_failures}/{max_consecutive_failures}): {e}")
+                        self.logger.warning(
+                            f"Decode error ({consecutive_failures}/{max_consecutive_failures}): {e}"
+                        )
                     if consecutive_failures >= max_consecutive_failures:
                         self.logger.error("Too many decode errors, exiting")
                         break
@@ -428,10 +482,14 @@ class BaseStreamProcessor(ABC):
                 if not ret or frame is None:
                     consecutive_failures += 1
                     if consecutive_failures <= 3 or consecutive_failures % 10 == 0:
-                        self.logger.warning(f"Failed to read frame ({consecutive_failures}/{max_consecutive_failures})")
+                        self.logger.warning(
+                            f"Failed to read frame ({consecutive_failures}/{max_consecutive_failures})"
+                        )
 
                     if consecutive_failures >= max_consecutive_failures:
-                        self.logger.error("Stream failed, exiting (orchestrator will handle reconnection)")
+                        self.logger.error(
+                            "Stream failed, exiting (orchestrator will handle reconnection)"
+                        )
                         break
 
                     time.sleep(0.1)
@@ -467,13 +525,15 @@ class BaseStreamProcessor(ABC):
                             # input_fps = raw camera rate (from jitter buffer if active,
                             # otherwise processor loop rate which equals camera rate in direct mode)
                             if self._jitter_buffer is not None:
-                                input_fps = self._jitter_buffer.stats.get('input_fps', 0.0)
+                                input_fps = self._jitter_buffer.stats.get(
+                                    "input_fps", 0.0
+                                )
                             else:
                                 input_fps = self._current_interval_fps
                             frame_data = {
-                                'clean': clean_frame,
-                                'annotated': processed_frame,
-                                'processor_fps': input_fps,
+                                "clean": clean_frame,
+                                "annotated": processed_frame,
+                                "processor_fps": input_fps,
                             }
                             self.frame_queue.put_nowait(frame_data)
                         except Exception:
@@ -495,21 +555,29 @@ class BaseStreamProcessor(ABC):
                     elapsed = timestamp - self.start_time
                     overall_fps = self.frames_processed / elapsed if elapsed > 0 else 0
                     interval_time = timestamp - self.last_log_time
-                    interval_fps = self.frames_since_log / interval_time if interval_time > 0 else 0
+                    interval_fps = (
+                        self.frames_since_log / interval_time
+                        if interval_time > 0
+                        else 0
+                    )
                     self._current_interval_fps = interval_fps
 
                     # Build log message
-                    log_msg = (f"Processed {self.frames_processed} frames | "
-                               f"Overall: {overall_fps:.1f} fps | "
-                               f"Last 5s: {interval_fps:.1f} fps")
+                    log_msg = (
+                        f"Processed {self.frames_processed} frames | "
+                        f"Overall: {overall_fps:.1f} fps | "
+                        f"Last 5s: {interval_fps:.1f} fps"
+                    )
 
                     # Add jitter buffer stats if enabled
                     if self._jitter_buffer is not None:
                         level, max_level = self._jitter_buffer.get_buffer_level()
                         buf_stats = self._jitter_buffer.stats
-                        log_msg += (f" | Buffer: {level}/{max_level} "
-                                   f"(under:{buf_stats['underruns']} over:{buf_stats['overflows']} "
-                                   f"dups:{buf_stats['duplicates_emitted']} read:{buf_stats['frames_read']})")
+                        log_msg += (
+                            f" | Buffer: {level}/{max_level} "
+                            f"(under:{buf_stats['underruns']} over:{buf_stats['overflows']} "
+                            f"dups:{buf_stats['duplicates_emitted']} read:{buf_stats['frames_read']})"
+                        )
 
                     self.logger.info(log_msg)
 
@@ -531,7 +599,9 @@ class BaseStreamProcessor(ABC):
                 self.logger.error(f"Error in on_stop: {e}")
 
             self.disconnect_stream()
-            self.logger.info(f"Processor stopped. Processed {self.frames_processed} frames in {elapsed:.1f}s")
+            self.logger.info(
+                f"Processor stopped. Processed {self.frames_processed} frames in {elapsed:.1f}s"
+            )
 
     def stop(self):
         """Stop the processor"""
@@ -549,13 +619,13 @@ class BaseStreamProcessor(ABC):
         fps = self.frames_processed / elapsed if elapsed > 0 else 0
 
         return {
-            'stream_name': self.stream_name,
-            'device_id': self.device_id,
-            'rtsp_url': self.rtsp_url,
-            'running': self.running,
-            'frames_processed': self.frames_processed,
-            'elapsed_time': elapsed,
-            'fps': fps,
-            'last_frame_time': self.last_frame_time,
-            'has_password': bool(self.password)
+            "stream_name": self.stream_name,
+            "device_id": self.device_id,
+            "rtsp_url": self.rtsp_url,
+            "running": self.running,
+            "frames_processed": self.frames_processed,
+            "elapsed_time": elapsed,
+            "fps": fps,
+            "last_frame_time": self.last_frame_time,
+            "has_password": bool(self.password),
         }

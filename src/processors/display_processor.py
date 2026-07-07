@@ -14,7 +14,13 @@ class DisplayProcessor(BaseStreamProcessor):
     Useful for monitoring and debugging streams
     """
 
-    def __init__(self, stream_name: str, rtsp_url: str, device_info: dict = None, frame_queue=None):
+    def __init__(
+        self,
+        stream_name: str,
+        rtsp_url: str,
+        device_info: dict = None,
+        frame_queue=None,
+    ):
         super().__init__(stream_name, rtsp_url, device_info, frame_queue)
         self.window_name = f"Stream: {stream_name}"
 
@@ -27,7 +33,9 @@ class DisplayProcessor(BaseStreamProcessor):
         cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(self.window_name, 800, 600)
 
-    def process_frame(self, frame: np.ndarray, frame_number: int, timestamp: float) -> np.ndarray:
+    def process_frame(
+        self, frame: np.ndarray, frame_number: int, timestamp: float
+    ) -> np.ndarray:
         """
         Display each frame in a window
 
@@ -43,7 +51,7 @@ class DisplayProcessor(BaseStreamProcessor):
         display_frame = frame.copy()
 
         # Get device info
-        device_id = self.device_info.get('device_id', self.stream_name)
+        device_id = self.device_info.get("device_id", self.stream_name)
 
         # Add info overlay
         font = cv2.FONT_HERSHEY_SIMPLEX
@@ -54,19 +62,29 @@ class DisplayProcessor(BaseStreamProcessor):
         cv2.addWeighted(overlay, 0.4, display_frame, 0.6, 0, display_frame)
 
         # Text info
-        cv2.putText(display_frame, f"Device: {device_id}",
-                   (10, 25), font, 0.6, (0, 255, 0), 2)
-        cv2.putText(display_frame, f"Stream: {self.stream_name}",
-                   (10, 50), font, 0.6, (0, 255, 0), 2)
-        cv2.putText(display_frame, f"Frame: {frame_number}",
-                   (10, 75), font, 0.6, (0, 255, 0), 2)
+        cv2.putText(
+            display_frame, f"Device: {device_id}", (10, 25), font, 0.6, (0, 255, 0), 2
+        )
+        cv2.putText(
+            display_frame,
+            f"Stream: {self.stream_name}",
+            (10, 50),
+            font,
+            0.6,
+            (0, 255, 0),
+            2,
+        )
+        cv2.putText(
+            display_frame, f"Frame: {frame_number}", (10, 75), font, 0.6, (0, 255, 0), 2
+        )
 
         # FPS calculation
-        if hasattr(self, 'start_time') and self.start_time:
+        if hasattr(self, "start_time") and self.start_time:
             elapsed = timestamp - self.start_time
             fps = self.frames_processed / elapsed if elapsed > 0 else 0
-            cv2.putText(display_frame, f"FPS: {fps:.1f}",
-                       (10, 100), font, 0.6, (0, 255, 0), 2)
+            cv2.putText(
+                display_frame, f"FPS: {fps:.1f}", (10, 100), font, 0.6, (0, 255, 0), 2
+            )
 
         # Display the frame
         cv2.imshow(self.window_name, display_frame)
@@ -75,7 +93,7 @@ class DisplayProcessor(BaseStreamProcessor):
         key = cv2.waitKey(1) & 0xFF
 
         # Press 'q' to quit (will stop this processor)
-        if key == ord('q'):
+        if key == ord("q"):
             self.logger.info("User pressed 'q', stopping processor")
             self.stop()
 
@@ -101,7 +119,13 @@ class MultiStreamDisplayProcessor(BaseStreamProcessor):
     Shows stream in a smaller window suitable for monitoring many streams
     """
 
-    def __init__(self, stream_name: str, rtsp_url: str, device_info: dict = None, frame_queue=None):
+    def __init__(
+        self,
+        stream_name: str,
+        rtsp_url: str,
+        device_info: dict = None,
+        frame_queue=None,
+    ):
         super().__init__(stream_name, rtsp_url, device_info, frame_queue)
         self.window_name = f"{stream_name}"
 
@@ -110,19 +134,28 @@ class MultiStreamDisplayProcessor(BaseStreamProcessor):
         cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(self.window_name, 400, 300)
 
-    def process_frame(self, frame: np.ndarray, frame_number: int, timestamp: float) -> np.ndarray:
+    def process_frame(
+        self, frame: np.ndarray, frame_number: int, timestamp: float
+    ) -> np.ndarray:
         """Display frame with minimal overlay"""
         display_frame = frame.copy()
 
         # Simple device ID overlay
-        device_id = self.device_info.get('device_id', self.stream_name)
-        cv2.putText(display_frame, device_id, (10, 30),
-                   cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        device_id = self.device_info.get("device_id", self.stream_name)
+        cv2.putText(
+            display_frame,
+            device_id,
+            (10, 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1,
+            (0, 255, 0),
+            2,
+        )
 
         cv2.imshow(self.window_name, display_frame)
 
         key = cv2.waitKey(1) & 0xFF
-        if key == ord('q'):
+        if key == ord("q"):
             self.stop()
 
         return display_frame

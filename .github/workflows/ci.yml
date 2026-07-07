@@ -1,0 +1,30 @@
+name: ci
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install ruff
+        uses: astral-sh/ruff-action@v3
+
+      - name: Lint
+        run: ruff check .
+
+      - name: Format check
+        run: ruff format --check .
+
+      # The full pipeline needs a GPU + camera streams, so tests can't run
+      # here; at minimum every module must byte-compile.
+      - name: Byte-compile all modules
+        run: python3 -m compileall -q . -x '(env|venv|\.venv)/'
