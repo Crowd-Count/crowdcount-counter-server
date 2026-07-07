@@ -631,7 +631,7 @@ class PeopleCounterProcessor(BaseStreamProcessor):
 
         # YOLO model setup
         self.model = None
-        self.model_path = str(MODELS_DIR / "crowdcount-v5_1.pt")  # V5.1 model trained on V5_1_data dataset
+        self.model_path = str(MODELS_DIR / "crowdcount-v6.pt")  # V6 model trained on V6_data dataset (mAP50=0.944)
         self.tracker_config = str(MODELS_DIR / "botsort.yaml")  # BoT-SORT config (XYWH Kalman, no ReID)
         self.class_names = {0: 'person'}  # Default
 
@@ -643,7 +643,7 @@ class PeopleCounterProcessor(BaseStreamProcessor):
             'min_path_length': 50,      # Minimum pixels traveled
             'max_tracking_distance': 0.156,  # Proportion of frame width (~100px at 640w)
             'tracker_timeout': 1.5,     # TUNED: Reduced from 3.0 to let false tracks expire faster
-            'yolo_conf_threshold': 0.35,  # Lowered from 0.45 for better recall
+            'yolo_conf_threshold': 0.31,  # F1-optimal threshold from V6 PR curve analysis
             'yolo_iou_threshold': 0.3,   # TUNED: Lowered from 0.45 to separate overlapping people
             'min_crossing_interval': 0.5,  # TUNED: Increased from 0.3 to prevent double counts
             'min_peak_confidence': 0.35,  # Aligned with YOLO conf — final quality gate before counting a crossing
@@ -1153,6 +1153,7 @@ class PeopleCounterProcessor(BaseStreamProcessor):
                 frame=frame,
                 conf=self.doorway_config['yolo_conf_threshold'],
                 iou=self.doorway_config['yolo_iou_threshold'],
+                slot_name=self.inference_slot_name,
             )
             try:
                 self.inference_request_queue.put(request, timeout=2.0)
