@@ -50,8 +50,13 @@ class CountBacklog:
                 CREATE INDEX IF NOT EXISTS idx_backlog_device_id ON count_backlog(device_id);
             """)
 
-    def add(self, device_id: str, operation: str, count: int = 1,
-            crossing_timestamp: Optional[float] = None):
+    def add(
+        self,
+        device_id: str,
+        operation: str,
+        count: int = 1,
+        crossing_timestamp: Optional[float] = None,
+    ):
         """Queue a failed count operation for later retry."""
         now = time.time()
         if crossing_timestamp is None:
@@ -61,7 +66,7 @@ class CountBacklog:
                 """INSERT INTO count_backlog
                    (device_id, operation, count, crossing_timestamp, created_at)
                    VALUES (?, ?, ?, ?, ?)""",
-                (device_id, operation, count, crossing_timestamp, now)
+                (device_id, operation, count, crossing_timestamp, now),
             )
             self._conn.commit()
         self.logger.info(f"Backlogged {operation} {count} for device {device_id}")
@@ -70,8 +75,7 @@ class CountBacklog:
         """Get the oldest pending entries for flushing (chronological order)."""
         with self._lock:
             cursor = self._conn.execute(
-                "SELECT * FROM count_backlog ORDER BY created_at ASC LIMIT ?",
-                (limit,)
+                "SELECT * FROM count_backlog ORDER BY created_at ASC LIMIT ?", (limit,)
             )
             return [dict(row) for row in cursor.fetchall()]
 
@@ -87,7 +91,7 @@ class CountBacklog:
         with self._lock:
             self._conn.execute(
                 "UPDATE count_backlog SET attempts = attempts + 1, last_attempt_at = ? WHERE id = ?",
-                (now, entry_id)
+                (now, entry_id),
             )
             self._conn.commit()
 
@@ -103,7 +107,7 @@ class CountBacklog:
             cursor = self._conn.execute(
                 "SELECT device_id, COUNT(*) as cnt FROM count_backlog GROUP BY device_id"
             )
-            return {row['device_id']: row['cnt'] for row in cursor.fetchall()}
+            return {row["device_id"]: row["cnt"] for row in cursor.fetchall()}
 
     def close(self):
         """Close the database connection."""

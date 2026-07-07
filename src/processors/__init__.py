@@ -8,19 +8,25 @@ from .example_processor import ExampleProcessor, PassthroughProcessor
 from .display_processor import DisplayProcessor, MultiStreamDisplayProcessor
 from .people_counter_processor import PeopleCounterProcessor
 from .frame_buffer import FrameJitterBuffer
-from .inference_server import InferenceServer, InferenceRequest, InferenceResponse, RequestType, DetectionResult
+from .inference_server import (
+    InferenceServer,
+    InferenceRequest,
+    InferenceResponse,
+    RequestType,
+    DetectionResult,
+)
 
 __all__ = [
-    'BaseStreamProcessor',
-    'ExampleProcessor',
-    'PassthroughProcessor',
-    'DisplayProcessor',
-    'MultiStreamDisplayProcessor',
-    'PeopleCounterProcessor',
-    'FrameJitterBuffer',
-    'InferenceServer',
-    'InferenceRequest',
-    'InferenceResponse',
-    'RequestType',
-    'DetectionResult',
+    "BaseStreamProcessor",
+    "ExampleProcessor",
+    "PassthroughProcessor",
+    "DisplayProcessor",
+    "MultiStreamDisplayProcessor",
+    "PeopleCounterProcessor",
+    "FrameJitterBuffer",
+    "InferenceServer",
+    "InferenceRequest",
+    "InferenceResponse",
+    "RequestType",
+    "DetectionResult",
 ]

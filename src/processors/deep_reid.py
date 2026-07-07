@@ -12,6 +12,7 @@ import logging
 try:
     import torch
     import torchreid
+
     TORCHREID_AVAILABLE = True
 except ImportError:
     TORCHREID_AVAILABLE = False
@@ -28,10 +29,7 @@ class DeepReIDExtractor:
     """
 
     def __init__(
-        self,
-        model_name: str = 'osnet_x1_0',
-        device: str = None,
-        verbose: bool = True
+        self, model_name: str = "osnet_x1_0", device: str = None, verbose: bool = True
     ):
         """
         Initialize the ReID model.
@@ -56,18 +54,20 @@ class DeepReIDExtractor:
 
         # Auto-detect device
         if device is None:
-            self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+            self.device = "cuda" if torch.cuda.is_available() else "cpu"
         else:
             self.device = device
 
         if self.verbose:
-            print(f"[DeepReID] Initializing {model_name} on {self.device}...", flush=True)
+            print(
+                f"[DeepReID] Initializing {model_name} on {self.device}...", flush=True
+            )
 
         # Build model pretrained on combined Market1501 + MSMT17 datasets
         self.model = torchreid.models.build_model(
             name=model_name,
             num_classes=1000,  # Doesn't matter for feature extraction
-            pretrained=True
+            pretrained=True,
         )
         self.model = self.model.to(self.device)
         self.model.eval()
@@ -81,7 +81,10 @@ class DeepReIDExtractor:
         self.feature_dim = 512
 
         if self.verbose:
-            print(f"[DeepReID] Model loaded successfully. Feature dim: {self.feature_dim}", flush=True)
+            print(
+                f"[DeepReID] Model loaded successfully. Feature dim: {self.feature_dim}",
+                flush=True,
+            )
 
         logger.info(f"DeepReID initialized: model={model_name}, device={self.device}")
 
@@ -117,12 +120,7 @@ class DeepReIDExtractor:
 
     @torch.no_grad()
     def extract(
-        self,
-        frame: np.ndarray,
-        x1: int,
-        y1: int,
-        x2: int,
-        y2: int
+        self, frame: np.ndarray, x1: int, y1: int, x2: int, y2: int
     ) -> Optional[np.ndarray]:
         """
         Extract ReID features from a bounding box in a frame.
@@ -174,9 +172,7 @@ class DeepReIDExtractor:
 
     @torch.no_grad()
     def extract_batch(
-        self,
-        frame: np.ndarray,
-        boxes: List[Tuple[int, int, int, int]]
+        self, frame: np.ndarray, boxes: List[Tuple[int, int, int, int]]
     ) -> List[Optional[np.ndarray]]:
         """
         Extract features for multiple bounding boxes in one forward pass.
@@ -234,7 +230,7 @@ class DeepReIDExtractor:
     @torch.no_grad()
     def extract_cross_camera_batch(
         self,
-        frame_boxes_pairs: List[Tuple[np.ndarray, List[Tuple[int, int, int, int]]]]
+        frame_boxes_pairs: List[Tuple[np.ndarray, List[Tuple[int, int, int, int]]]],
     ) -> List[List[Optional[np.ndarray]]]:
         """
         Extract features for multiple cameras' boxes in ONE forward pass.
@@ -254,9 +250,9 @@ class DeepReIDExtractor:
         if not frame_boxes_pairs:
             return []
 
-        all_crops = []       # Preprocessed crop tensors
-        crop_map = []        # (camera_idx, box_idx) for each crop
-        box_counts = []      # Total boxes per camera (for building result arrays)
+        all_crops = []  # Preprocessed crop tensors
+        crop_map = []  # (camera_idx, box_idx) for each crop
+        box_counts = []  # Total boxes per camera (for building result arrays)
 
         for cam_idx, (frame, boxes) in enumerate(frame_boxes_pairs):
             box_counts.append(len(boxes))
@@ -332,16 +328,16 @@ class FallbackReIDExtractor:
 
     def __init__(self):
         self.feature_dim = 96
-        print("[FallbackReID] Using HSV histogram features (torchreid not available)", flush=True)
-        logger.warning("Using fallback HSV ReID - install torchreid for better accuracy")
+        print(
+            "[FallbackReID] Using HSV histogram features (torchreid not available)",
+            flush=True,
+        )
+        logger.warning(
+            "Using fallback HSV ReID - install torchreid for better accuracy"
+        )
 
     def extract(
-        self,
-        frame: np.ndarray,
-        x1: int,
-        y1: int,
-        x2: int,
-        y2: int
+        self, frame: np.ndarray, x1: int, y1: int, x2: int, y2: int
     ) -> Optional[np.ndarray]:
         """Extract HSV histogram features (fallback method)."""
         try:
@@ -391,16 +387,14 @@ class FallbackReIDExtractor:
             return None
 
     def extract_batch(
-        self,
-        frame: np.ndarray,
-        boxes: List[Tuple[int, int, int, int]]
+        self, frame: np.ndarray, boxes: List[Tuple[int, int, int, int]]
     ) -> List[Optional[np.ndarray]]:
         """Extract features for multiple boxes (sequential for fallback)."""
         return [self.extract(frame, *box) for box in boxes]
 
     def extract_cross_camera_batch(
         self,
-        frame_boxes_pairs: List[Tuple[np.ndarray, List[Tuple[int, int, int, int]]]]
+        frame_boxes_pairs: List[Tuple[np.ndarray, List[Tuple[int, int, int, int]]]],
     ) -> List[List[Optional[np.ndarray]]]:
         """Extract features for multiple cameras' boxes (sequential for fallback)."""
         return [self.extract_batch(frame, boxes) for frame, boxes in frame_boxes_pairs]
@@ -415,9 +409,7 @@ class FallbackReIDExtractor:
 
 
 def create_reid_extractor(
-    model_name: str = 'osnet_x1_0',
-    device: str = None,
-    verbose: bool = True
+    model_name: str = "osnet_x1_0", device: str = None, verbose: bool = True
 ):
     """
     Factory function to create the best available ReID extractor.
@@ -426,7 +418,9 @@ def create_reid_extractor(
     """
     if TORCHREID_AVAILABLE:
         try:
-            return DeepReIDExtractor(model_name=model_name, device=device, verbose=verbose)
+            return DeepReIDExtractor(
+                model_name=model_name, device=device, verbose=verbose
+            )
         except Exception as e:
             logger.error(f"Failed to initialize DeepReID: {e}")
             print(f"[ReID] Failed to load deep model: {e}. Using fallback.", flush=True)

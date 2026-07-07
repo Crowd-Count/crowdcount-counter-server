@@ -38,12 +38,18 @@ RTSP_HOST = "127.0.0.1"
 ORCHESTRATOR_HOST = "0.0.0.0"
 
 # Stream processor settings
-PROCESSOR_TYPE = "subprocess"  # Options: "subprocess", "docker" (docker not implemented yet)
-MAX_PROCESSORS = 35  # Maximum number of concurrent stream processors (GPU 1: 25 + GPU 0: 10)
+PROCESSOR_TYPE = (
+    "subprocess"  # Options: "subprocess", "docker" (docker not implemented yet)
+)
+MAX_PROCESSORS = (
+    35  # Maximum number of concurrent stream processors (GPU 1: 25 + GPU 0: 10)
+)
 PROCESSOR_RESTART_DELAY = 5  # Seconds to wait before restarting a failed processor
 
 # Stream settings
-STREAM_RECONNECT_TIMEOUT = 15  # Seconds to wait for stream reconnection before marking offline
+STREAM_RECONNECT_TIMEOUT = (
+    15  # Seconds to wait for stream reconnection before marking offline
+)
 STREAM_HEALTH_CHECK_INTERVAL = 5  # Seconds between stream health checks
 
 # Logging
@@ -55,12 +61,12 @@ DB_PATH = DATA_DIR / "devices.db"
 
 # Count backlog settings (persists failed API counts across crashes)
 BACKLOG_DB_PATH = DATA_DIR / "count_backlog.db"
-BACKLOG_FLUSH_INTERVAL = 30      # Seconds between flush attempts
-BACKLOG_FLUSH_BATCH_SIZE = 50    # Max entries to process per flush cycle
+BACKLOG_FLUSH_INTERVAL = 30  # Seconds between flush attempts
+BACKLOG_FLUSH_BATCH_SIZE = 50  # Max entries to process per flush cycle
 
 # SSH settings for remote device control
-SSH_KEY_PATH = os.path.expanduser('~/.ssh/id_rsa')
-SSH_USER = 'pi'  # Default Raspberry Pi username
+SSH_KEY_PATH = os.path.expanduser("~/.ssh/id_rsa")
+SSH_USER = "pi"  # Default Raspberry Pi username
 
 # Web dashboard
 STATIC_DIR = BASE_DIR / "static"
@@ -77,8 +83,8 @@ NUM_GPUS = int(os.getenv("NUM_GPUS", "1"))
 # GPU 1 is primary (25 slots), GPU 0 is overflow (10 slots)
 # This allows prioritizing the more powerful GPU while keeping a backup
 GPU_SLOT_LIMITS = {
-    0: int(os.getenv("GPU_0_SLOTS", "10")),   # Overflow GPU
-    1: int(os.getenv("GPU_1_SLOTS", "25")),   # Primary GPU
+    0: int(os.getenv("GPU_0_SLOTS", "10")),  # Overflow GPU
+    1: int(os.getenv("GPU_1_SLOTS", "25")),  # Primary GPU
 }
 
 # GPU priority order: fill these GPUs in order (GPU 1 first, then overflow to GPU 0)
@@ -103,13 +109,13 @@ TENSORRT_WARMUP_ITERS = int(os.getenv("TENSORRT_WARMUP_ITERS", "3"))
 # =============================================================================
 # VIDEO SETTINGS - Change these values to adjust FPS and resolution globally
 # =============================================================================
-VIDEO_FPS = 15              # Frames per second (was 30)
-VIDEO_WIDTH = 640           # Video width in pixels
-VIDEO_HEIGHT = 480          # Video height in pixels
+VIDEO_FPS = 15  # Frames per second (was 30)
+VIDEO_WIDTH = 640  # Video width in pixels
+VIDEO_HEIGHT = 480  # Video height in pixels
 
 # ByteTrack timing (track_buffer should be ~2 seconds worth of frames)
 # At 15fps: 30 frames = 2 seconds | At 30fps: 60 frames = 2 seconds
-TRACK_BUFFER_SECONDS = 2.0    # How many seconds to keep lost tracks
+TRACK_BUFFER_SECONDS = 2.0  # How many seconds to keep lost tracks
 TRACK_BUFFER_FRAMES = int(VIDEO_FPS * TRACK_BUFFER_SECONDS)
 
 # =============================================================================
@@ -119,7 +125,9 @@ TRACK_BUFFER_FRAMES = int(VIDEO_FPS * TRACK_BUFFER_SECONDS)
 # When enabled, frames are buffered for 2-3 seconds before processing to ensure
 # steady FPS output regardless of network timing variations
 FRAME_BUFFER_ENABLED = os.getenv("FRAME_BUFFER_ENABLED", "false").lower() == "true"
-FRAME_BUFFER_SECONDS = float(os.getenv("FRAME_BUFFER_SECONDS", "2.5"))  # Buffer duration
+FRAME_BUFFER_SECONDS = float(
+    os.getenv("FRAME_BUFFER_SECONDS", "2.5")
+)  # Buffer duration
 
 # =============================================================================
 
