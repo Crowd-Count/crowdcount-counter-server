@@ -1405,7 +1405,7 @@ class StreamOrchestrator:
                 self.logger.error(f"Error in /api/dashboard: {e}")
                 return jsonify(
                     {
-                        "error": str(e),
+                        "error": "Internal error",
                         "devices": [],
                         "online_count": 0,
                         "total_count": 0,
