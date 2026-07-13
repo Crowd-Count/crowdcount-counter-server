@@ -47,6 +47,7 @@ from config.server_config import (
     ORCHESTRATOR_PORT,
     MAX_PROCESSORS,
     STREAM_HEALTH_CHECK_INTERVAL,
+    STREAM_KEEPALIVE_INTERVAL,
     STREAM_RECONNECT_TIMEOUT,
     RTSP_HOST,
     RTSP_PORT,
@@ -363,6 +364,9 @@ class StreamOrchestrator:
         # Monitor thread watchdog: heartbeat stamped each monitor loop iteration
         self._monitor_heartbeat = 0.0
         self._monitor_heartbeat_lock = threading.Lock()
+
+        # Last time we re-affirmed "online" to the API for active streams
+        self._last_keepalive_push = 0.0
 
         # Thread pool for fire-and-forget status updates (prevents thread accumulation)
         self._status_update_executor = ThreadPoolExecutor(
@@ -2654,6 +2658,30 @@ class StreamOrchestrator:
                 _cleanup_queue(frame_queue)
             # Keep device info for reconnection (don't delete credentials)
 
+    def _push_stream_keepalives(self):
+        """Re-affirm "online" to the API for every active (non-mirror) stream.
+
+        Called periodically from the monitor loop so the API's stream status is
+        recency-based: while a stream is genuinely up, its "online" is refreshed
+        every STREAM_KEEPALIVE_INTERVAL; if the stream dies (or this orchestrator
+        crashes) the refreshes stop and the API expires the stream to offline on
+        its own — no reliance on a single edge-triggered "offline" push landing.
+
+        Skips streams in pending_reconnect (dropped, awaiting reconnect grace) so
+        we don't race the pending "offline" push and re-online a dying stream.
+        """
+        with self._state_lock:
+            active = [
+                (name, self.api_clients[name])
+                for name, proc in self.processors.items()
+                if name in self.api_clients
+                and name not in self._mirror_streams
+                and name not in self.pending_reconnect
+                and proc.is_alive()
+            ]
+        for name, api_client in active:
+            self._submit_status_update(api_client, "online", name)
+
     def _submit_status_update(self, api_client, status: str, stream_name: str = ""):
         """Submit a status update with a done-callback that logs failures."""
 
@@ -2924,6 +2952,12 @@ class StreamOrchestrator:
                 _monitor_iteration += 1
                 with self._monitor_heartbeat_lock:
                     self._monitor_heartbeat = time.time()
+
+                # Periodically re-affirm active streams' "online" to the API so
+                # its stream status self-expires (see _push_stream_keepalives).
+                if time.time() - self._last_keepalive_push >= STREAM_KEEPALIVE_INTERVAL:
+                    self._push_stream_keepalives()
+                    self._last_keepalive_push = time.time()
 
                 # Periodic resource monitoring (every 10 iterations = ~150s with 15s interval)
                 if _monitor_iteration % 10 == 0:
