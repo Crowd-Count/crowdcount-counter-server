@@ -2666,6 +2666,9 @@ class StreamOrchestrator:
         every STREAM_KEEPALIVE_INTERVAL; if the stream dies (or this orchestrator
         crashes) the refreshes stop and the API expires the stream to offline on
         its own — no reliance on a single edge-triggered "offline" push landing.
+
+        Skips streams in pending_reconnect (dropped, awaiting reconnect grace) so
+        we don't race the pending "offline" push and re-online a dying stream.
         """
         with self._state_lock:
             active = [
@@ -2673,6 +2676,7 @@ class StreamOrchestrator:
                 for name, proc in self.processors.items()
                 if name in self.api_clients
                 and name not in self._mirror_streams
+                and name not in self.pending_reconnect
                 and proc.is_alive()
             ]
         for name, api_client in active:
