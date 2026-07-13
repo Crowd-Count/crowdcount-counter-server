@@ -51,6 +51,11 @@ STREAM_RECONNECT_TIMEOUT = (
     15  # Seconds to wait for stream reconnection before marking offline
 )
 STREAM_HEALTH_CHECK_INTERVAL = 5  # Seconds between stream health checks
+# Re-affirm "online" to the API for each active stream this often, so the API's
+# stream status self-expires. Without it the API only hears about a stream on
+# start/stop (edge-triggered); a dropped "offline" push or an orchestrator crash
+# would otherwise leave a dead stream showing "online" forever.
+STREAM_KEEPALIVE_INTERVAL = 45  # Seconds between periodic stream-status keepalives
 
 # Logging
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
