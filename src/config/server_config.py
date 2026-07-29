@@ -43,7 +43,7 @@ MAX_PROCESSORS = 35  # Maximum number of concurrent stream processors (GPU 1: 25
 PROCESSOR_RESTART_DELAY = 5  # Seconds to wait before restarting a failed processor
 
 # Stream settings
-STREAM_RECONNECT_TIMEOUT = 15  # Seconds to wait for stream reconnection before marking offline
+STREAM_RECONNECT_TIMEOUT = 90  # Seconds a stream may be gone from MediaMTX before the device is marked offline. Widened past the worst-case counter pipeline restart so a legitimate restart doesn't flap the device offline/online on the dashboard.
 STREAM_HEALTH_CHECK_INTERVAL = 5  # Seconds between stream health checks
 
 # Logging
